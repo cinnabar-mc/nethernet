@@ -32,6 +32,7 @@ impl Peer {
         let mut pc = RTCPeerConnectionBuilder::new()
             .with_setting_engine(
                 SettingEngineBuilder::new()
+                    .with_sdp_media_level_fingerprints(true)
                     .with_answering_dtls_role(RTCDtlsRole::Client)
                     .build(),
             )

@@ -498,9 +498,16 @@ impl Session {
         }
     }
 
+    /// Requests transport closure immediately, including from a synchronous owner's Drop.
+    /// The existing actor performs teardown; accepted receive data remains readable before EOF.
+    /// Repeated calls are harmless and this never aborts the actor task or waits for I/O.
+    pub fn start_close(&self) {
+        self.close_token.cancel();
+    }
+
     /// Starts closing and returns without waiting for teardown.
     pub async fn close(&self) -> Result<()> {
-        self.close_token.cancel();
+        self.start_close();
         Ok(())
     }
 

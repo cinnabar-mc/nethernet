@@ -111,6 +111,39 @@ async fn a_ready_server_session_can_transfer_its_accepted_fifo_after_transport_c
     .expect("queued ready peer lost its accepted FIFO after closure");
 }
 
+/// Synchronous retirement uses the existing actor's ordered FIFO and terminal owner.
+#[tokio::test]
+async fn synchronous_close_retires_retained_handles_after_the_accepted_fifo() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ((sender, _sender_reliable), (receiver, mut reliable, _unreliable)) =
+            connected_pair().await;
+        let retained = receiver.clone();
+        for message in [b"accepted first".as_slice(), b"accepted second".as_slice()] {
+            sender.send(Bytes::copy_from_slice(message)).await.unwrap();
+        }
+        while reliable.rx.len() < 2 {
+            assert!(!receiver.is_closed().await);
+            tokio::task::yield_now().await;
+        }
+        receiver.start_close();
+        receiver.start_close();
+        drop(receiver);
+        assert!(retained.is_closed().await);
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "accepted first");
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "accepted second");
+        assert!(reliable.recv().await.unwrap().is_none());
+        assert!(
+            retained
+                .send(Bytes::from_static(b"after retirement"))
+                .await
+                .is_err()
+        );
+        sender.close().await.unwrap();
+    })
+    .await
+    .expect("synchronous retirement lost accepted data or actor shutdown");
+}
+
 #[tokio::test]
 async fn concurrent_sends_wait_outside_the_bounded_real_session_command_queue() {
     use futures::poll;

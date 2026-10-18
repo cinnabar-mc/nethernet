@@ -11,12 +11,12 @@ use p384::pkcs8::EncodePublicKey;
 use serde_json::json;
 use zeroize::Zeroizing;
 
-use super::envelope::{DEFAULT_IDP_PROTOCOL, insert_identity};
+use super::envelope::{DEFAULT_IDP_PROTOCOL, identity_base64, insert_identity};
 use super::error::{IdentityError, Result};
 use super::jws::Jws;
 use super::jwt::Claims;
 use super::server::DEFAULT_DOMAIN;
-use super::{Assertion, Identity, Idp, SdpIdentity, fingerprint_payload, sdp_fingerprints};
+use super::{Idp, SdpIdentity, fingerprint_payload, sdp_fingerprints};
 
 /// A client token and its matching P-384 signing key.
 ///
@@ -38,8 +38,9 @@ impl fmt::Debug for ClientIdentity {
 impl ClientIdentity {
     /// Binds an application-authenticated token to its signing key.
     ///
-    /// Fails if the token is malformed or its `cpk` names another key. The caller
-    /// authenticates the issuer; expiry is checked whenever an offer is signed.
+    /// Fails if the provider domain is empty, the token is malformed, or its `cpk`
+    /// names another key. The caller authenticates the issuer; expiry is checked
+    /// whenever an offer is signed.
     pub fn from_token(
         signing: SigningKey,
         token: String,
@@ -51,15 +52,16 @@ impl ClientIdentity {
             return Err(IdentityError::KeyMismatch);
         }
         let domain = domain.into();
+        if domain.is_empty() {
+            return Err(IdentityError::Malformed(
+                "client identity provider domain must not be empty".to_owned(),
+            ));
+        }
         Ok(Self {
             signing,
             token,
             claims,
-            domain: if domain.is_empty() {
-                DEFAULT_DOMAIN.to_owned()
-            } else {
-                domain
-            },
+            domain,
         })
     }
 
@@ -95,6 +97,7 @@ impl ClientIdentity {
 }
 
 impl SdpIdentity for ClientIdentity {
+    /// Signs an offer; its returned SDP contains the token and must not be logged.
     fn augment(&self, sdp: &str, now: SystemTime) -> Result<String> {
         self.claims.check_expiry(now)?;
         let fingerprints = sdp_fingerprints(sdp)?;
@@ -102,17 +105,14 @@ impl SdpIdentity for ClientIdentity {
             return Err(IdentityError::NoFingerprints);
         }
         let payload = fingerprint_payload(&fingerprints);
-        let identity = Identity {
-            idp: Idp {
+        let identity = Zeroizing::new(identity_base64(
+            &Idp {
                 domain: self.domain.clone(),
                 protocol: DEFAULT_IDP_PROTOCOL.to_owned(),
             },
-            assertion: Assertion {
-                token: self.token.to_string(),
-                fingerprints: Jws::sign_detached(&self.signing, &payload)?,
-            },
-        }
-        .to_base64()?;
+            &self.token,
+            &Jws::sign_detached(&self.signing, &payload)?,
+        )?);
         Ok(insert_identity(sdp, &identity))
     }
 }
@@ -120,7 +120,7 @@ impl SdpIdentity for ClientIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{TokenTrust, validate_sdp};
+    use crate::identity::{Identity, TokenTrust, validate_sdp};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     const SDP: &str = "v=0\r\na=fingerprint:sha-256 AB:CD\r\nm=application 9\r\n";
@@ -169,6 +169,10 @@ mod tests {
         assert!(matches!(
             ClientIdentity::from_token(SigningKey::generate(), identity.token.to_string(), "self"),
             Err(IdentityError::KeyMismatch)
+        ));
+        assert!(matches!(
+            ClientIdentity::from_token(identity.signing.clone(), identity.token.to_string(), ""),
+            Err(IdentityError::Malformed(_))
         ));
         assert!(
             identity

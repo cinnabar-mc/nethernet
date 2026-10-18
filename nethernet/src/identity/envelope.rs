@@ -4,6 +4,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Idp {
@@ -32,7 +33,7 @@ pub struct Identity {
     pub assertion: Assertion,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct Raw {
     #[serde(default)]
     idp: Idp,
@@ -75,18 +76,54 @@ impl Identity {
     }
 
     pub fn to_json(&self) -> Result<String> {
-        let raw = Raw {
-            idp: self.idp.clone(),
-            assertion: serde_json::to_string(&self.assertion)
-                .map_err(|e| IdentityError::Malformed(e.to_string()))?,
-        };
-
-        serde_json::to_string(&raw).map_err(|e| IdentityError::Malformed(e.to_string()))
+        identity_json(
+            &self.idp,
+            &self.assertion.token,
+            &self.assertion.fingerprints,
+        )
     }
 
     pub fn to_base64(&self) -> Result<String> {
-        Ok(STANDARD.encode(self.to_json()?))
+        identity_base64(
+            &self.idp,
+            &self.assertion.token,
+            &self.assertion.fingerprints,
+        )
     }
+}
+
+/// Serializes borrowed assertion fields, clearing the intermediate JSON string on return.
+fn identity_json(idp: &Idp, token: &str, fingerprints: &str) -> Result<String> {
+    #[derive(Serialize)]
+    struct AssertionRef<'a> {
+        token: &'a str,
+        fingerprints: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct RawRef<'a> {
+        idp: &'a Idp,
+        assertion: &'a str,
+    }
+
+    let assertion = Zeroizing::new(
+        serde_json::to_string(&AssertionRef {
+            token,
+            fingerprints,
+        })
+        .map_err(|e| IdentityError::Malformed(e.to_string()))?,
+    );
+    serde_json::to_string(&RawRef {
+        idp,
+        assertion: &assertion,
+    })
+    .map_err(|e| IdentityError::Malformed(e.to_string()))
+}
+
+/// Encodes an identity without copying its token into another owned assertion.
+pub(crate) fn identity_base64(idp: &Idp, token: &str, fingerprints: &str) -> Result<String> {
+    let json = Zeroizing::new(identity_json(idp, token, fingerprints)?);
+    Ok(STANDARD.encode(json.as_bytes()))
 }
 
 /// The `(algorithm, digest)` pairs of the `a=fingerprint` lines of `sdp`, in order.
@@ -130,20 +167,22 @@ pub(crate) const DEFAULT_IDP_PROTOCOL: &str = "default";
 
 /// Inserts an encoded identity before the media section, preserving the description's line endings.
 pub(crate) fn insert_identity(sdp: &str, identity: &str) -> String {
-    let attribute = format!("a=identity:{identity}");
+    const PREFIX: &str = "a=identity:";
     let eol = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut out = String::with_capacity(sdp.len() + attribute.len() + eol.len());
+    let mut out = String::with_capacity(sdp.len() + PREFIX.len() + identity.len() + eol.len());
     let mut inserted = false;
     for line in sdp.split_inclusive(['\n']) {
         if !inserted && line.starts_with("m=") {
-            out.push_str(&attribute);
+            out.push_str(PREFIX);
+            out.push_str(identity);
             out.push_str(eol);
             inserted = true;
         }
         out.push_str(line);
     }
     if !inserted {
-        out.push_str(&attribute);
+        out.push_str(PREFIX);
+        out.push_str(identity);
         out.push_str(eol);
     }
     out

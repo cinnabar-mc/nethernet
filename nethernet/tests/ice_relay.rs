@@ -8,7 +8,7 @@ use nethernet::session::{
     Channel, GatheringState, IceConfig, IceError, IcePolicy, IceServer, Session, SessionEvent,
     SessionInput, SessionOutput, TurnCredentials,
 };
-use rtc::ice::candidate::CandidateType;
+use rtc::ice::candidate::{Candidate, CandidateType};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use turn::{PASSWORD, TurnPeer, USER};
@@ -117,6 +117,15 @@ fn deliver_server_packets(
 
 /// Completes gathering and applies full descriptions before the actual secured transport handshake.
 fn pair(v6: bool) -> ([Endpoint; 2], TurnPeer, Instant) {
+    pair_with_candidates(v6, Vec::new(), false)
+}
+
+/// Keeps original full-SDP establishment while admitting independently unusable candidate paths.
+fn pair_with_candidates(
+    v6: bool,
+    extra: Vec<Candidate>,
+    refuse_extra: bool,
+) -> ([Endpoint; 2], TurnPeer, Instant) {
     let mut now = Instant::now();
     let mut server = TurnPeer::new(addr(v6, 3478));
     let (a, a_description) = Session::new_with_ice(
@@ -178,9 +187,14 @@ fn pair(v6: bool) -> ([Endpoint; 2], TurnPeer, Instant) {
     let (a_description, a_candidates) =
         Description::parse(&a_description.encode_full(endpoints[0].session.local_candidates()))
             .unwrap();
-    let (b_description, b_candidates) =
+    let (b_description, mut b_candidates) =
         Description::parse(&b_description.encode_full(endpoints[1].session.local_candidates()))
             .unwrap();
+    if refuse_extra {
+        server.refuse_permissions_for = Some(extra[0].addr().ip());
+        server.drop_permissions = true;
+    }
+    b_candidates.extend(extra);
     endpoints[0]
         .session
         .handle(SessionInput::RemoteDescription(
@@ -197,8 +211,15 @@ fn pair(v6: bool) -> ([Endpoint; 2], TurnPeer, Instant) {
             now,
         ))
         .unwrap();
+    let mut denied_at = None;
     for _ in 0..3000 {
         step(&mut endpoints, &mut server, &mut now);
+        if server.permission_refusals != 0 {
+            let original = *denied_at.get_or_insert(now);
+            if now.duration_since(original) >= Duration::from_secs(1) {
+                server.drop_permissions = false;
+            }
+        }
         if endpoints.iter().all(|endpoint| endpoint.ready) {
             break;
         }
@@ -208,6 +229,66 @@ fn pair(v6: bool) -> ([Endpoint; 2], TurnPeer, Instant) {
         "ICE/DTLS/SCTP did not complete through TURN"
     );
     (endpoints, server, now)
+}
+
+/// A well-formed unsupported TCP path cannot invalidate a usable UDP full description.
+#[test]
+fn full_ice_ignores_unsupported_candidates_and_keeps_the_udp_session() {
+    let tcp = nethernet::protocol::webrtc::candidate::parse_ice_candidate(
+        "candidate:tcp-fixture 1 tcp 2122260223 192.0.2.9 49000 typ host tcptype passive",
+    )
+    .unwrap();
+    let (mut endpoints, mut server, mut now) = pair_with_candidates(false, vec![tcp], false);
+    endpoints[0]
+        .session
+        .handle(SessionInput::Send(
+            Channel::Reliable,
+            b"usable UDP path".as_slice().into(),
+            now,
+        ))
+        .unwrap();
+    for _ in 0..1000 {
+        step(&mut endpoints, &mut server, &mut now);
+        if !endpoints[1].received.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        endpoints[1].received,
+        [(Channel::Reliable, b"usable UDP path".to_vec())]
+    );
+}
+
+/// A signed TURN refusal for one candidate leaves the other candidate's secured path live.
+#[test]
+fn denied_turn_candidate_permission_keeps_other_pairs_viable() {
+    let private = nethernet::protocol::webrtc::candidate::parse_ice_candidate(
+        "candidate:private-fixture 1 udp 2122260223 10.0.0.9 49001 typ host",
+    )
+    .unwrap();
+    let (mut endpoints, mut server, mut now) = pair_with_candidates(false, vec![private], true);
+    assert_eq!(
+        server.permission_refusals, 1,
+        "refused permissions must not be retried forever"
+    );
+    endpoints[0]
+        .session
+        .handle(SessionInput::Send(
+            Channel::Reliable,
+            b"other relay remains live".as_slice().into(),
+            now,
+        ))
+        .unwrap();
+    for _ in 0..1000 {
+        step(&mut endpoints, &mut server, &mut now);
+        if !endpoints[1].received.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        endpoints[1].received,
+        [(Channel::Reliable, b"other relay remains live".to_vec())]
+    );
 }
 
 #[test]

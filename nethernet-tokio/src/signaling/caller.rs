@@ -359,15 +359,18 @@ impl CallerSignalingDriver {
         let inbox = self.inbox.clone();
         let closed = self.closed.clone();
         Ok(async move {
+            let permit = tokio::select! {
+                biased;
+                _ = closed.cancelled() => return Err(CallerSignalingError::Closed),
+                permit = incoming.reserve_owned() => permit.map_err(|_| CallerSignalingError::Closed)?,
+            };
             if closed.is_cancelled() {
                 return Err(CallerSignalingError::Closed);
             }
             let inbox = inbox.lock().unwrap_or_else(|error| error.into_inner());
             check_subscription(&inbox, &signal)?;
-            incoming.try_send(signal).map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => CallerSignalingError::Capacity,
-                mpsc::error::TrySendError::Closed(_) => CallerSignalingError::Closed,
-            })
+            permit.send(signal);
+            Ok(())
         })
     }
 

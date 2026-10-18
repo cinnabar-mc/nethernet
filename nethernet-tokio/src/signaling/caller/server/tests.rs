@@ -23,87 +23,91 @@ fn bridge() -> (CallerServerSignaling, CallerServerSignalingDriver) {
 /// Real owned admission futures reserve bounded exact routes, even before their first poll.
 #[tokio::test]
 async fn caller_server_routes_follow_authenticated_sender_and_concrete_lease() {
-    let (caller, driver) = bridge();
-    let mut incoming = caller.signals().unwrap();
-    assert!(matches!(
-        caller.signals(),
-        Err(crate::error::NetherError::CallerSignaling(
-            CallerSignalingError::AlreadySubscribed
-        ))
-    ));
-    assert_eq!(
-        driver.try_deliver("", "CONNECTREQUEST 7 offer"),
-        Err(CallerSignalingError::RouteMismatch)
-    );
-    assert_eq!(
-        driver.try_deliver("first", "not a signal"),
-        Err(CallerSignalingError::InvalidSignal)
-    );
-    assert_eq!(
-        driver.try_deliver(&"x".repeat(513), "CONNECTREQUEST 7 offer"),
-        Err(CallerSignalingError::Capacity)
-    );
-    assert_eq!(
-        driver.try_deliver("first", &format!("CONNECTREQUEST 7 {}", "x".repeat(513))),
-        Err(CallerSignalingError::Capacity)
-    );
-    let first = driver
-        .prepare_delivery("first", "CONNECTREQUEST 7 offer")
-        .unwrap();
-    assert!(matches!(
-        driver.prepare_delivery("first", "CONNECTREQUEST 8 other"),
-        Err(CallerSignalingError::Capacity)
-    ));
-    assert_eq!(
-        driver.try_deliver("first", "CONNECTREQUEST 7 duplicate"),
-        Err(CallerSignalingError::RouteMismatch)
-    );
-    let second = driver
-        .prepare_delivery("second", "CONNECTREQUEST 7 other peer")
-        .unwrap();
-    assert_eq!(
-        driver.try_deliver("third", "CONNECTREQUEST 7 excess"),
-        Err(CallerSignalingError::Capacity)
-    );
-    drop(second);
-    let second = driver
-        .prepare_delivery("second", "CONNECTREQUEST 7 other peer")
-        .unwrap();
-    first.await.unwrap();
-    let offer = incoming.next().await.unwrap();
-    assert_eq!(
-        (offer.network_id.as_str(), offer.connection_id),
-        ("first", 7)
-    );
-    let lease = caller.claim(&offer).unwrap();
-    second.await.unwrap();
-    let other = incoming.next().await.unwrap();
-    assert_eq!(other.network_id, "second");
-    let other_lease = caller.claim(&other).unwrap();
-    assert_eq!(
-        driver.try_deliver("unknown", "CANDIDATEADD 7 unknown"),
-        Err(CallerSignalingError::RouteMismatch)
-    );
-    let stale = driver
-        .prepare_delivery("first", "CANDIDATEADD 7 stale")
-        .unwrap();
-    lease.retire();
-    assert_eq!(
-        driver.try_deliver("first", "CANDIDATEADD 7 retired"),
-        Err(CallerSignalingError::RouteMismatch)
-    );
-    assert_eq!(
-        driver.try_deliver("first", "CONNECTREQUEST 7 retained receiver"),
-        Err(CallerSignalingError::RouteMismatch)
-    );
-    drop(lease);
-    driver
-        .try_deliver("first", "CONNECTREQUEST 7 replacement")
-        .unwrap();
-    assert_eq!(stale.await, Err(CallerSignalingError::RouteMismatch));
-    assert_eq!(incoming.next().await.unwrap().data, "replacement");
-    assert!(incoming.next().now_or_never().is_none());
-    drop(other_lease);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (caller, driver) = bridge();
+        let mut incoming = caller.signals().unwrap();
+        assert!(matches!(
+            caller.signals(),
+            Err(crate::error::NetherError::CallerSignaling(
+                CallerSignalingError::AlreadySubscribed
+            ))
+        ));
+        assert_eq!(
+            driver.try_deliver("", "CONNECTREQUEST 7 offer"),
+            Err(CallerSignalingError::RouteMismatch)
+        );
+        assert_eq!(
+            driver.try_deliver("first", "not a signal"),
+            Err(CallerSignalingError::InvalidSignal)
+        );
+        assert_eq!(
+            driver.try_deliver(&"x".repeat(513), "CONNECTREQUEST 7 offer"),
+            Err(CallerSignalingError::Capacity)
+        );
+        assert_eq!(
+            driver.try_deliver("first", &format!("CONNECTREQUEST 7 {}", "x".repeat(513))),
+            Err(CallerSignalingError::Capacity)
+        );
+        let first = driver
+            .prepare_delivery("first", "CONNECTREQUEST 7 offer")
+            .unwrap();
+        assert!(matches!(
+            driver.prepare_delivery("first", "CONNECTREQUEST 8 other"),
+            Err(CallerSignalingError::Capacity)
+        ));
+        assert_eq!(
+            driver.try_deliver("first", "CONNECTREQUEST 7 duplicate"),
+            Err(CallerSignalingError::RouteMismatch)
+        );
+        let second = driver
+            .prepare_delivery("second", "CONNECTREQUEST 7 other peer")
+            .unwrap();
+        assert_eq!(
+            driver.try_deliver("third", "CONNECTREQUEST 7 excess"),
+            Err(CallerSignalingError::Capacity)
+        );
+        drop(second);
+        let second = driver
+            .prepare_delivery("second", "CONNECTREQUEST 7 other peer")
+            .unwrap();
+        first.await.unwrap();
+        let offer = incoming.next().await.unwrap();
+        assert_eq!(
+            (offer.network_id.as_str(), offer.connection_id),
+            ("first", 7)
+        );
+        let lease = caller.claim(&offer).unwrap();
+        second.await.unwrap();
+        let other = incoming.next().await.unwrap();
+        assert_eq!(other.network_id, "second");
+        let other_lease = caller.claim(&other).unwrap();
+        assert_eq!(
+            driver.try_deliver("unknown", "CANDIDATEADD 7 unknown"),
+            Err(CallerSignalingError::RouteMismatch)
+        );
+        let stale = driver
+            .prepare_delivery("first", "CANDIDATEADD 7 stale")
+            .unwrap();
+        lease.retire();
+        assert_eq!(
+            driver.try_deliver("first", "CANDIDATEADD 7 retired"),
+            Err(CallerSignalingError::RouteMismatch)
+        );
+        assert_eq!(
+            driver.try_deliver("first", "CONNECTREQUEST 7 retained receiver"),
+            Err(CallerSignalingError::RouteMismatch)
+        );
+        drop(lease);
+        driver
+            .try_deliver("first", "CONNECTREQUEST 7 replacement")
+            .unwrap();
+        assert_eq!(incoming.next().await.unwrap().data, "replacement");
+        assert_eq!(stale.await, Err(CallerSignalingError::RouteMismatch));
+        assert!(incoming.next().now_or_never().is_none());
+        drop(other_lease);
+    })
+    .await
+    .expect("bounded caller route fixture stalled");
 }
 
 /// Deadline and subscription are checked at the actual reserved queue commitment, including ABA reuse.

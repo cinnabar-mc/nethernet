@@ -158,6 +158,7 @@ impl CallerSignaling {
     ) -> std::result::Result<(Self, CallerSignalingDriver), CallerSignalingError> {
         validate_config(&local_id, Some(&remote_id), &config)?;
         let capacity = config.capacity.get();
+        let max_bytes = config.max_signal_bytes.get();
         let (outgoing, requests) = mpsc::channel(capacity);
         let (incoming, receiver) = mpsc::channel(capacity);
         let inbox = Arc::new(Mutex::new(Inbox {

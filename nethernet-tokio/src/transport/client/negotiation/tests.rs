@@ -6,7 +6,7 @@ use crate::signaling::caller::{CallerSignaling, CallerSignalingConfig};
 use bytes::Bytes;
 use futures::poll;
 use nethernet::connection::IceMode;
-use nethernet::session::IceConfig;
+use nethernet::session::{IceConfig, Session};
 use rtc::stun::message::{CLASS_REQUEST, METHOD_BINDING, Message};
 use std::sync::Arc;
 

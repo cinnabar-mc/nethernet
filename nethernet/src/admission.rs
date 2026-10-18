@@ -398,7 +398,8 @@ mod tests {
         let (mut core, description) = Session::new(loopback(40309), false, 9, now).unwrap();
         let candidates = core.local_candidates().len();
         let error = admitted
-            .prepare_answer(&mut core, description, now, wall + Duration::from_secs(2))
+            // The existing token policy permits sixty seconds of clock skew after expiry.
+            .prepare_answer(&mut core, description, now, wall + Duration::from_secs(62))
             .err()
             .expect("original offer expired during gathering");
         assert!(matches!(error, AdmissionError::Untrusted(_)));

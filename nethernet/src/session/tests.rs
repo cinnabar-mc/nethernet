@@ -186,6 +186,159 @@ fn connected_pair() -> (Session, Session, Instant) {
     (offerer, answerer, now)
 }
 
+/// Full ICE can use its numeric path while an unsupported mDNS host remains unresolved.
+#[test]
+fn full_ice_mixed_mdns_and_numeric_descriptions_reach_ready() {
+    let now = Instant::now();
+    let (mut offerer, offer) = Session::new(addr(40100), true, 1, now).unwrap();
+    let (mut answerer, answer) = Session::new(addr(40101), false, 2, now).unwrap();
+    let mdns = crate::protocol::webrtc::candidate::parse_ice_candidate(
+        "candidate:mdns 1 udp 2130706431 synthetic-peer.local 54321 typ host",
+    )
+    .unwrap();
+    let offer_sdp = offer.encode_full(&[mdns.clone(), offerer.local_candidate().clone()]);
+    let answer_sdp = answer.encode_full(&[answerer.local_candidate().clone(), mdns]);
+    let (offer, offer_candidates) = Description::parse(&offer_sdp).unwrap();
+    let (answer, answer_candidates) = Description::parse(&answer_sdp).unwrap();
+    assert_eq!(offer_candidates.len(), 2);
+    assert_eq!(offer_candidates[0].address(), "synthetic-peer.local");
+    assert_eq!(answer_candidates.len(), 2);
+    assert_eq!(answer_candidates[1].address(), "synthetic-peer.local");
+    answerer
+        .handle(SessionInput::RemoteDescription(
+            offer,
+            offer_candidates,
+            now,
+        ))
+        .expect("an unresolved mDNS candidate rejected the usable Full ICE offer");
+    offerer
+        .handle(SessionInput::RemoteDescription(
+            answer,
+            answer_candidates,
+            now,
+        ))
+        .expect("an unresolved mDNS candidate rejected the usable Full ICE answer");
+    assert_eq!(
+        drive_until_ready(&mut offerer, &mut answerer, now),
+        (true, true),
+        "the actual DTLS/SCTP sessions did not use the numeric candidates"
+    );
+    assert_eq!(offerer.remote_addr(), Some(addr(40101)));
+    assert_eq!(answerer.remote_addr(), Some(addr(40100)));
+}
+
+/// Ignoring unsupported hostnames never broadens malformed numeric UDP admission.
+#[test]
+fn full_ice_malformed_numeric_candidates_still_reject() {
+    let now = Instant::now();
+    for candidate in [
+        "candidate:invalid 1 udp 2130706431 0.0.0.0 54321 typ host",
+        "candidate:invalid 1 udp 2130706431 224.0.0.1 54321 typ host",
+        "candidate:invalid 2 udp 2130706431 127.0.0.1 54321 typ host",
+    ] {
+        let (mut session, _) = Session::new(addr(40100), true, 1, now).unwrap();
+        let (peer, description) = Session::new(addr(40101), false, 2, now).unwrap();
+        let invalid = crate::protocol::webrtc::candidate::parse_ice_candidate(candidate).unwrap();
+        let sdp = description.encode_full(&[peer.local_candidate().clone(), invalid]);
+        let (description, candidates) = Description::parse(&sdp).unwrap();
+        assert_eq!(candidates.len(), 2, "numeric control did not reach ICE");
+        assert!(matches!(
+            session.handle(SessionInput::RemoteDescription(
+                description,
+                candidates,
+                now
+            )),
+            Err(ProtocolError::Ice(IceError::Configuration))
+        ));
+    }
+}
+
+/// Actual complete reliable outputs retain FIFO if ICE fails before the caller drains them.
+#[test]
+fn ice_failure_preserves_queued_reliable_messages_before_single_terminal() {
+    let (mut receiver, mut peer, now) = connected_pair();
+    let messages = [
+        b"first accepted payload".as_slice(),
+        b"second accepted payload".as_slice(),
+    ];
+    for message in messages {
+        peer.handle(SessionInput::Send(
+            Channel::Reliable,
+            Bytes::copy_from_slice(message),
+            now,
+        ))
+        .unwrap();
+    }
+    while let Some(output) = peer.poll() {
+        if let SessionOutput::Send(data, to) = output {
+            assert_eq!(to, addr(40100));
+            receiver
+                .handle(SessionInput::Packet(data.into(), addr(40101), now))
+                .unwrap();
+        }
+    }
+    let accepted = receiver
+        .output
+        .iter()
+        .filter_map(|output| match output {
+            SessionOutput::Message(Channel::Reliable, data) => Some(data.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accepted, messages,
+        "real RTC messages were not admitted before failure"
+    );
+    let failed_at = now + Duration::from_secs(3600);
+    receiver.handle(SessionInput::Timeout(failed_at)).unwrap();
+    assert_eq!(receiver.gathering_state(), GatheringState::Closed);
+    let output = std::iter::from_fn(|| receiver.poll()).collect::<Vec<_>>();
+    let retained = output
+        .iter()
+        .filter_map(|output| match output {
+            SessionOutput::Message(Channel::Reliable, data) => Some(data.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained, messages,
+        "ICE failure erased already-produced reliable outputs"
+    );
+    let terminal = output
+        .iter()
+        .position(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+        .expect("the actual ICE timeout did not emit failure");
+    assert_eq!(
+        output
+            .iter()
+            .filter(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+            .count(),
+        1
+    );
+    assert!(
+        output[..terminal]
+            .iter()
+            .all(|output| matches!(output, SessionOutput::Message(..)))
+    );
+    assert!(output[terminal + 1..].is_empty());
+    assert!(receiver.poll_timeout().is_none());
+    receiver
+        .handle(SessionInput::Timeout(failed_at + Duration::from_secs(1)))
+        .unwrap();
+    assert!(
+        receiver.poll().is_none(),
+        "failed session repeated its terminal or stale work"
+    );
+    assert!(matches!(
+        receiver.handle(SessionInput::Send(
+            Channel::Reliable,
+            Bytes::from_static(b"late"),
+            failed_at
+        )),
+        Err(ProtocolError::Ice(IceError::Closed))
+    ));
+}
+
 fn forward(
     from: &mut Session,
     to: &mut Session,

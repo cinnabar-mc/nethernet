@@ -1,13 +1,19 @@
+mod negotiation;
+
 use crate::addr::Addr;
 use crate::error::{NetherError, Result, SignalErrorCode};
 use crate::protocol::{Signal, SignalType};
+use crate::session::guard::{ConnectionGuard, GatheringGuard, transport_now};
 use crate::session::{AcceptedSession, Command, Session, SessionReceiver};
 use crate::signaling::ClientSignaling;
 use crate::transport::{ConnectionConfig, local_bind_addr};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use nethernet::connection::{Connection as SansConnection, ConnectionInput, IceMode};
+#[cfg(test)]
+use nethernet::connection::ConnectionInput;
+use nethernet::connection::{Connection as SansConnection, IceMode};
 use nethernet::identity::{TokenTrust, verify_answer};
+#[cfg(test)]
 use nethernet::sans::Sans;
 use nethernet::session::Session as SansSession;
 use rand::Rng;
@@ -15,7 +21,9 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Instant, SystemTime};
+#[cfg(test)]
+use std::time::Instant;
+use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio_util::io::StreamReader;
@@ -172,8 +180,14 @@ impl NetherClient {
         connection_id: u64,
         config: ConnectionConfig,
     ) -> std::result::Result<Self, (Option<SignalErrorCode>, NetherError)> {
+        let deadline = tokio::time::Instant::now() + config.timeouts.negotiation;
+        let bind_addr = config
+            .client_ice
+            .as_ref()
+            .and_then(|ice| ice.bind_addr)
+            .unwrap_or_else(local_bind_addr);
         let socket = Arc::new(
-            UdpSocket::bind(local_bind_addr())
+            UdpSocket::bind(bind_addr)
                 .await
                 .map_err(|e| (None, NetherError::from(e)))?,
         );
@@ -181,22 +195,47 @@ impl NetherClient {
             .local_addr()
             .map_err(|e| (None, NetherError::from(e)))?;
 
-        let (mut session, description) =
-            SansSession::new(bound_addr, true, rand::random(), Instant::now()).map_err(|e| {
-                (
-                    Some(SignalErrorCode::FailedToCreatePeerConnection),
-                    NetherError::from(e),
-                )
-            })?;
+        let (mut session, description) = match &config.client_ice {
+            Some(ice) => SansSession::new_with_ice(
+                bound_addr,
+                true,
+                rand::random(),
+                ice.ice.clone(),
+                transport_now(),
+            ),
+            None => SansSession::new(bound_addr, true, rand::random(), transport_now()),
+        }
+        .map_err(|error| {
+            (
+                Some(SignalErrorCode::FailedToCreatePeerConnection),
+                NetherError::from(error),
+            )
+        })?;
         session.set_establish_deadline(config.timeouts.establish());
-
         let ice_mode = if signaling.disable_trickle_ice() {
             IceMode::Full
         } else {
             IceMode::Trickle
         };
+        let mut gathering = GatheringGuard::new(session, socket.clone());
+        if ice_mode == IceMode::Full {
+            negotiation::gather(
+                &socket,
+                gathering
+                    .core
+                    .as_mut()
+                    .expect("gathering session is still owned"),
+                deadline,
+            )
+            .await
+            .map_err(|error| (Some(SignalErrorCode::Ice), error))?;
+        }
+        let session = gathering
+            .core
+            .take()
+            .expect("gathered session is handed off once");
 
-        let (mut connection, signals) = SansConnection::connect(
+        let (connection, signals) = SansConnection::connect(
             session,
             description,
             connection_id,
@@ -204,11 +243,11 @@ impl NetherClient {
             ice_mode,
         );
 
+        let mut guard = ConnectionGuard::new(connection, socket.clone());
         let mut signals_out = signals.into_iter();
         let offer = signals_out
             .next()
-            .expect("Connection::connect always returns an offer signal first");
-
+            .expect("Connection::connect produces an offer first");
         let offer_data = match &config.identity {
             Some(identity) => identity
                 .augment(&offer.data, SystemTime::now())
@@ -221,83 +260,41 @@ impl NetherClient {
             None => offer.data,
         };
 
-        let mut signals = signaling.signals().map_err(|error| (None, error))?;
-
-        signaling
-            .signal(Signal::offer(
-                connection_id,
-                offer_data,
-                remote_network_id.to_string(),
-            ))
-            .await
-            .map_err(|e| (None, e))?;
-        for trickled in signals_out {
-            signaling.signal(trickled).await.map_err(|e| (None, e))?;
-        }
-
-        let deadline = tokio::time::Instant::now() + config.timeouts.negotiation;
-
-        loop {
-            let signal = tokio::time::timeout_at(deadline, async {
-                loop {
-                    let signal = signals.next().await?;
-                    if signal.connection_id == connection_id
-                        && signal.network_id == remote_network_id
-                    {
-                        return Some(signal);
-                    }
-                }
-            })
-            .await
-            .map_err(|_| {
-                (
-                    Some(SignalErrorCode::NegotiationTimeoutWaitingForResponse),
-                    NetherError::Timeout,
-                )
-            })?
-            .ok_or((None, NetherError::ConnectionClosed))?;
-
-            match signal.signal_type {
-                SignalType::Answer => {
-                    check_answer(&signal, config.server_trust.as_ref(), SystemTime::now())?;
-                    connection
-                        .handle(ConnectionInput::Signal(signal, Instant::now()))
-                        .map_err(|e| {
-                            (
-                                Some(SignalErrorCode::FailedToSetRemoteDescription),
-                                NetherError::from(e),
-                            )
-                        })?;
-                    // The answer may already contain every candidate. Drive ICE now;
-                    // later candidate signals are forwarded to the same session.
-                    break;
-                }
-                SignalType::Candidate => {
-                    connection
-                        .handle(ConnectionInput::Signal(signal, Instant::now()))
-                        .map_err(|e| (Some(SignalErrorCode::Ice), NetherError::from(e)))?;
-                }
-                SignalType::Error => {
-                    let code = parse_error_code(&signal.data);
-                    return Err((None, NetherError::Signaled(code)));
-                }
-                SignalType::Offer => {
-                    return Err((
-                        Some(SignalErrorCode::IncomingConnectionIgnored),
-                        NetherError::Other("received offer while dialing".to_string()),
-                    ));
-                }
-            }
-        }
+        let mut incoming = signaling.signals().map_err(|error| (None, error))?;
+        let mut outgoing = vec![Signal::offer(
+            connection_id,
+            offer_data,
+            remote_network_id.to_string(),
+        )];
+        outgoing.extend(signals_out);
+        negotiation::exchange(
+            &socket,
+            guard.core(),
+            &mut incoming,
+            signaling,
+            outgoing,
+            connection_id,
+            remote_network_id,
+            config.server_trust.as_ref(),
+            config.timeouts.negotiation,
+            deadline,
+        )
+        .await?;
+        let connection = guard.take();
 
         let local = Addr::new(signaling.network_id(), connection_id);
         let remote = Addr::new(remote_network_id.to_string(), connection_id);
 
-        let (session, reliable, unreliable, ready_rx) =
-            Session::spawn(socket, connection, local, remote);
+        let (session, reliable, unreliable, ready_rx) = Session::spawn_with_signaling(
+            socket,
+            connection,
+            local,
+            remote,
+            Some((signaling.clone(), config.timeouts.negotiation)),
+        );
 
         spawn_late_signal_forwarder(
-            signals,
+            incoming,
             connection_id,
             remote_network_id.to_string(),
             session.signal_sender(),

@@ -158,3 +158,42 @@ key ownership in the application. Supply its `SdpIdentity` through
 `ConnectionConfig::identity`; the bridge creates no replacement identity key.
 The current transport gathers only host ICE candidates. Service signaling alone
 does not add STUN/TURN gathering or relay connectivity.
+
+Configured UDP ICE sessions can gather server-reflexive and TURN relay candidates.
+The pure `nethernet::session::IceConfig` owns resolved endpoints, credential
+expiry, gathering deadlines and candidate policy. `Session::new` remains
+host-only; use `Session::new_with_ice` for configured paths. Full ICE callers drive
+gathering to `GatheringState::Complete` before encoding their SDP. Trickle callers
+drain `Session::poll_local_candidate` or `Connection::poll_local_signal` while
+continuing to feed packets and time.
+
+The optional Tokio client adapter accepts `ConnectionConfig::client_ice`:
+
+```rust,ignore
+let servers = nethernet_tokio::resolve_ice_servers(
+    &acquired_credentials.ice_servers,
+    local_bind_address,
+    original_credential_expiry,
+    resolution_deadline,
+).await?;
+let config = nethernet_tokio::ConnectionConfig {
+    client_ice: Some(nethernet_tokio::ClientIceConfig {
+        ice: nethernet::session::IceConfig { servers, ..Default::default() },
+        bind_addr: Some(local_bind_address),
+    }),
+    ..Default::default()
+};
+```
+
+The application acquires and renews service credentials. DNS runs only in the
+adapter; the core receives numeric endpoints. Full mode gathers before signing
+the offer. Trickle mode continues UDP gathering while signaling is pending and
+sends later candidates through the retained signaling owner. Runtime session
+handles accept credential rotation through `update_turn_credentials`. Cancelling
+negotiation or dropping the driver stops its state and attempts relay release.
+
+This path supports UDP STUN and TURN with IPv4 relay allocations over IPv4 or
+IPv6 outer UDP. Explicit IPv6 relay allocation and TURN TCP/TLS remain incomplete.
+Bevy may drive the same configured core with its own sockets and clock; configured
+ICE construction and late outgoing candidate wiring in that adapter remain
+incomplete and do not require a Tokio dependency.

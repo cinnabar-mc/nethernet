@@ -4,7 +4,10 @@ mod server;
 use crate::error::ProtocolError;
 use crate::protocol::webrtc::certificate;
 use bytes::BytesMut;
-pub use config::{GatheringState, IceConfig, IceError, IcePolicy, IceServer, TurnCredentials};
+pub use config::{
+    GatheringState, IceConfig, IceError, IcePolicy, IceServer, MAX_ICE_SERVERS,
+    MAX_TURN_CREDENTIAL_BYTES, TurnCredentials,
+};
 use rtc::ice::agent::agent_config::AgentConfig;
 use rtc::ice::agent::{Agent, Credentials, Event};
 use rtc::ice::candidate::candidate_host::CandidateHostConfig;

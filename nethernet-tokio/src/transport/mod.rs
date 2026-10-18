@@ -24,6 +24,15 @@ pub(crate) fn local_bind_addr() -> SocketAddr {
 }
 use tokio_util::sync::CancellationToken;
 
+/// Outbound UDP ICE configuration. DNS and service credential acquisition happen before dialing.
+#[derive(Clone)]
+pub struct ClientIceConfig {
+    /// Resolved server endpoints, bounded credentials, gathering deadline and candidate policy.
+    pub ice: nethernet::session::IceConfig,
+    /// Optional concrete local interface and port. Use an IPv6 address for IPv6 outer server transport.
+    pub bind_addr: Option<SocketAddr>,
+}
+
 /// Settings shared by NetherClient::connect_with and NetherServer::bind_with.
 #[derive(Clone)]
 pub struct ConnectionConfig {
@@ -36,6 +45,9 @@ pub struct ConnectionConfig {
     /// Client offers made when negotiation times out; 0 counts as 1.
     /// Caller-driven signaling always uses one attempt; the application owns retries.
     pub attempts: u32,
+
+    /// Optional STUN/TURN paths for outbound client sessions; servers continue to use their own admission path.
+    pub client_ice: Option<ClientIceConfig>,
 
     /// Signs local SDP: ClientIdentity for offers or ServerIdentity for answers.
     pub identity: Option<Arc<dyn SdpIdentity>>,
@@ -66,6 +78,7 @@ impl Default for ConnectionConfig {
             timeouts: Timeouts::default(),
             cancel_token: CancellationToken::new(),
             attempts: 3,
+            client_ice: None,
             identity: None,
             allow_unsigned_answers: false,
             token_trust: None,
@@ -82,6 +95,7 @@ impl fmt::Debug for ConnectionConfig {
         f.debug_struct("ConnectionConfig")
             .field("timeouts", &self.timeouts)
             .field("attempts", &self.attempts)
+            .field("client_ice", &self.client_ice.is_some())
             .field("identity", &self.identity.is_some())
             .field("allow_unsigned_answers", &self.allow_unsigned_answers)
             .field("token_trust", &self.token_trust.is_some())

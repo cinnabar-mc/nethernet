@@ -3,8 +3,8 @@
 //! This owner starts no tasks and opens no sockets. Create a separate bridge for
 //! each concurrent connection, and multiplex their requests over the caller's
 //! messaging socket. Sender routing uses the authenticated messaging envelope,
-//! not a peer's separately advertised NetherNet ID. The transport still gathers
-//! only host ICE candidates; this bridge does not add STUN or TURN support.
+//! not a peer's separately advertised NetherNet ID. ICE gathering and relay paths remain owned by the configured transport session;
+//! this bridge only carries its signals.
 
 use crate::error::Result;
 use crate::protocol::{Signal, SignalType};

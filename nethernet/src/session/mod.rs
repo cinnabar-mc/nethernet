@@ -12,7 +12,10 @@ use crate::sans::Sans;
 use dtls::EndpointEvent;
 pub use dtls::ResolvedRole;
 use ice::IceLayer;
-pub use ice::{GatheringState, IceConfig, IceError, IcePolicy, IceServer, TurnCredentials};
+pub use ice::{
+    GatheringState, IceConfig, IceError, IcePolicy, IceServer, MAX_ICE_SERVERS,
+    MAX_TURN_CREDENTIAL_BYTES, TurnCredentials,
+};
 use rtc::datachannel::message::Message as DcepMessage;
 use rtc::ice::candidate::Candidate;
 use rtc::ice::state::ConnectionState as IceConnectionState;

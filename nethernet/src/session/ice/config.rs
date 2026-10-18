@@ -3,9 +3,11 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-pub(super) const MAX_SERVERS: usize = 8;
+/// Maximum resolved STUN/TURN endpoints retained by one session.
+pub const MAX_ICE_SERVERS: usize = 8;
 pub(super) const MAX_REMOTE_CANDIDATES: usize = 64;
-const MAX_CREDENTIAL_BYTES: usize = 512;
+/// Maximum bytes in either TURN credential component.
+pub const MAX_TURN_CREDENTIAL_BYTES: usize = 512;
 
 /// Failures at the configured ICE boundary. Dependency errors never expose server text or credentials.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +39,8 @@ impl TurnCredentials {
     pub fn new(username: String, password: String, valid_until: Instant) -> Result<Self, IceError> {
         if username.is_empty()
             || password.is_empty()
-            || username.len() > MAX_CREDENTIAL_BYTES
-            || password.len() > MAX_CREDENTIAL_BYTES
+            || username.len() > MAX_TURN_CREDENTIAL_BYTES
+            || password.len() > MAX_TURN_CREDENTIAL_BYTES
             || username.contains('\0')
             || password.contains('\0')
         {
@@ -100,7 +102,7 @@ impl Default for IceConfig {
 impl IceConfig {
     /// Checks bounded inputs before any RTC transaction is constructed.
     pub(super) fn validate(&self, local: SocketAddr, now: Instant) -> Result<(), IceError> {
-        if self.servers.len() > MAX_SERVERS
+        if self.servers.len() > MAX_ICE_SERVERS
             || self.gather_timeout.is_zero()
             || self.gather_timeout > Duration::from_secs(60)
             || now.checked_add(self.gather_timeout).is_none()

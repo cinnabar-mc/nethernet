@@ -11,6 +11,11 @@ use tokio::sync::oneshot;
 pub(crate) enum Command {
     Send(Channel, Bytes, oneshot::Sender<Result<()>>),
     Signal(Signal),
+    TurnCredentials(
+        SocketAddr,
+        nethernet::session::TurnCredentials,
+        oneshot::Sender<Result<()>>,
+    ),
     RemoteAddr(oneshot::Sender<Option<SocketAddr>>),
     Rtt(oneshot::Sender<Option<Duration>>),
     SetPlayer(Arc<PlayerInfo>),

@@ -6,6 +6,7 @@ readme = "../README.md"
 
 [dependencies]
 nethernet.workspace = true
+rtc.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 socket2 = "0.6.5"

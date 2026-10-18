@@ -221,6 +221,17 @@ impl Connection {
     pub fn close(&mut self, now: Instant) -> Result<(), ProtocolError> {
         self.session.close(now)
     }
+
+    /// Rotates one TURN allocation's credential using the caller's clock.
+    pub fn update_turn_credentials(
+        &mut self,
+        server: SocketAddr,
+        credentials: crate::session::TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        self.session
+            .update_turn_credentials(server, credentials, now)
+    }
 }
 
 pub enum ConnectionInput {

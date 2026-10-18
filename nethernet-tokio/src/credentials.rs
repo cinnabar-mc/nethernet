@@ -1,7 +1,7 @@
 //! TURN credentials in the JSON form returned by the signaling service.
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Credentials {
     /// Lifetime of the credentials in seconds.
     #[serde(rename = "ExpirationInSeconds")]
@@ -11,7 +11,7 @@ pub struct Credentials {
     pub ice_servers: Vec<IceServer>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct IceServer {
     #[serde(rename = "Username")]
     pub username: String,

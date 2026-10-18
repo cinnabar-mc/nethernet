@@ -1,19 +1,25 @@
 //! A connected session driven by one task, with reliable and unreliable channels and peer metadata.
 pub(crate) mod command;
+pub(crate) mod guard;
+pub(crate) mod outgoing;
 
 pub(crate) use command::Command;
 
 use crate::addr::Addr;
 use crate::error::{NetherError, Result};
+use crate::signaling::ClientSignaling;
 use bytes::Bytes;
+use futures::future::{BoxFuture, pending};
+use guard::{ConnectionGuard, transport_now};
 use nethernet::connection::{Connection as SansConnection, ConnectionInput};
 use nethernet::identity::PlayerInfo;
 use nethernet::sans::Sans;
 pub use nethernet::session::Channel;
 use nethernet::session::{SessionEvent, SessionOutput};
+use outgoing::signal_send;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -80,6 +86,22 @@ impl Session {
         SessionReceiver,
         oneshot::Receiver<()>,
     ) {
+        Self::spawn_with_signaling(socket, connection, local, remote, None)
+    }
+
+    /// Retains the concrete signaling owner only when late outgoing candidates can be produced.
+    pub(crate) fn spawn_with_signaling(
+        socket: Arc<UdpSocket>,
+        connection: SansConnection,
+        local: Addr,
+        remote: Addr,
+        signaling: Option<(ClientSignaling, Duration)>,
+    ) -> (
+        Self,
+        SessionReceiver,
+        SessionReceiver,
+        oneshot::Receiver<()>,
+    ) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (packet_tx, packet_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
         let (unreliable_tx, unreliable_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
@@ -94,6 +116,7 @@ impl Session {
             unreliable_tx,
             Some(ready_tx),
             close_token.clone(),
+            signaling,
         );
 
         let guard = Arc::new(TaskGuard {
@@ -130,16 +153,20 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     fn drive(
         socket: Arc<UdpSocket>,
-        mut connection: SansConnection,
+        connection: SansConnection,
         mut commands: mpsc::UnboundedReceiver<Command>,
         packet_tx: mpsc::Sender<Bytes>,
         unreliable_tx: mpsc::Sender<Bytes>,
         mut ready_tx: Option<oneshot::Sender<()>>,
         close_token: CancellationToken,
+        signaling: Option<(ClientSignaling, Duration)>,
     ) -> JoinHandle<()> {
+        let mut guard = ConnectionGuard::new(connection, socket.clone());
         tokio::spawn(async move {
+            let connection = guard.core();
             let mut buf = vec![0u8; 65536];
-            let mut wake = Instant::now() + MAX_IDLE;
+            let mut wake = transport_now();
+            let mut outgoing: Option<BoxFuture<'static, Result<()>>> = None;
             let mut remote_addr = None;
             let mut rtt = None;
             let mut player: Option<Arc<PlayerInfo>> = None;
@@ -150,9 +177,20 @@ impl Session {
                     biased;
 
                     _ = close_token.cancelled() => break,
+                    _ = tokio::time::sleep_until(wake.into()) => {
+                        let now = transport_now();
+                        if connection.handle(ConnectionInput::Timeout(now)).is_err() { break; }
+                        wake = now + MAX_IDLE;
+                    },
+                    result = async {
+                        match &mut outgoing { Some(send) => send.await, None => pending().await }
+                    } => {
+                        outgoing = None;
+                        if result.is_err() { break; }
+                    },
                     received = socket.recv_from(&mut buf) => match received {
                         Ok((n, from)) => {
-                            let now = Instant::now();
+                            let now = transport_now();
                             let input = ConnectionInput::Packet(buf[..n].into(), from, now);
                             if let Err(e) = connection.handle(input) {
                                 tracing::debug!("packet handling error: {e}");
@@ -163,12 +201,12 @@ impl Session {
                     command = commands.recv() => match command {
                         Some(Command::Send(channel, data, reply)) => {
                             let result = connection
-                                .handle(ConnectionInput::Send(channel, data, Instant::now()))
+                                .handle(ConnectionInput::Send(channel, data, transport_now()))
                                 .map_err(NetherError::from);
                             let _ = reply.send(result);
                         }
                         Some(Command::Signal(signal)) => {
-                            if let Err(e) = connection.handle(ConnectionInput::Signal(signal, Instant::now())) {
+                            if let Err(e) = connection.handle(ConnectionInput::Signal(signal, transport_now())) {
                                 tracing::debug!("signal handling error: {e}");
                             }
                         }
@@ -190,14 +228,12 @@ impl Session {
                         Some(Command::Host(reply)) => {
                             let _ = reply.send(host.clone());
                         }
+                        Some(Command::TurnCredentials(server, credentials, reply)) => {
+                            let result = connection.update_turn_credentials(server, credentials, transport_now()).map_err(NetherError::from);
+                            let _ = reply.send(result);
+                        }
                         None => break,
                     },
-                    _ = tokio::time::sleep_until(wake.into()) => {
-                        let now = Instant::now();
-                        if let Err(e) = connection.handle(ConnectionInput::Timeout(now)) {
-                            tracing::debug!("timeout handling error: {e}");
-                        }
-                    }
                 }
 
                 while let Some(output) = connection.poll() {
@@ -218,17 +254,24 @@ impl Session {
                             break 'drive;
                         }
                         SessionOutput::Message(Channel::Reliable, data) => {
-                            if packet_tx.send(Bytes::from(data)).await.is_err() {
-                                break;
+                            if packet_tx.try_send(Bytes::from(data)).is_err() {
+                                break 'drive;
                             }
                         }
                         SessionOutput::Message(Channel::Unreliable, data) => {
                             let _ = unreliable_tx.try_send(Bytes::from(data));
                         }
                         SessionOutput::Wait(wait) => {
-                            wake = Instant::now() + wait.min(MAX_IDLE);
+                            wake = transport_now() + wait.min(MAX_IDLE);
                         }
                     }
+                }
+
+                if outgoing.is_none()
+                    && let Some((signaling, within)) = &signaling
+                    && let Some(signal) = connection.poll_local_signal()
+                {
+                    outgoing = Some(signal_send(signaling.clone(), signal, *within));
                 }
 
                 rtt = connection.rtt();
@@ -240,6 +283,19 @@ impl Session {
 
     pub async fn send(&self, data: Bytes) -> Result<()> {
         self.send_on(Channel::Reliable, data).await
+    }
+
+    /// Replaces one TURN server's credential without opening a service client or changing its allocation.
+    pub async fn update_turn_credentials(
+        &self,
+        server: std::net::SocketAddr,
+        credentials: nethernet::session::TurnCredentials,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::TurnCredentials(server, credentials, reply_tx))
+            .map_err(|_| NetherError::ConnectionClosed)?;
+        reply_rx.await.map_err(|_| NetherError::ConnectionClosed)?
     }
 
     /// The message must fit one segment (guide section 6.1).

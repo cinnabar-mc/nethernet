@@ -214,3 +214,115 @@ async fn peer_worker_refuses_originally_expired_ready_handoff() {
 async fn peer_worker_refuses_never_ready_closed_handoff() {
     exercise_handoff(HandoffCase::NeverReady).await;
 }
+
+#[tokio::test]
+async fn peer_worker_retains_ready_prefix_and_close_during_answer_dispatch() {
+    use crate::signaling::lan::{LanConfig, LanSignaling};
+    use nethernet::protocol::SignalType;
+    use nethernet::protocol::packet::discovery::ServerData;
+    use nethernet::protocol::webrtc::candidate::parse_ice_candidate;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        // The current discovery adapter cannot expose a port-zero bind; reuse the existing LAN fixture convention.
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let signaling = Arc::new(
+            LanSignaling::with_config(
+                1,
+                address,
+                LanConfig {
+                    discovery_port: address.port(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        signaling.set_server_data(ServerData::new("fixture".into(), "world".into()));
+        let client = LanSignaling::with_config(
+            2,
+            "127.0.0.1:0".parse().unwrap(),
+            LanConfig {
+                discovery_port: address.port(),
+                broadcast_address: Some(address),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut offers = signaling.signals();
+        let mut answers = client.signals();
+        while !client.discover().await.contains_key(&1) {
+            tokio::task::yield_now().await;
+        }
+        let (mut rtc, offer) = RtcPeer::offer().await;
+        client
+            .signal(Signal::offer(7, offer, "1".into()))
+            .await
+            .unwrap();
+        let offer = offers.next().await.unwrap();
+        assert_eq!(offer.signal_type, SignalType::Offer);
+        let pending = PendingOffers::default()
+            .try_admit(&offer.network_id, 1, 1)
+            .unwrap();
+        let capacity = Arc::new(Semaphore::new(1));
+        let lease = ServerLease::new(capacity.try_acquire_owned().unwrap());
+        let (incoming_tx, mut incoming) = mpsc::channel(1);
+        let (_signals, signal_rx) = mpsc::channel(crate::session::command::COMMAND_CAPACITY);
+        let config = ConnectionConfig::default();
+        let mut owner = Peer {
+            signaling: signaling.clone().into(),
+            incoming: incoming_tx,
+            negotiation_deadline: transport_now() + config.timeouts.negotiation,
+            config,
+            listener: CancellationToken::new(),
+            stop: CancellationToken::new(),
+            signals: signal_rx,
+        };
+        let mut answer = Box::pin(owner.answer(offer, lease));
+        assert!(poll!(answer.as_mut()).is_pending());
+        // The second concrete Address command follows the worker's own query in the real LAN actor.
+        signaling.get_address(2).await.unwrap();
+        assert!(poll!(answer.as_mut()).is_pending());
+        let first = answers.next().await.unwrap();
+        assert_eq!(first.signal_type, SignalType::Answer);
+        // Consume that real ACK, then hold the worker at its next genuine candidate-ACK await.
+        assert!(poll!(answer.as_mut()).is_pending());
+        let candidate = answers.next().await.unwrap();
+        assert_eq!(candidate.signal_type, SignalType::Candidate);
+        let endpoint = parse_ice_candidate(&candidate.data).unwrap().addr();
+        rtc.apply_answer(first.data);
+        rtc.apply_candidate(candidate.data);
+        while !rtc.both_ready() {
+            rtc.turn().await;
+        }
+        for index in 0..3 {
+            rtc.send(index);
+        }
+        while rtc.outstanding() != 0 {
+            rtc.turn().await;
+        }
+        rtc.close_dtls().await;
+        rtc.close_reply(endpoint).await;
+        let answered = answer
+            .await
+            .expect("accepted ready prefix was lost during actual answer dispatch");
+        let _forwarding = owner
+            .handoff(answered, pending)
+            .await
+            .expect("answer dispatch lost its actual ready handoff");
+        let mut accepted = incoming.recv().await.unwrap();
+        assert!(accepted.session.accept_from_server());
+        for index in 0u32..3 {
+            assert_eq!(
+                accepted.reliable.recv().await.unwrap().unwrap().as_ref(),
+                index.to_be_bytes()
+            );
+        }
+        assert!(accepted.reliable.recv().await.unwrap().is_none());
+        assert!(accepted.reliable.recv().await.unwrap().is_none());
+    })
+    .await
+    .expect("finite actual LAN answer-dispatch handoff fixture stalled");
+}

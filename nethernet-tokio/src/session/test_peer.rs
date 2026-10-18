@@ -8,7 +8,7 @@ use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::{
-    CandidateConfig, CandidateHostConfig, RTCDtlsRole, RTCIceCandidate,
+    CandidateConfig, CandidateHostConfig, RTCDtlsRole, RTCIceCandidate, RTCIceCandidateInit,
 };
 use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::sansio::Protocol;
@@ -105,6 +105,16 @@ impl Peer {
             .unwrap();
     }
 
+    /// Applies a genuine candidate from the same signaling exchange to RTC's ICE owner.
+    pub fn apply_candidate(&mut self, candidate: String) {
+        self.pc
+            .add_remote_candidate(RTCIceCandidateInit {
+                candidate,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
     /// Flushes currently available protocol datagrams without creating a background task.
     pub async fn flush(&mut self) {
         while let Some(packet) = self.pc.poll_write() {
@@ -198,5 +208,19 @@ impl Peer {
             alerts > 0,
             "the actual RTC peer did not emit an authenticated DTLS close"
         );
+    }
+
+    /// Observes the real core's closing reply after its peer-close event, from its exact candidate endpoint.
+    pub async fn close_reply(&mut self, server: std::net::SocketAddr) {
+        loop {
+            let (size, from) = self.socket.recv_from(&mut self.buffer).await.unwrap();
+            if from == server
+                && self.buffer[..size]
+                    .first()
+                    .is_some_and(|byte| ContentType::from(*byte) == ContentType::Alert)
+            {
+                return;
+            }
+        }
     }
 }

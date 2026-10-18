@@ -152,15 +152,18 @@ async fn original_deadline_and_driver_closure_cancel_inflight_requests_without_r
     let request = driver.recv().await.unwrap();
     tokio::time::advance(signaling.config.send_timeout).await;
     assert!(request.is_cancelled());
-    assert!(matches!(
-        send.await,
-        Err(NetherError::CallerSignaling(CallerSignalingError::TimedOut))
-    ));
+    request.finish(Ok(SignalDelivery::PeerReceived));
+    assert!(
+        matches!(
+            send.await,
+            Err(NetherError::CallerSignaling(CallerSignalingError::TimedOut))
+        ),
+        "a late completion must not turn an expired wait into success"
+    );
     assert!(
         driver.recv().now_or_never().is_none(),
         "a timed out request was retried"
     );
-    request.finish(Ok(SignalDelivery::PeerReceived));
 
     let mut send =
         Box::pin(signaling.signal(Signal::candidate(7, "candidate".into(), PEER.into())));

@@ -120,6 +120,8 @@ keeping its receivers does not free it. The existing `max_pending` and
 `max_pending_per_network_id` separately limit negotiations. Excess offers are
 refused with `IncomingConnectionIgnored`; setting `max_sessions` to zero refuses
 all offers.
+Refusal delivery retains at most one best-effort send; further excess offers may
+expire while that signaling operation is stalled.
 
 The listener owns its pending negotiations and bounded late-candidate queues.
 Closing or dropping it cancels unaccepted peers through metadata, answer delivery

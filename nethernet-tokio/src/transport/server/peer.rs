@@ -1,12 +1,12 @@
 //! One bounded incoming negotiation, followed by its owned late-signal forwarding.
 use crate::addr::Addr;
-use crate::error::{NetherError, Result, SignalErrorCode};
+use crate::error::{NetherError, SignalErrorCode};
 use crate::protocol::Signal;
 use crate::session::guard::transport_now;
 use crate::session::{AcceptedSession, Command, ServerLease, ServerRetirement, Session};
 use crate::signaling::ServerSignaling;
 use crate::transport::{ConnectionConfig, local_bind_addr, pending::PendingSlot};
-use futures::future::pending;
+use futures::{FutureExt, future::Shared};
 use nethernet::admission::OfferPolicy;
 use nethernet::connection::IceMode;
 use std::sync::Arc;
@@ -29,7 +29,8 @@ pub(super) struct Peer {
 
 struct Answered {
     accepted: AcceptedSession,
-    ready: oneshot::Receiver<()>,
+    // Retains the actor's exact outcome across dispatch and handoff suspension.
+    ready: Shared<oneshot::Receiver<()>>,
     deadline: Instant,
     retirement: ServerRetirement,
 }
@@ -38,6 +39,8 @@ struct Forwarding {
     commands: mpsc::Sender<Command>,
     close: CancellationToken,
     retirement: ServerRetirement,
+    // A consumed candidate remains owned through readiness; later signals cannot overtake it.
+    pending: Option<Signal>,
 }
 
 impl Peer {
@@ -93,6 +96,7 @@ impl Peer {
             commands,
             close,
             mut retirement,
+            mut pending,
         } = self.handoff(answered, slot).await?;
         // Forwarding retains no Session or receiver handle; dropping all public owners stops the actor.
         loop {
@@ -102,12 +106,16 @@ impl Peer {
                 _ = self.config.cancel_token.cancelled() => break,
                 _ = self.stop.cancelled() => { close.cancel(); retirement.preserve_queued(); break; },
                 _ = close.cancelled() => { retirement.preserve_queued(); break; },
-                signal = self.signals.recv() => {
-                    let Some(signal) = signal else { break; };
-                    if self.forward(signal, &commands, &close, None).await.is_err() {
+                permit = commands.reserve(), if pending.is_some() => {
+                    let Ok(permit) = permit else {
                         if close.is_cancelled() { retirement.preserve_queued(); }
                         break;
-                    }
+                    };
+                    permit.send(Command::Signal(pending.take().expect("reservation has a retained candidate")));
+                }
+                signal = self.signals.recv(), if pending.is_none() => {
+                    let Some(signal) = signal else { break; };
+                    pending = Some(signal);
                 }
             }
         }
@@ -119,32 +127,44 @@ impl Peer {
     async fn handoff(&mut self, answered: Answered, slot: PendingSlot) -> OfferResult<Forwarding> {
         let Answered {
             accepted,
-            mut ready,
+            ready,
             deadline,
             retirement,
         } = answered;
         let close = accepted.session.close_token();
         let commands = accepted.session.signal_sender();
+        // Reserve capacity alongside Ready rather than hiding it behind a blocked send.
+        let mut pending = None;
         loop {
             tokio::select! {
                 biased;
                 _ = self.listener.cancelled() => return Err(closed()),
                 _ = self.config.cancel_token.cancelled() => return Err(closed()),
                 _ = self.stop.cancelled() => { close.cancel(); return Err(closed()); },
-                _ = close.cancelled() => return Err(closed()),
                 _ = tokio::time::sleep_until(deadline.into()) => return Err(timeout()),
-                result = &mut ready => {
+                result = ready.clone() => {
                     result.map_err(|_| closed())?;
                     if transport_now() >= deadline { return Err(timeout()); }
                     break;
                 }
-                signal = self.signals.recv() => {
-                    self.forward(signal.ok_or_else(closed)?, &commands, &close, Some(deadline)).await.map_err(|error| match error {
-                        NetherError::Timeout => timeout(),
-                        error => (None, error),
-                    })?;
+                _ = close.cancelled() => return Err(closed()),
+                permit = commands.reserve(), if pending.is_some() => {
+                    let permit = permit.map_err(|_| closed())?;
+                    permit.send(Command::Signal(pending.take().expect("reservation has a retained candidate")));
+                }
+                signal = self.signals.recv(), if pending.is_none() => {
+                    pending = Some(signal.ok_or_else(closed)?);
                 }
             }
+        }
+        if self.listener.is_cancelled()
+            || self.config.cancel_token.is_cancelled()
+            || self.stop.is_cancelled()
+        {
+            return Err(closed());
+        }
+        if transport_now() >= deadline {
+            return Err(timeout());
         }
         drop(slot);
         self.incoming.try_send(accepted).map_err(|_| closed())?;
@@ -152,6 +172,7 @@ impl Peer {
             commands,
             close,
             retirement,
+            pending,
         })
     }
 
@@ -200,23 +221,34 @@ impl Peer {
         let (session, reliable, unreliable, ready) =
             Session::spawn_for_server(socket, answered.connection, local, remote, lease);
         let retirement = session.server_retirement();
-        let dispatch = async {
-            if let Some(player) = player {
-                session.set_player(player).await;
+        // Cache only the actual actor result; dispatch and handoff may each resume after its close.
+        let ready = ready.shared();
+        {
+            let dispatch = async {
+                if let Some(player) = player {
+                    session.set_player(player).await;
+                }
+                if let Some(host) = signaled_host {
+                    session.set_host(host).await;
+                }
+                for outgoing in answered.signals {
+                    self.signaling.signal(outgoing).await?;
+                }
+                Ok::<_, NetherError>(())
+            };
+            tokio::pin!(dispatch);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = self.listener.cancelled() => return Err(closed()),
+                    _ = self.config.cancel_token.cancelled() => return Err(closed()),
+                    _ = self.stop.cancelled() => return Err(closed()),
+                    _ = tokio::time::sleep_until(deadline.into()) => return Err(timeout()),
+                    result = &mut dispatch => { result.map_err(|error| (None, error))?; break; },
+                    result = ready.clone(), if ready.peek().is_none() => { result.map_err(|_| closed())?; },
+                    _ = session.closed(), if !ready.peek().is_some_and(|result| result.is_ok()) => return Err(closed()),
+                }
             }
-            if let Some(host) = signaled_host {
-                session.set_host(host).await;
-            }
-            for outgoing in answered.signals {
-                self.signaling.signal(outgoing).await?;
-            }
-            Ok::<_, NetherError>(())
-        };
-        tokio::select! {
-            biased;
-            _ = session.closed() => return Err(closed()),
-            _ = tokio::time::sleep_until(deadline.into()) => return Err(timeout()),
-            result = dispatch => result.map_err(|error| (None, error))?,
         }
         if transport_now() >= deadline {
             return Err(timeout());
@@ -231,34 +263,6 @@ impl Peer {
             deadline,
             retirement,
         })
-    }
-
-    /// Forwards one late candidate under cancellation and the original ready deadline, if pending.
-    async fn forward(
-        &self,
-        signal: Signal,
-        commands: &mpsc::Sender<Command>,
-        close: &CancellationToken,
-        deadline: Option<Instant>,
-    ) -> Result<()> {
-        if deadline.is_some_and(|deadline| transport_now() >= deadline) {
-            return Err(NetherError::Timeout);
-        }
-        let expired = async {
-            match deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
-                None => pending().await,
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = self.listener.cancelled() => Err(NetherError::ConnectionClosed),
-            _ = self.config.cancel_token.cancelled() => Err(NetherError::ConnectionClosed),
-            _ = self.stop.cancelled() => { close.cancel(); Err(NetherError::ConnectionClosed) },
-            _ = close.cancelled() => Err(NetherError::ConnectionClosed),
-            _ = expired => Err(NetherError::Timeout),
-            result = commands.send(Command::Signal(signal)) => result.map_err(|_| NetherError::ConnectionClosed),
-        }
     }
 }
 

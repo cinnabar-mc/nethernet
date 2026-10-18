@@ -588,12 +588,22 @@ impl Session {
         self.terminate(SessionEvent::Failed, now)
     }
 
-    /// Retires all protocol state before publishing the single terminal outcome.
+    /// Retains accepted data/readiness in order, retiring protocol work before the single terminal outcome.
     fn terminate(&mut self, terminal: SessionEvent, now: Instant) -> Result<(), ProtocolError> {
         if !self.channels.terminal_emitted {
             self.channels.terminal_emitted = true;
-            self.close(now)?;
-            self.output.push_back(SessionOutput::Event(terminal));
+            let mut accepted = std::mem::take(&mut self.output);
+            accepted.retain(|output| {
+                matches!(
+                    output,
+                    SessionOutput::Message(..) | SessionOutput::Event(SessionEvent::Ready)
+                )
+            });
+            let teardown = self.close(now);
+            accepted.append(&mut self.output);
+            accepted.push_back(SessionOutput::Event(terminal));
+            self.output = accepted;
+            teardown?;
         }
         Ok(())
     }

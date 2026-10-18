@@ -12,6 +12,8 @@ use tokio::sync::oneshot;
 pub(crate) const COMMAND_CAPACITY: usize = 16;
 
 pub(crate) enum Command {
+    #[cfg(test)]
+    QueuedCommands(oneshot::Sender<usize>),
     Send(Channel, Bytes, Option<Instant>, oneshot::Sender<Result<()>>),
     Signal(Signal),
     TurnCredentials(

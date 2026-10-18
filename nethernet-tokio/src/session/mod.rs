@@ -81,10 +81,14 @@ pub struct AcceptedSession {
 }
 
 impl Session {
-    /// Observes actual actor admission in owning tests without advancing the driver.
+    /// Queues a snapshot before the test's send burst; the actual receiver observes it before draining that burst.
     #[cfg(test)]
-    fn queued_commands(&self) -> usize {
-        self.command_tx.max_capacity() - self.command_tx.capacity()
+    fn queued_commands(&self) -> oneshot::Receiver<usize> {
+        let (reply, observation) = oneshot::channel();
+        self.command_tx
+            .try_send(Command::QueuedCommands(reply))
+            .expect("fixture's observation precedes its command burst");
+        observation
     }
 
     pub(crate) fn spawn(
@@ -273,6 +277,10 @@ impl Session {
                         Err(e) => tracing::debug!("recv error: {e}"),
                     },
                     command = commands.recv() => match command {
+                        #[cfg(test)]
+                        Some(Command::QueuedCommands(reply)) => {
+                            let _ = reply.send(commands.len());
+                        }
                         Some(Command::Send(channel, data, deadline, reply)) => {
                             let now = transport_now();
                             let result = if deadline.is_some_and(|deadline| now >= deadline) {

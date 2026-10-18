@@ -4,21 +4,47 @@ use crate::identity::error::{IdentityError, Result};
 use crate::identity::jwk::MinecraftKeys;
 use crate::identity::jwt::{Claims, Jws};
 use crate::identity::{MINECRAFT_AUDIENCE, MINECRAFT_ISSUER};
-use std::time::SystemTime;
+use std::{fmt, sync::Arc, time::SystemTime};
+
+/// Application-supplied, pure issuer policy for a received multiplayer token.
+/// Verify signature, algorithm, issuer, audience, identity and validity before
+/// returning claims. This hook opens no HTTP client and does not read a clock.
+/// The SDP owner always separately verifies the detached fingerprint signature
+/// with the returned token's own `cpk`; never bind it to the local client's key.
+pub trait TokenVerifier: Send + Sync {
+    /// Authenticates the token under the caller's explicit time policy.
+    fn verify(&self, token: &str, now: SystemTime) -> Result<Claims>;
+}
 
 /// How the token in a received assertion is authenticated.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum TokenTrust {
     /// RS256 token signed by a key in the set, with the Minecraft issuer and audience.
     Minecraft(MinecraftKeys),
+
+    /// A configured provider's signature, issuer, audience, identity and temporal policy.
+    Provider(Arc<dyn TokenVerifier>),
 
     /// Any well-formed unexpired token; signature, issuer and audience are not checked.
     Any,
 }
 
+impl fmt::Debug for TokenTrust {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Minecraft(keys) => f.debug_tuple("Minecraft").field(keys).finish(),
+            Self::Provider(_) => f.write_str("Provider(..)"),
+            Self::Any => f.write_str("Any"),
+        }
+    }
+}
+
 impl TokenTrust {
     /// Parses the token and checks its expiry, plus signature, issuer and audience under `Minecraft`.
     pub fn claims(&self, identity: &Identity, now: SystemTime) -> Result<Claims> {
+        if let Self::Provider(verifier) = self {
+            return verifier.verify(&identity.assertion.token, now);
+        }
         let jws = Jws::parse(&identity.assertion.token)?;
         let claims = jws.claims()?;
         claims.check_expiry(now)?;
@@ -212,5 +238,44 @@ mod tests {
             validate_sdp(&answer, &TokenTrust::Any, NOW + Duration::from_secs(600)).unwrap_err();
 
         assert!(matches!(error, IdentityError::Untrusted(_)));
+    }
+
+    /// Provider policy authenticates the peer token while the existing SDP owner
+    /// independently binds its own cpk to the exact received fingerprints.
+    #[test]
+    fn configured_provider_keeps_token_and_fingerprint_verification_separate() {
+        struct Provider(p384::ecdsa::VerifyingKey);
+        impl TokenVerifier for Provider {
+            fn verify(&self, token: &str, now: SystemTime) -> Result<Claims> {
+                let jws = Jws::parse(token)?;
+                jws.verify_es384(&self.0)?;
+                let claims = jws.claims()?;
+                claims.check_expiry(now)?;
+                if claims.issuer() != Some("peer.example") {
+                    return Err(IdentityError::Untrusted("wrong provider".to_owned()));
+                }
+                Ok(claims)
+            }
+        }
+        let peer = ServerIdentity::generate("peer.example", NOW).unwrap();
+        let trust = TokenTrust::Provider(Arc::new(Provider(*peer.verifying_key())));
+        let answer = peer
+            .augment(&offer(""), NOW)
+            .unwrap()
+            .replace("a=identity:\r\n", "");
+        assert_eq!(
+            validate_sdp(&answer, &trust, NOW).unwrap().issuer(),
+            Some("peer.example")
+        );
+        assert!(matches!(
+            validate_sdp(&answer.replace("AB:CD", "EF:01"), &trust, NOW),
+            Err(IdentityError::FingerprintMismatch)
+        ));
+        let stranger = ServerIdentity::generate("peer.example", NOW).unwrap();
+        let wrong = stranger
+            .augment(&offer(""), NOW)
+            .unwrap()
+            .replace("a=identity:\r\n", "");
+        assert!(validate_sdp(&wrong, &trust, NOW).is_err());
     }
 }

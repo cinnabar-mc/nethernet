@@ -168,6 +168,17 @@ async fn an_expired_queued_send_is_refused_before_sctp_admission() {
             ))
             .unwrap();
         assert!(matches!(result.await.unwrap(), Err(NetherError::Timeout)));
+        let (reply, result) = oneshot::channel();
+        drop(result);
+        sender
+            .command_tx
+            .send(Command::Send(
+                Channel::Reliable,
+                Bytes::from_static(b"abandoned Login"),
+                Some(deadline + Duration::from_secs(5)),
+                reply,
+            ))
+            .unwrap();
         sender
             .send(Bytes::from_static(b"ordinary send"))
             .await

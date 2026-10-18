@@ -204,10 +204,17 @@ impl Session {
                         Err(e) => tracing::debug!("recv error: {e}"),
                     },
                     command = commands.recv() => match command {
-                        Some(Command::Send(channel, data, _deadline, reply)) => {
-                            let result = connection
-                                .handle(ConnectionInput::Send(channel, data, transport_now()))
-                                .map_err(NetherError::from);
+                        Some(Command::Send(channel, data, deadline, reply)) => {
+                            let now = transport_now();
+                            let result = if deadline.is_some_and(|deadline| now >= deadline) {
+                                Err(NetherError::Timeout)
+                            } else if deadline.is_some() && reply.is_closed() {
+                                // An abandoned wait may retract only a command not yet admitted.
+                                Err(NetherError::ConnectionClosed)
+                            } else {
+                                connection.handle(ConnectionInput::Send(channel, data, now))
+                                    .map_err(NetherError::from)
+                            };
                             let _ = reply.send(result);
                         }
                         Some(Command::Signal(signal)) => {

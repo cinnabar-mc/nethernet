@@ -1,6 +1,7 @@
 //! An application-acquired token bound to one connection proof key.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use p384::ecdsa::SigningKey;
@@ -21,7 +22,7 @@ pub const MAX_TOKEN_BYTES: usize = 64 * 1024;
 /// verify the issuer's signature. Use the same key and token for Bedrock Login.
 /// This owner performs no I/O, reads no clock and never generates a replacement key.
 pub struct TokenIdentity {
-    signing: SigningKey,
+    signing: Arc<SigningKey>,
     token: String,
     claims: Claims,
     issuer: String,
@@ -35,6 +36,8 @@ impl fmt::Debug for TokenIdentity {
 
 impl TokenIdentity {
     /// Takes an acquired credential and checks that it binds this connection key.
+    /// An owned key moves into one Arc allocation; an existing Arc shares that
+    /// exact allocation with Login without copying private material.
     ///
     /// The `iss` claim supplies the SDP identity provider verbatim. Expiry uses
     /// this crate's existing token leeway. Full issuer/temporal verification is
@@ -43,7 +46,12 @@ impl TokenIdentity {
     /// # Errors
     /// Rejects oversized/malformed tokens, absent expiry/issuer, an expired token
     /// or a different `cpk`. Errors never include the supplied credential.
-    pub fn new(signing: SigningKey, token: String, now: SystemTime) -> Result<Self> {
+    pub fn new(
+        signing: impl Into<Arc<SigningKey>>,
+        token: String,
+        now: SystemTime,
+    ) -> Result<Self> {
+        let signing = signing.into();
         if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
             return Err(invalid_token());
         }
@@ -127,9 +135,10 @@ mod tests {
     #[test]
     fn acquired_token_and_connection_key_bind_the_actual_sdp_assertion() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let key = SigningKey::generate();
+        let key = Arc::new(SigningKey::generate());
         let token = token(&key, "https://issuer.example/");
-        let identity = TokenIdentity::new(key, token.clone(), now).unwrap();
+        let identity = TokenIdentity::new(Arc::clone(&key), token.clone(), now).unwrap();
+        assert!(std::ptr::eq(identity.signing_key(), key.as_ref()));
         let sdp = identity.augment(SDP, now).unwrap();
         let parsed = Identity::from_sdp(&sdp).unwrap();
         assert_eq!(parsed.assertion.token, token);

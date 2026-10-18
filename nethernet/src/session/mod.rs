@@ -406,7 +406,8 @@ impl Session {
 
     /// Delivers complete final data and routes close_notify before releasing the relay allocation.
     fn peer_closed(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        let mut final_output = VecDeque::new();
+        let mut final_output = std::mem::take(&mut self.output);
+        final_output.retain(|output| !matches!(output, SessionOutput::Wait(..)));
         let flush = (|| {
             if let Some(sctp) = &mut self.sctp {
                 drain_dcep_and_data(sctp, &mut self.channels, &mut final_output, now)?;

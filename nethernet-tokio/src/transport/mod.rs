@@ -7,7 +7,7 @@ pub use client::NetherClient;
 pub use nethernet::connection::Timeouts;
 pub use server::NetherServer;
 
-use nethernet::identity::{ServerIdentity, TokenTrust};
+use nethernet::identity::{SdpIdentity, TokenTrust};
 use nethernet::protocol::constants::{DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_NETWORK_ID};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -36,8 +36,8 @@ pub struct ConnectionConfig {
     /// Client offers made when negotiation times out; 0 counts as 1.
     pub attempts: u32,
 
-    /// Server identity that signs answers; HTTP signaling needs it unless allow_unsigned_answers is set.
-    pub identity: Option<Arc<ServerIdentity>>,
+    /// Signs local SDP: ClientIdentity for offers or ServerIdentity for answers.
+    pub identity: Option<Arc<dyn SdpIdentity>>,
 
     /// Answers without a signature, which the vanilla client refuses (guide section 5.2).
     pub allow_unsigned_answers: bool,

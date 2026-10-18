@@ -2,7 +2,7 @@
 use crate::connection::{Connection, ConnectionInput, IceMode};
 use crate::error::{ProtocolError, SignalErrorCode};
 use crate::identity::error::IdentityError;
-use crate::identity::{PlayerInfo, ServerIdentity, TokenTrust, validate_sdp};
+use crate::identity::{PlayerInfo, SdpIdentity, TokenTrust, validate_sdp};
 use crate::protocol::Signal;
 use crate::protocol::webrtc::Description;
 use crate::sans::Sans;
@@ -44,13 +44,25 @@ impl AdmissionError {
 }
 
 /// Server settings applied to every offer: an identity signs answers, token trust authenticates offers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct OfferPolicy<'a> {
-    identity: Option<&'a ServerIdentity>,
+    identity: Option<&'a dyn SdpIdentity>,
     token_trust: Option<&'a TokenTrust>,
     infer_peer_candidates: bool,
     ice_mode: IceMode,
     establish_deadline: Option<Duration>,
+}
+
+impl std::fmt::Debug for OfferPolicy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OfferPolicy")
+            .field("identity", &self.identity.is_some())
+            .field("token_trust", &self.token_trust.is_some())
+            .field("infer_peer_candidates", &self.infer_peer_candidates)
+            .field("ice_mode", &self.ice_mode)
+            .field("establish_deadline", &self.establish_deadline)
+            .finish()
+    }
 }
 
 impl<'a> OfferPolicy<'a> {
@@ -70,7 +82,8 @@ impl<'a> OfferPolicy<'a> {
         self
     }
 
-    pub fn with_identity(mut self, identity: &'a ServerIdentity) -> Self {
+    /// Uses the supplied signer for the answer's SDP fingerprints.
+    pub fn with_identity(mut self, identity: &'a dyn SdpIdentity) -> Self {
         self.identity = Some(identity);
         self
     }
@@ -207,6 +220,7 @@ pub struct Answered {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::ServerIdentity;
     use crate::protocol::SignalType;
     use std::net::{Ipv4Addr, SocketAddr};
 

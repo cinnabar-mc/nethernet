@@ -21,3 +21,4 @@ rsa.workspace = true
 rtc.workspace = true
 byteorder.workspace = true
 ipnet.workspace = true
+zeroize.workspace = true

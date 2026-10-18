@@ -98,6 +98,19 @@ defaults to accepting any self-signed token while still binding it to the certif
 peer presents. `nethernet_tokio::util::jwks::Jwks::minecraft` fetches the keys needed to
 require a token issued by the Minecraft authorization service instead.
 
+### Client identities
+
+`ConnectionConfig::identity` accepts an `Arc<dyn SdpIdentity>`. Use
+`ClientIdentity::self_signed(now, lifetime)` for signed-out offers, or
+`ClientIdentity::from_token(key, token, domain)` with an application-authenticated
+token. The token's `cpk` must match the signing key, and expiry is checked when
+signing the offer. The same key is available through `signing_key()` for an
+application login that binds to the transport identity.
+
+Client self-signed tokens encode the public key as base64 DER in `cpk` and `x5u`.
+`ServerIdentity` keeps its existing answer format and also implements
+`SdpIdentity`. Credentials and refresh remain owned by the application.
+
 ## License
 
 This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.

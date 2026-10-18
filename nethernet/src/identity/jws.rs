@@ -73,6 +73,17 @@ impl Jws {
         Ok(format!("{}.{}.{}", header, payload, signature))
     }
 
+    /// Signs a token with the base64 DER public key in its `x5u` header.
+    pub(crate) fn sign_with_x5u(
+        key: &SigningKey,
+        payload: &str,
+        public_key: &str,
+    ) -> Result<String> {
+        let header = serde_json::json!({"alg": "ES384", "x5u": public_key}).to_string();
+        let (header, payload, signature) = Self::sign_parts_with_header(key, &header, payload)?;
+        Ok(format!("{header}.{payload}.{signature}"))
+    }
+
     /// Signs `payload` as a `header..signature` ES384 JWS with the payload left out.
     pub fn sign_detached(key: &SigningKey, payload: &str) -> Result<String> {
         let (header, _, signature) = Self::sign_parts(key, payload)?;
@@ -80,7 +91,16 @@ impl Jws {
     }
 
     fn sign_parts(key: &SigningKey, payload: &str) -> Result<(String, String, String)> {
-        let header = URL_SAFE_NO_PAD.encode(ES384_HEADER);
+        Self::sign_parts_with_header(key, ES384_HEADER, payload)
+    }
+
+    /// Signs the encoded header and payload without changing either representation.
+    fn sign_parts_with_header(
+        key: &SigningKey,
+        header: &str,
+        payload: &str,
+    ) -> Result<(String, String, String)> {
+        let header = URL_SAFE_NO_PAD.encode(header);
         let payload = URL_SAFE_NO_PAD.encode(payload);
 
         let signature: Signature = key

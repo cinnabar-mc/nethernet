@@ -224,7 +224,7 @@ impl NetherServer {
             OfferPolicy::new(ice_mode).with_inferred_peer_candidates(config.infer_peer_candidates);
         policy = policy.with_establish_deadline(config.timeouts.establish());
         if let Some(identity) = &config.identity {
-            policy = policy.with_identity(identity);
+            policy = policy.with_identity(identity.as_ref());
         }
         if !signaling.validates_offers()
             && let Some(trust) = &config.token_trust

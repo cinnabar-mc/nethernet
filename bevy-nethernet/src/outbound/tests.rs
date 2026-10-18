@@ -329,3 +329,13 @@ pub(crate) fn overflow_real_delivery(
     }
     panic!("the real peer did not exhaust the existing bounded delivery owner");
 }
+
+/// Reads the existing application budget rather than repeating it in owning-edge witnesses.
+pub(crate) fn application_message_capacity() -> usize {
+    MAX_RECEIVED_MESSAGES
+}
+
+/// Observes actual primary ownership while a resource intentionally defers application reads.
+pub(crate) fn accepted_primary_messages(received: &Received) -> usize {
+    received.reliable.len() + received.unreliable.len()
+}

@@ -206,8 +206,8 @@ impl NetherHttpServer {
 
     pub fn sessions(&self) -> impl Iterator<Item = &EstablishedSessionId> {
         self.sessions
-            .iter()
-            .filter_map(|(_, entry)| entry.ready.as_ref())
+            .values()
+            .filter_map(|entry| entry.ready.as_ref())
     }
 
     pub fn player(&self, id: &EstablishedSessionId) -> Option<Arc<PlayerInfo>> {

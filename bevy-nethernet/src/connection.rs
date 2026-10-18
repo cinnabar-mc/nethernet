@@ -353,10 +353,9 @@ fn drive<K: Eq + Hash + Clone>(
                 Ok(Command::Send(id, readiness, channel, data)) => {
                     if let Some(entry) = entries.get_mut(&id)
                         && entry.readiness.matches(&readiness)
+                        && let Err(e) = entry.connection.send(channel, data.into(), now)
                     {
-                        if let Err(e) = entry.connection.send(channel, data.into(), now) {
-                            tracing::debug!("send error: {e}");
-                        }
+                        tracing::debug!("send error: {e}");
                     }
                 }
                 Err(TryRecvError::Empty) => break,

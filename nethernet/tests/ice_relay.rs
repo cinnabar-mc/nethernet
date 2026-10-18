@@ -126,24 +126,26 @@ fn pair_with_candidates(
     extra: Vec<Candidate>,
     refuse_extra: bool,
 ) -> ([Endpoint; 2], TurnPeer, Instant) {
+    pair_with_binding(v6, extra, refuse_extra, false)
+}
+
+/// Allows gathering to finish with an allocated relay while its Binding transaction remains unanswered.
+fn pair_with_binding(
+    v6: bool,
+    extra: Vec<Candidate>,
+    refuse_extra: bool,
+    drop_bindings: bool,
+) -> ([Endpoint; 2], TurnPeer, Instant) {
     let mut now = Instant::now();
     let mut server = TurnPeer::new(addr(v6, 3478));
-    let (a, a_description) = Session::new_with_ice(
-        addr(v6, 41000),
-        true,
-        1,
-        config(server.addr, now, IcePolicy::RelayOnly),
-        now,
-    )
-    .unwrap();
-    let (b, b_description) = Session::new_with_ice(
-        addr(v6, 41001),
-        false,
-        2,
-        config(server.addr, now, IcePolicy::RelayOnly),
-        now,
-    )
-    .unwrap();
+    server.drop_bindings = drop_bindings;
+    let mut ice = config(server.addr, now, IcePolicy::RelayOnly);
+    if drop_bindings {
+        ice.gather_timeout = Duration::from_millis(100);
+    }
+    let (a, a_description) =
+        Session::new_with_ice(addr(v6, 41000), true, 1, ice.clone(), now).unwrap();
+    let (b, b_description) = Session::new_with_ice(addr(v6, 41001), false, 2, ice, now).unwrap();
     let mut endpoints = [
         Endpoint {
             local: addr(v6, 41000),
@@ -229,6 +231,47 @@ fn pair_with_candidates(
         "ICE/DTLS/SCTP did not complete through TURN"
     );
     (endpoints, server, now)
+}
+
+#[test]
+fn unanswered_gathering_binding_cannot_retire_an_established_relay() {
+    let (mut endpoints, mut server, mut now) = pair_with_binding(false, Vec::new(), false, true);
+    let after_retries = now + Duration::from_secs(15);
+    for _ in 0..5000 {
+        if now >= after_retries {
+            break;
+        }
+        step(&mut endpoints, &mut server, &mut now);
+    }
+    assert!(now >= after_retries, "finite relay work did not drain");
+    assert_eq!(server.allocation_count(), 2);
+    for endpoint in &mut endpoints {
+        assert_eq!(endpoint.session.gathering_state(), GatheringState::Complete);
+        assert_eq!(endpoint.session.local_candidates().len(), 1);
+        endpoint
+            .session
+            .handle(SessionInput::Send(
+                Channel::Reliable,
+                b"relay after gathering timeout".as_slice().into(),
+                now,
+            ))
+            .unwrap();
+    }
+    for _ in 0..1000 {
+        step(&mut endpoints, &mut server, &mut now);
+        if endpoints
+            .iter()
+            .all(|endpoint| !endpoint.received.is_empty())
+        {
+            break;
+        }
+    }
+    for endpoint in endpoints {
+        assert_eq!(
+            endpoint.received,
+            [(Channel::Reliable, b"relay after gathering timeout".to_vec())]
+        );
+    }
 }
 
 /// A well-formed unsupported TCP path cannot invalidate a usable UDP full description.

@@ -30,6 +30,7 @@ struct Allocation {
 pub struct TurnPeer {
     pub addr: SocketAddr,
     pub packets: VecDeque<(SocketAddr, Vec<u8>)>,
+    pub drop_bindings: bool,
     pub drop_permissions: bool,
     pub refuse_permissions_for: Option<IpAddr>,
     pub permission_refusals: usize,
@@ -48,6 +49,7 @@ impl TurnPeer {
         Self {
             addr,
             packets: VecDeque::new(),
+            drop_bindings: false,
             drop_permissions: false,
             refuse_permissions_for: None,
             permission_refusals: 0,
@@ -84,6 +86,9 @@ impl TurnPeer {
         request.decode().unwrap();
         assert!(request.typ.class == CLASS_REQUEST || request.typ.class == CLASS_INDICATION);
         if request.typ.method == METHOD_BINDING {
+            if self.drop_bindings {
+                return;
+            }
             self.respond(
                 from,
                 &request,

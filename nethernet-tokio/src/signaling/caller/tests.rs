@@ -198,3 +198,47 @@ async fn client_dispatches_to_caller_and_does_not_retry_a_service_rejection() {
     ));
     assert!(matches!(driver.recv().now_or_never(), Some(None)));
 }
+
+#[tokio::test]
+async fn cancellation_interrupts_best_effort_terminal_signal_cleanup() {
+    let (signaling, mut driver) =
+        CallerSignaling::new("1234".into(), PEER.into(), CallerSignalingConfig::default()).unwrap();
+    let config = crate::ConnectionConfig::default();
+    let cancel = config.cancel_token.clone();
+    let mut connect = Box::pin(crate::NetherClient::connect_with(
+        signaling,
+        PEER.into(),
+        config,
+    ));
+    let offer = tokio::select! {
+        request = driver.recv() => request.unwrap(),
+        _ = &mut connect => panic!("connection ended before offering"),
+    };
+    driver
+        .try_deliver(
+            PEER,
+            &format!(
+                "CONNECTRESPONSE {} invalid-sdp",
+                offer.signal().connection_id
+            ),
+        )
+        .unwrap();
+    offer.finish(Ok(SignalDelivery::PeerReceived));
+    let terminal = loop {
+        let request = tokio::select! {
+            request = driver.recv() => request.unwrap(),
+            _ = &mut connect => panic!("connection ended before terminal signaling"),
+        };
+        match request.signal().signal_type {
+            SignalType::Candidate => request.finish(Ok(SignalDelivery::ServiceAccepted)),
+            SignalType::Error => break request,
+            _ => panic!("unexpected negotiation signal"),
+        }
+    };
+    cancel.cancel();
+    assert!(
+        poll!(connect.as_mut()).is_ready(),
+        "cancellation must stop waiting for best-effort terminal signal delivery"
+    );
+    assert!(terminal.is_cancelled());
+}

@@ -602,3 +602,60 @@ fn an_authenticated_closing_datagram_delivers_its_final_complete_message_before_
     );
     assert_eq!(receiver.gathering_state(), GatheringState::Closed);
 }
+
+#[test]
+fn a_complete_queued_message_survives_a_later_authenticated_closing_packet() {
+    let (mut receiver, mut peer, now) = connected_pair();
+    peer.handle(SessionInput::Send(
+        Channel::Reliable,
+        Bytes::from_static(b"already accepted by the core"),
+        now,
+    ))
+    .unwrap();
+    while let Some(output) = peer.poll() {
+        if let SessionOutput::Send(data, to) = output {
+            assert_eq!(to, addr(40100));
+            receiver
+                .handle(SessionInput::Packet(data.into(), addr(40101), now))
+                .unwrap();
+        }
+    }
+    assert!(
+        receiver.output.iter().any(|output| matches!(
+            output,
+            SessionOutput::Message(Channel::Reliable, data) if data == b"already accepted by the core"
+        )),
+        "the actual peer data did not reach the core's pending output"
+    );
+    peer.dtls.as_mut().unwrap().close_for_test(now).unwrap();
+    let mut close_count = 0;
+    while let Some((data, to)) = peer.dtls.as_mut().unwrap().poll_transmit() {
+        close_count += 1;
+        assert_eq!(to, addr(40100));
+        receiver
+            .handle(SessionInput::Packet(data.into(), addr(40101), now))
+            .unwrap();
+    }
+    assert!(
+        close_count > 0,
+        "the actual DTLS peer emitted no close_notify"
+    );
+    let output: Vec<_> = std::iter::from_fn(|| receiver.poll()).collect();
+    let data = output
+        .iter()
+        .position(|output| matches!(
+            output,
+            SessionOutput::Message(Channel::Reliable, data) if data == b"already accepted by the core"
+        ))
+        .expect("complete pending core message disappeared during authenticated peer closure");
+    let closed = output
+        .iter()
+        .position(|output| matches!(output, SessionOutput::Event(SessionEvent::PeerClosed)))
+        .expect("peer close did not terminate the session");
+    assert!(data < closed);
+    assert!(!output.iter().any(|output| matches!(
+        output,
+        SessionOutput::Event(SessionEvent::Failed) | SessionOutput::Wait(..)
+    )));
+    assert_eq!(receiver.gathering_state(), GatheringState::Closed);
+}

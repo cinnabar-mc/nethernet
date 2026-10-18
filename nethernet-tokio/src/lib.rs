@@ -1,8 +1,9 @@
-//! Tokio transport for NetherNet: LAN and HTTP signaling, with client and server connections.
+//! Tokio transport for NetherNet with LAN, HTTP and caller-owned dialing/accepting signaling.
 pub mod addr;
 pub mod builders;
 pub mod credentials;
 pub mod error;
+pub mod ice;
 pub mod protocol;
 pub mod session;
 pub mod signaling;
@@ -13,11 +14,23 @@ pub use addr::Addr;
 pub use builders::*;
 pub use credentials::{Credentials, IceServer};
 pub use error::{NetherError, Result};
-pub use nethernet::identity::{PlayerInfo, ServerIdentity, TokenTrust};
+pub use ice::{IceResolveError, resolve_ice_servers};
+pub use nethernet::identity::{
+    PlayerInfo, SdpIdentity, SelfSignedIdentity, ServerIdentity, TokenIdentity, TokenTrust,
+};
 pub use protocol::packet::discovery::{MessagePacket, RequestPacket, ResponsePacket, ServerData};
 pub use protocol::{Message, MessageSegment, Signal, SignalType};
 pub use session::{AcceptedSession, Session, SessionReceiver};
+pub use signaling::caller::server::{
+    CallerServerSignaling, CallerServerSignalingConfig, CallerServerSignalingDriver,
+};
+pub use signaling::caller::{
+    CallerSignaling, CallerSignalingConfig, CallerSignalingDriver, CallerSignalingError,
+    SignalDelivery, SignalRequest,
+};
 pub use signaling::http::{HttpServerConfig, HttpSignaling, HttpSignalingServer};
 pub use signaling::lan::{LanConfig, LanSignaling};
 pub use signaling::{ClientSignaling, ServerSignaling};
-pub use transport::{ConnectionConfig, NetherClient, NetherServer, Timeouts};
+pub use transport::{
+    ClientIceConfig, ConnectionConfig, NetherClient, NetherServer, ServerIceConfig, Timeouts,
+};

@@ -45,6 +45,30 @@ pub(crate) struct TlsWire {
 }
 
 impl Wire {
+    /// Polls a nonblocking connect without attempting application or TLS writes.
+    pub(crate) fn poll_connect(&self) -> std::io::Result<bool> {
+        let stream = match self {
+            Self::Plain(stream) => stream,
+            #[cfg(feature = "tls")]
+            Self::Tls(tls) => &tls.stream,
+        };
+        if let Some(error) = stream.take_error()? {
+            return Err(error);
+        }
+        match stream.peer_addr() {
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotConnected | ErrorKind::WouldBlock
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn plain(stream: TcpStream) -> Self {
         Self::Plain(stream)
     }

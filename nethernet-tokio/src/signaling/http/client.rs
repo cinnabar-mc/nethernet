@@ -45,9 +45,9 @@ impl HttpSignaling {
     fn join_url(&self, network_id: &str) -> Result<Url> {
         let url = Url::parse(network_id)
             .map_err(|e| NetherError::Other(format!("parse network ID as URL: {}", e)))?;
-        if !matches!(url.scheme(), "http" | "https") || url.port().is_none() {
+        if !matches!(url.scheme(), "http" | "https") || url.port_or_known_default().is_none() {
             return Err(NetherError::Other(format!(
-                "network ID must be a HTTP/HTTPS URL with a port: {}",
+                "network ID must be a HTTP/HTTPS URL: {}",
                 network_id
             )));
         }
@@ -62,7 +62,7 @@ impl HttpSignaling {
         Ok(url)
     }
 
-    /// Reads GET /v1/join; the network id here is an http(s) URL with a port.
+    /// Reads GET /v1/join; the network id here is an HTTP/HTTPS target URL.
     pub async fn server_data(&self, network_id: &str) -> Result<ServerData> {
         let response = self
             .client
@@ -200,10 +200,16 @@ mod tests {
     }
 
     #[test]
-    fn join_url_rejects_network_ids_without_a_port() {
+    fn join_url_uses_scheme_default_ports_and_rejects_other_identifiers() {
         let signaling = HttpSignaling::new("1234".to_string()).unwrap();
 
-        assert!(signaling.join_url("https://example.com").is_err());
+        for (target, port) in [("http://127.0.0.1:80", 80), ("https://[::1]:443", 443)] {
+            let url = signaling.join_url(target).unwrap();
+            assert_eq!(url.port_or_known_default(), Some(port));
+            assert_eq!(url.path(), join::join_path("1234"));
+        }
+        assert!(signaling.join_url("https://example.com").is_ok());
+        assert!(signaling.join_url("ftp://example.com:19132").is_err());
         assert!(signaling.join_url("5678").is_err());
     }
 }

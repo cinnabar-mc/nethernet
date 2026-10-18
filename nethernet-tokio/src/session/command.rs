@@ -5,12 +5,22 @@ use nethernet::identity::PlayerInfo;
 use nethernet::protocol::Signal;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
+/// Bounds retained actor commands independently of application-owned pending send futures.
+pub(crate) const COMMAND_CAPACITY: usize = 16;
+
 pub(crate) enum Command {
-    Send(Channel, Bytes, oneshot::Sender<Result<()>>),
+    #[cfg(test)]
+    QueuedCommands(oneshot::Sender<usize>),
+    Send(Channel, Bytes, Option<Instant>, oneshot::Sender<Result<()>>),
     Signal(Signal),
+    TurnCredentials(
+        SocketAddr,
+        nethernet::session::TurnCredentials,
+        oneshot::Sender<Result<()>>,
+    ),
     RemoteAddr(oneshot::Sender<Option<SocketAddr>>),
     Rtt(oneshot::Sender<Option<Duration>>),
     SetPlayer(Arc<PlayerInfo>),

@@ -242,8 +242,13 @@ mod admission {
         }
 
         fn offer(&mut self) {
-            let (session, description) =
-                Session::new(self.socket.local_addr().unwrap(), true, Instant::now()).unwrap();
+            let (session, description) = Session::new(
+                self.socket.local_addr().unwrap(),
+                true,
+                rand::random(),
+                Instant::now(),
+            )
+            .unwrap();
             let (_, signals) = Connection::connect(
                 session,
                 description,

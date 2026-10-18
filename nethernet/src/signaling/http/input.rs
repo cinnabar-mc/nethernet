@@ -4,7 +4,7 @@ use crate::identity::TokenTrust;
 use crate::protocol::packet::discovery::ServerData;
 use http::Request;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 /// Why a pending join is refused, sent as 403, 504 or 503.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +38,10 @@ pub enum HttpSignalerInput {
     Request {
         connection: u64,
         request: Box<Request<String>>,
+        /// Monotonic receive time used for pending-answer deadlines.
         now: Instant,
+        /// Caller-provided UTC receive time used only to validate credential expiry.
+        wall: SystemTime,
     },
 
     /// Completes a pending join with the answer SDP.

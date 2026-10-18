@@ -1,50 +1,33 @@
+//! A bounded listener whose unaccepted peer tasks retire with the listener.
+mod listener;
+mod peer;
+
 use crate::addr::Addr;
-use crate::error::{NetherError, Result, SignalErrorCode};
-use crate::protocol::{Signal, SignalType};
-use crate::session::{AcceptedSession, Command, Session};
+use crate::error::{NetherError, Result};
+use crate::session::AcceptedSession;
 use crate::signaling::ServerSignaling;
-use crate::transport::pending::PendingOffers;
-use crate::transport::{ConnectionConfig, local_bind_addr};
-use futures::{Stream, StreamExt};
-use nethernet::admission::OfferPolicy;
-use nethernet::connection::IceMode;
+use crate::transport::{ConnectionConfig, ServerIceConfig};
+use futures::Stream;
 use nethernet::identity::TokenTrust;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::task::{Context, Poll};
-use std::time::{Instant, SystemTime};
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-async fn signal_error(
-    signaling: &ServerSignaling,
-    connection_id: u64,
-    network_id: String,
-    code: SignalErrorCode,
-) {
-    if let Err(e) = signaling
-        .signal(Signal::error(connection_id, code, network_id))
-        .await
-    {
-        tracing::debug!("Failed to signal error: {}", e);
-    }
-}
-
-type ConnectionKey = (String, u64);
-
-type SignalDispatchers = HashMap<ConnectionKey, mpsc::UnboundedSender<Signal>>;
+type SharedIce = Arc<RwLock<Option<ServerIceConfig>>>;
 
 type SharedTrust = Arc<RwLock<Option<TokenTrust>>>;
 
 /// Answers offers arriving on its signaling and yields the connected sessions.
+/// Negotiating, queued and accepted sessions share `ConnectionConfig::max_sessions`.
 pub struct NetherServer {
-    incoming: mpsc::UnboundedReceiver<AcceptedSession>,
+    incoming: mpsc::Receiver<AcceptedSession>,
     local_addr: Addr,
     signaling: ServerSignaling,
     token_trust: SharedTrust,
+    ice: SharedIce,
     cancel_token: CancellationToken,
     signal_handler_task: Option<JoinHandle<()>>,
 }
@@ -55,6 +38,7 @@ impl NetherServer {
     }
 
     /// Fails with IdentityRequired when the signaling needs signed answers and the config has no identity.
+    /// Rejects capacity or deadline settings that cannot be represented by the runtime.
     pub async fn bind_with(
         signaling: impl Into<ServerSignaling>,
         config: ConnectionConfig,
@@ -66,278 +50,88 @@ impl NetherServer {
         {
             return Err(NetherError::IdentityRequired);
         }
+        if matches!(&signaling, ServerSignaling::Caller(_)) && config.token_trust.is_none() {
+            return Err(NetherError::InvalidState(
+                "caller server requires explicit offer trust".into(),
+            ));
+        }
+        let establish = config.timeouts.start.checked_add(config.timeouts.channel);
+        let now = crate::session::guard::transport_now();
+        if config.max_sessions > Semaphore::MAX_PERMITS
+            || establish
+                .and_then(|within| now.checked_add(within))
+                .is_none()
+            || now.checked_add(config.timeouts.negotiation).is_none()
+        {
+            return Err(NetherError::InvalidState(
+                "unrepresentable server admission settings".into(),
+            ));
+        }
         let local_addr = Addr::network(signaling.network_id());
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        // Zero disables admission, while Tokio requires a nonzero channel capacity.
+        let (incoming_tx, incoming_rx) = mpsc::channel(config.max_sessions.max(1));
         let cancel_token = CancellationToken::new();
         let token_trust = Arc::new(RwLock::new(config.token_trust.clone()));
-
-        let signal_handler_task = Self::start_signal_handler(
+        let ice = Arc::new(RwLock::new(config.server_ice.clone()));
+        let signals = signaling.signals()?;
+        let signal_handler_task = listener::start(
             signaling.clone(),
             incoming_tx,
             cancel_token.clone(),
             config,
             token_trust.clone(),
+            ice.clone(),
+            signals,
         );
 
-        let listener = Self {
+        Ok(Self {
             incoming: incoming_rx,
             local_addr,
             signaling,
             token_trust,
+            ice,
             cancel_token,
             signal_handler_task: Some(signal_handler_task),
-        };
-
-        Ok(listener)
-    }
-
-    fn start_signal_handler(
-        signaling: ServerSignaling,
-        incoming_tx: mpsc::UnboundedSender<AcceptedSession>,
-        cancel_token: CancellationToken,
-        config: ConnectionConfig,
-        token_trust: SharedTrust,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut dispatchers: SignalDispatchers = HashMap::new();
-            let pending = PendingOffers::default();
-            let mut signals = signaling.signals();
-
-            loop {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        break;
-                    }
-                    signal = signals.next() => {
-                        match signal {
-                            Some(signal) => {
-                                match signal.signal_type {
-                                    SignalType::Offer => {
-                                        dispatchers.retain(|_, tx| !tx.is_closed());
-                                        let mut config = config.clone();
-                                        config.token_trust = token_trust
-                                            .read()
-                                            .unwrap_or_else(PoisonError::into_inner)
-                                            .clone();
-                                        if let Err(e) = Self::handle_offer(
-                                            signal,
-                                            &signaling,
-                                            &incoming_tx,
-                                            &mut dispatchers,
-                                            &pending,
-                                            config,
-                                        )
-                                        .await
-                                        {
-                                            tracing::debug!("Failed to handle offer: {}", e);
-                                        }
-                                    }
-                                    SignalType::Answer | SignalType::Candidate | SignalType::Error => {
-                                        let key = (signal.network_id.clone(), signal.connection_id);
-                                        if let Some(tx) = dispatchers.get(&key)
-                                            && tx.send(signal).is_err()
-                                        {
-                                            dispatchers.remove(&key);
-                                        }
-                                    }
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
         })
-    }
-
-    async fn handle_offer(
-        signal: Signal,
-        signaling: &ServerSignaling,
-        incoming_tx: &mpsc::UnboundedSender<AcceptedSession>,
-        dispatchers: &mut SignalDispatchers,
-        pending: &PendingOffers,
-        config: ConnectionConfig,
-    ) -> Result<()> {
-        let connection_id = signal.connection_id;
-        let network_id = signal.network_id.clone();
-
-        let cancel_token = config.cancel_token.clone();
-        let result = tokio::select! {
-            _ = cancel_token.cancelled() => Err((None, NetherError::ConnectionClosed)),
-            result = Self::answer_offer(signal, signaling, incoming_tx, dispatchers, pending, config.clone()) => result,
-        };
-
-        match result {
-            Ok(()) => Ok(()),
-            Err((code, e)) => {
-                if let Some(code) = code {
-                    signal_error(signaling, connection_id, network_id, code).await;
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn answer_offer(
-        signal: Signal,
-        signaling: &ServerSignaling,
-        incoming_tx: &mpsc::UnboundedSender<AcceptedSession>,
-        dispatchers: &mut SignalDispatchers,
-        pending: &PendingOffers,
-        config: ConnectionConfig,
-    ) -> std::result::Result<(), (Option<SignalErrorCode>, NetherError)> {
-        let slot = pending
-            .try_admit(
-                &signal.network_id,
-                config.max_pending,
-                config.max_pending_per_network_id,
-            )
-            .ok_or_else(|| {
-                (
-                    Some(SignalErrorCode::IncomingConnectionIgnored),
-                    NetherError::PendingCountExceeded(signal.network_id.clone()),
-                )
-            })?;
-
-        let remote_address = signaling
-            .remote_address(&Addr::new(signal.network_id.clone(), signal.connection_id))
-            .await;
-
-        let connection_id = signal.connection_id;
-        let network_id = signal.network_id.clone();
-        let key = (network_id.clone(), connection_id);
-
-        let signaled_player = signaling
-            .player(&Addr::new(network_id.clone(), connection_id))
-            .await;
-
-        let signaled_host = signaling
-            .host(&Addr::new(network_id.clone(), connection_id))
-            .await;
-
-        let ice_mode = if signaling.disable_trickle_ice() {
-            IceMode::Full
-        } else {
-            IceMode::Trickle
-        };
-        let mut policy =
-            OfferPolicy::new(ice_mode).with_inferred_peer_candidates(config.infer_peer_candidates);
-        policy = policy.with_establish_deadline(config.timeouts.establish());
-        if let Some(identity) = &config.identity {
-            policy = policy.with_identity(identity);
-        }
-        if !signaling.validates_offers()
-            && let Some(trust) = &config.token_trust
-        {
-            policy = policy.with_token_trust(trust);
-        }
-
-        let admitted = policy
-            .admit(&signal, remote_address, SystemTime::now())
-            .map_err(|e| (Some(e.code()), NetherError::from(e)))?;
-
-        let socket = Arc::new(UdpSocket::bind(local_bind_addr()).await.map_err(|e| {
-            (
-                Some(SignalErrorCode::FailedToCreatePeerConnection),
-                NetherError::from(e),
-            )
-        })?);
-        let bound_addr = socket.local_addr().map_err(|e| {
-            (
-                Some(SignalErrorCode::FailedToCreatePeerConnection),
-                NetherError::from(e),
-            )
-        })?;
-
-        let answered = admitted
-            .answer(bound_addr, Instant::now())
-            .map_err(|e| (Some(e.code()), NetherError::from(e)))?;
-        let player = answered.player.map(Arc::new).or(signaled_player);
-        let connection = answered.connection;
-
-        for line in &answered.inferred {
-            tracing::debug!("Inferred candidate for the peer: {}", line);
-        }
-        for outgoing in answered.signals {
-            signaling.signal(outgoing).await.map_err(|e| (None, e))?;
-        }
-
-        let local = Addr::new(signaling.network_id(), connection_id);
-        let remote = Addr::new(network_id.clone(), connection_id);
-
-        let (session, reliable, unreliable, ready_rx) =
-            Session::spawn(socket, connection, local, remote);
-
-        if let Some(player) = player {
-            session.set_player(player).await;
-        }
-        if let Some(host) = signaled_host {
-            session.set_host(host).await;
-        }
-
-        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
-        dispatchers.insert(key, signal_tx);
-        let closed = session.clone();
-        spawn_late_signal_forwarder(signal_rx, session.signal_sender(), async move {
-            closed.closed().await
-        });
-
-        let incoming_tx = incoming_tx.clone();
-        let signaling = signaling.clone();
-        tokio::spawn(async move {
-            let cancel_token = config.cancel_token.clone();
-            let result = tokio::select! {
-                _ = cancel_token.cancelled() => Err((None, NetherError::ConnectionClosed)),
-                result = wait_ready(ready_rx, config.timeouts.establish()) => result,
-            };
-            drop(slot);
-
-            match result {
-                Ok(()) => {
-                    let _ = incoming_tx.send(AcceptedSession {
-                        session,
-                        reliable,
-                        unreliable,
-                    });
-                }
-                Err((code, e)) => {
-                    tracing::debug!("Failed to establish incoming connection: {}", e);
-                    if let Err(e) = session.close().await {
-                        tracing::debug!("Failed to close the unestablished session: {}", e);
-                    }
-                    if let Some(code) = code {
-                        signal_error(&signaling, connection_id, network_id, code).await;
-                    }
-                }
-            }
-        });
-
-        Ok(())
     }
 
     /// Next connected session; fails with ConnectionClosed once the server is closed.
     pub async fn accept(&mut self) -> Result<AcceptedSession> {
-        self.incoming
-            .recv()
+        futures::future::poll_fn(|cx| self.poll_accept(cx))
             .await
             .ok_or(NetherError::ConnectionClosed)
     }
 
+    /// Crosses the same synchronous ownership boundary for `accept` and `Stream`.
+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Option<AcceptedSession>> {
+        if self.cancel_token.is_cancelled() {
+            return Poll::Ready(None);
+        }
+        loop {
+            match self.incoming.poll_recv(cx) {
+                Poll::Ready(Some(accepted)) => {
+                    if accepted.session.accept_from_server() {
+                        return Poll::Ready(Some(accepted));
+                    }
+                    // A peer may retire while queued; retain no closed pending owner here.
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Stops signaling and closes sessions that were not yet accepted.
+    /// Accepted receivers retain their FIFO and capacity until their owners retire.
     pub async fn close(&mut self) -> Result<()> {
         self.cancel_token.cancel();
         self.incoming.close();
-
         while let Ok(accepted) = self.incoming.try_recv() {
-            if let Err(e) = accepted.session.close().await {
-                tracing::debug!("Failed to close pending session: {}", e);
-            }
+            accepted.session.close().await?;
         }
-
-        if let Some(task) = self.signal_handler_task.take() {
+        if let Some(task) = self.signal_handler_task.as_mut() {
             let _ = task.await;
         }
-
+        self.signal_handler_task.take();
         Ok(())
     }
 
@@ -345,13 +139,20 @@ impl NetherServer {
         &self.local_addr
     }
 
-    /// Replaces how later offers are authenticated; `None` skips validation.
-    ///
+    /// Replaces STUN/TURN configuration for later offers without extending existing credentials.
+    /// Pure session construction validates bounds, family and absolute expiry at each admission.
+    /// Live sessions use Session::update_turn_credentials for their existing allocation.
+    pub fn set_server_ice(&self, ice: Option<ServerIceConfig>) {
+        *self.ice.write().unwrap_or_else(PoisonError::into_inner) = ice;
+    }
+
+    /// Replaces how later offers are authenticated. `None` disables caller-bridge offer admission;
+    /// LAN skips validation and HTTP replaces its signaler policy.
     /// Over HTTP signaling the signaler authenticates offers, so its trust is replaced instead.
     pub fn set_token_trust(&self, trust: Option<TokenTrust>) {
         match &self.signaling {
             ServerSignaling::Http(signaling) => signaling.set_token_trust(trust),
-            ServerSignaling::Lan(_) => {
+            ServerSignaling::Caller(_) | ServerSignaling::Lan(_) => {
                 *self
                     .token_trust
                     .write()
@@ -359,46 +160,6 @@ impl NetherServer {
             }
         }
     }
-}
-
-fn spawn_late_signal_forwarder(
-    mut signals: mpsc::UnboundedReceiver<Signal>,
-    command_tx: mpsc::UnboundedSender<Command>,
-    closed: impl Future<Output = ()> + Send + 'static,
-) {
-    tokio::spawn(async move {
-        tokio::pin!(closed);
-        loop {
-            let signal = tokio::select! {
-                _ = &mut closed => break,
-                signal = signals.recv() => match signal {
-                    Some(signal) => signal,
-                    None => break,
-                },
-            };
-            if signal.signal_type != SignalType::Candidate {
-                continue;
-            }
-            if command_tx.send(Command::Signal(signal)).is_err() {
-                break;
-            }
-        }
-    });
-}
-
-async fn wait_ready(
-    ready_rx: tokio::sync::oneshot::Receiver<()>,
-    timeout: std::time::Duration,
-) -> std::result::Result<(), (Option<SignalErrorCode>, NetherError)> {
-    tokio::time::timeout(timeout, ready_rx)
-        .await
-        .map_err(|_| {
-            (
-                Some(SignalErrorCode::NegotiationTimeoutWaitingForAccept),
-                NetherError::Timeout,
-            )
-        })?
-        .map_err(|_| (None, NetherError::ConnectionClosed))
 }
 
 impl Drop for NetherServer {
@@ -411,58 +172,9 @@ impl Stream for NetherServer {
     type Item = AcceptedSession;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().incoming.poll_recv(cx)
+        self.get_mut().poll_accept(cx)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn forwarder_stops_when_its_session_closes() {
-        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
-        let (command_tx, _command_rx) = mpsc::unbounded_channel();
-        let session_closed = CancellationToken::new();
-        spawn_late_signal_forwarder(
-            signal_rx,
-            command_tx,
-            session_closed.clone().cancelled_owned(),
-        );
-
-        session_closed.cancel();
-
-        tokio::time::timeout(Duration::from_secs(1), signal_tx.closed())
-            .await
-            .expect("the forwarder should drop its receiver once the session closes");
-    }
-
-    #[tokio::test]
-    async fn a_trust_set_on_a_server_over_http_reaches_the_signaler() {
-        use crate::signaling::http::server::tests::{post_offer, signed_offer};
-        use crate::signaling::http::{HttpServerConfig, HttpSignalingServer};
-
-        let signaling = Arc::new(
-            HttpSignalingServer::bind("127.0.0.1:0".parse().unwrap(), HttpServerConfig::default())
-                .await
-                .unwrap(),
-        );
-        let server = NetherServer::bind_with(
-            signaling.clone(),
-            ConnectionConfig {
-                allow_unsigned_answers: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        server.set_token_trust(Some(TokenTrust::Minecraft(Default::default())));
-
-        assert_eq!(
-            post_offer(signaling.local_addr(), &signed_offer()).await,
-            "HTTP/1.1 401 Unauthorized"
-        );
-    }
-}
+mod tests;

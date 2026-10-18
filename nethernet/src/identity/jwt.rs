@@ -54,9 +54,38 @@ impl Claims {
         }
     }
 
+    /// Reads NumericDate seconds, truncating fractional representations toward zero.
+    /// Missing and null claims are absent; malformed or out-of-range values fail.
+    pub fn numeric_date(&self, claim: &str) -> Result<Option<SystemTime>> {
+        let Some(value) = self.values.get(claim).filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let invalid = || IdentityError::Untrusted("invalid token timestamp".to_string());
+        let seconds = if let Some(seconds) = value.as_i64() {
+            seconds
+        } else if value.is_u64() {
+            return Err(invalid());
+        } else {
+            let seconds = value.as_f64().ok_or_else(invalid)?;
+            // Reject rounded boundary floats; exact signed integers use the path above.
+            if !seconds.is_finite() || seconds <= i64::MIN as f64 || seconds >= -(i64::MIN as f64) {
+                return Err(invalid());
+            }
+            seconds as i64
+        };
+        let duration = Duration::from_secs(seconds.unsigned_abs());
+        let time = if seconds < 0 {
+            UNIX_EPOCH.checked_sub(duration)
+        } else {
+            UNIX_EPOCH.checked_add(duration)
+        }
+        .ok_or_else(invalid)?;
+        Ok(Some(time))
+    }
+
+    /// Reads the token's expiry with the shared NumericDate conversion policy.
     pub fn expiry(&self) -> Option<SystemTime> {
-        let seconds = self.values.get("exp").and_then(Value::as_u64)?;
-        Some(UNIX_EPOCH + Duration::from_secs(seconds))
+        self.numeric_date("exp").ok().flatten()
     }
 
     /// The `cpk` claim: a P-384 key as a JWK object or as a base64 SPKI DER string.
@@ -92,11 +121,11 @@ impl Claims {
             .expiry()
             .ok_or_else(|| IdentityError::Untrusted("the token carries no expiry".to_string()))?;
 
-        match now <= expiry + LEEWAY {
-            true => Ok(()),
-            false => Err(IdentityError::Untrusted(
+        match now.duration_since(expiry) {
+            Ok(elapsed) if elapsed > LEEWAY => Err(IdentityError::Untrusted(
                 "the token has expired".to_string(),
             )),
+            _ => Ok(()),
         }
     }
 }
@@ -167,6 +196,30 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, IdentityError::Untrusted(_)));
+    }
+
+    #[test]
+    fn expiry_validation_handles_the_system_time_boundary() {
+        assert!(
+            claims(json!({"exp": u64::MAX}))
+                .check_expiry(UNIX_EPOCH)
+                .is_err()
+        );
+        let seconds = i64::MAX as u64;
+        if let Some(expiry) = UNIX_EPOCH.checked_add(Duration::from_secs(seconds)) {
+            assert!(claims(json!({"exp": seconds})).check_expiry(expiry).is_ok());
+        }
+        for value in ["1000.9", "10009e-1"] {
+            let value = serde_json::from_str(&format!("{{\"exp\":{value}}}")).unwrap();
+            assert_eq!(
+                claims(value).expiry(),
+                UNIX_EPOCH.checked_add(Duration::from_secs(1000))
+            );
+        }
+        for value in ["1e100", "-1e100", "-9223372036854775809"] {
+            let value = serde_json::from_str(&format!("{{\"iat\":{value}}}")).unwrap();
+            assert!(claims(value).numeric_date("iat").is_err());
+        }
     }
 
     #[test]

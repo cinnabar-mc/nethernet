@@ -126,6 +126,28 @@ pub fn canonical_fingerprint_json(sdp: &str) -> Result<String> {
 }
 
 pub(crate) const EMPTY_FINGERPRINTS: &str = "{\"fingerprint\":[]}";
+pub(crate) const DEFAULT_IDP_PROTOCOL: &str = "default";
+
+/// Inserts an encoded identity before the media section, preserving the description's line endings.
+pub(crate) fn insert_identity(sdp: &str, identity: &str) -> String {
+    let attribute = format!("a=identity:{identity}");
+    let eol = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(sdp.len() + attribute.len() + eol.len());
+    let mut inserted = false;
+    for line in sdp.split_inclusive(['\n']) {
+        if !inserted && line.starts_with("m=") {
+            out.push_str(&attribute);
+            out.push_str(eol);
+            inserted = true;
+        }
+        out.push_str(line);
+    }
+    if !inserted {
+        out.push_str(&attribute);
+        out.push_str(eol);
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {

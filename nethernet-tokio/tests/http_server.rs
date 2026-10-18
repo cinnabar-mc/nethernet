@@ -45,17 +45,151 @@ fn server_connection_config() -> ConnectionConfig {
 }
 
 async fn serve(config: HttpServerConfig) -> (String, NetherServer) {
+    serve_with_connection(config, server_connection_config()).await
+}
+
+/// Uses the same real HTTP/RTC owners with explicit server admission policy.
+async fn serve_with_connection(
+    config: HttpServerConfig,
+    connection: ConnectionConfig,
+) -> (String, NetherServer) {
     let signaling = HttpSignalingServer::bind("127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
     signaling.set_server_data(ServerData::new("test".into(), "world".into()));
 
     let addr = signaling.local_addr();
-    let listener = NetherServer::bind_with(signaling, server_connection_config())
+    let listener = NetherServer::bind_with(signaling, connection)
         .await
         .unwrap();
 
     (format!("http://{addr}"), listener)
+}
+
+/// Makes one real HTTP/ICE/DTLS/SCTP attempt, without automatic negotiation replay.
+async fn connect_once(url: &str, peer: &str) -> Result<NetherClient, NetherError> {
+    let mut config = client_config();
+    config.attempts = 1;
+    NetherClient::connect_with(HttpSignaling::new(peer.into()).unwrap(), url.into(), config).await
+}
+
+/// Matches the existing public HTTP refusal, keeping other errors and successful connections distinct.
+fn http_forbidden(result: &Result<NetherClient, NetherError>) -> bool {
+    let expected = nethernet::signaling::http::join::JoinResponseError::Status(
+        http::StatusCode::FORBIDDEN.as_u16(),
+    )
+    .to_string();
+    matches!(result, Err(NetherError::Other(message)) if *message == expected)
+}
+
+#[tokio::test]
+async fn queued_and_live_accepted_sessions_hold_the_server_capacity() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let connection = ConnectionConfig {
+            max_sessions: 1,
+            ..server_connection_config()
+        };
+        let (url, mut listener) = serve_with_connection(server_config(), connection).await;
+        let first = connect_once(&url, "peer-one").await.unwrap();
+        let refused = connect_once(&url, "peer-two").await;
+        assert!(
+            http_forbidden(&refused),
+            "a connected session queued for accept must retain the server capacity: connected={}, error={:?}",
+            refused.is_ok(),
+            refused.as_ref().err()
+        );
+        let mut accepted = listener.accept().await.unwrap();
+        let refused = connect_once(&url, "peer-three").await;
+        assert!(
+            http_forbidden(&refused),
+            "transferring a live session to its consumer must not release server capacity: connected={}, error={:?}",
+            refused.is_ok(),
+            refused.as_ref().err()
+        );
+        first
+            .send(Bytes::from_static(b"original accepted peer"))
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.reliable.recv().await.unwrap().unwrap(),
+            "original accepted peer"
+        );
+        accepted.session.close().await.unwrap();
+        first.close().await.unwrap();
+        listener.close().await.unwrap();
+    })
+    .await
+    .expect("finite actual server admission fixture stalled");
+}
+
+#[tokio::test]
+async fn closing_the_listener_preserves_an_already_accepted_session() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (url, mut listener) = serve(server_config()).await;
+        let client = connect_once(&url, "accepted-peer").await.unwrap();
+        let mut accepted = listener.accept().await.unwrap();
+        listener.close().await.unwrap();
+        client
+            .send(Bytes::from_static(b"accepted before listener close"))
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.reliable.recv().await.unwrap().unwrap(),
+            "accepted before listener close"
+        );
+        accepted.session.close().await.unwrap();
+        client.close().await.unwrap();
+    })
+    .await
+    .expect("listener close ended or stalled an already accepted session");
+}
+
+#[tokio::test]
+async fn closed_accepted_receivers_retain_capacity_until_their_owners_retire() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let connection = ConnectionConfig {
+            max_sessions: 1,
+            ..server_connection_config()
+        };
+        let (url, mut listener) = serve_with_connection(server_config(), connection).await;
+        let client = connect_once(&url, "retained-peer").await.unwrap();
+        let accepted = listener.accept().await.unwrap();
+        accepted.session.close().await.unwrap();
+        client.close().await.unwrap();
+        drop(accepted.session);
+        let refused = connect_once(&url, "refused-peer").await;
+        assert!(
+            http_forbidden(&refused),
+            "closed receivers must keep their original session reservation: connected={}, error={:?}",
+            refused.is_ok(),
+            refused.as_ref().err()
+        );
+        drop(accepted.reliable);
+        drop(accepted.unreliable);
+        let replacement = loop {
+            match connect_once(&url, "replacement-peer").await {
+                // Actual actor destruction may still be queued; wait through its public refusal.
+                result if http_forbidden(&result) => {
+                    tokio::task::yield_now().await;
+                }
+                result => break result.unwrap(),
+            }
+        };
+        let mut accepted = listener.accept().await.unwrap();
+        replacement
+            .send(Bytes::from_static(b"replacement peer"))
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.reliable.recv().await.unwrap().unwrap(),
+            "replacement peer"
+        );
+        accepted.session.close().await.unwrap();
+        replacement.close().await.unwrap();
+        listener.close().await.unwrap();
+    })
+    .await
+    .expect("actual session retirement failed to release bounded server capacity");
 }
 
 #[tokio::test(flavor = "multi_thread")]

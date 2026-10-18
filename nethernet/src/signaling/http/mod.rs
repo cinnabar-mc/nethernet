@@ -18,7 +18,7 @@ use input::{HttpSignalerInput, RejectReason};
 use output::{HttpSignalerOutput, Offer};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 const FORWARDED_FOR: &str = "x-forwarded-for";
 
@@ -59,7 +59,8 @@ impl Sans for HttpSignaler {
                 connection,
                 request,
                 now,
-            } => self.handle_request(connection, &request, now)?,
+                wall,
+            } => self.handle_request(connection, &request, now, wall)?,
             HttpSignalerInput::Answer { connection_id, sdp } => self.answer(connection_id, &sdp)?,
             HttpSignalerInput::Reject {
                 connection_id,
@@ -159,6 +160,7 @@ impl HttpSignaler {
         connection: u64,
         request: &Request<String>,
         now: Instant,
+        wall: SystemTime,
     ) -> Result<(), HttpSignalerError> {
         let keep_alive = keep_alive(request);
         let path = request.uri().path().to_string();
@@ -178,7 +180,14 @@ impl HttpSignaler {
             return self.respond(connection, StatusCode::METHOD_NOT_ALLOWED, keep_alive);
         }
 
-        self.join(connection, network_id.to_string(), request, keep_alive, now)
+        self.join(
+            connection,
+            network_id.to_string(),
+            request,
+            keep_alive,
+            now,
+            wall,
+        )
     }
 
     fn status(
@@ -206,6 +215,7 @@ impl HttpSignaler {
         request: &Request<String>,
         keep_alive: bool,
         now: Instant,
+        wall: SystemTime,
     ) -> Result<(), HttpSignalerError> {
         if self.pending.len() >= self.config.max_pending_joins {
             tracing::warn!(
@@ -219,7 +229,7 @@ impl HttpSignaler {
         let sdp = request.body();
 
         let player = match &self.config.token_trust {
-            Some(trust) => match validate_sdp(sdp, trust, systemtime(now)) {
+            Some(trust) => match validate_sdp(sdp, trust, wall) {
                 Ok(claims) => Some(Box::new(PlayerInfo::new(
                     claims,
                     network_id.clone(),
@@ -396,11 +406,6 @@ fn keep_alive(request: &Request<String>) -> bool {
     }
 }
 
-fn systemtime(now: Instant) -> std::time::SystemTime {
-    let elapsed = Instant::now().saturating_duration_since(now);
-    std::time::SystemTime::now() - elapsed
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,16 +455,19 @@ mod tests {
                 connection,
                 request,
                 now: Instant::now(),
+                wall: wall(),
             })
             .unwrap();
     }
 
+    /// Fixed credential time keeps identity tests independent of the machine clock.
+    fn wall() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
     fn signed_offer() -> String {
-        let identity =
-            ServerIdentity::generate("example.com", std::time::SystemTime::now()).unwrap();
-        identity
-            .augment(OFFER, std::time::SystemTime::now())
-            .unwrap()
+        let identity = ServerIdentity::generate("example.com", wall()).unwrap();
+        identity.augment(OFFER, wall()).unwrap()
     }
 
     fn next(signaler: &mut HttpSignaler) -> HttpSignalerOutput {
@@ -600,6 +608,7 @@ mod tests {
                 connection: 1,
                 request: request(Method::POST, "/v1/join/1234", &signed_offer()),
                 now,
+                wall: wall(),
             })
             .unwrap();
         let _ = next(&mut signaler);
@@ -844,7 +853,63 @@ mod tests {
     }
 
     #[test]
-    fn the_epoch_is_not_mistaken_for_now() {
-        assert!(systemtime(Instant::now()) > UNIX_EPOCH);
+    fn credential_time_is_explicit_and_answer_deadlines_stay_monotonic() {
+        let now = Instant::now();
+        let wall = wall();
+        let identity = ServerIdentity::generate_with_expiry(
+            "example.com",
+            wall,
+            Some(Duration::from_secs(60)),
+        )
+        .unwrap();
+        let offer = identity.augment(OFFER, wall).unwrap();
+        let mut signaler = signaler(HttpSignalerConfig {
+            answer_timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+        connect(&mut signaler, 1, "127.0.0.1:1000");
+        connect(&mut signaler, 2, "127.0.0.1:1001");
+
+        for (connection, wall) in [(1, wall), (2, wall + Duration::from_secs(121))] {
+            signaler
+                .handle(HttpSignalerInput::Request {
+                    connection,
+                    request: request(Method::POST, "/v1/join/1234", &offer),
+                    now,
+                    wall,
+                })
+                .unwrap();
+        }
+        assert!(matches!(next(&mut signaler), HttpSignalerOutput::Offer(_)));
+        let HttpSignalerOutput::Response {
+            connection,
+            response,
+            ..
+        } = next(&mut signaler)
+        else {
+            panic!("expected an expired-credential response");
+        };
+        assert_eq!(connection, 2);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        signaler
+            .handle(HttpSignalerInput::Update(now + Duration::from_secs(4)))
+            .unwrap();
+        assert!(
+            matches!(next(&mut signaler), HttpSignalerOutput::Wait(wait) if wait == Duration::from_secs(1))
+        );
+        signaler
+            .handle(HttpSignalerInput::Update(now + Duration::from_secs(5)))
+            .unwrap();
+        let HttpSignalerOutput::Response {
+            connection,
+            response,
+            ..
+        } = next(&mut signaler)
+        else {
+            panic!("expected the unanswered join to expire");
+        };
+        assert_eq!(connection, 1);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 }

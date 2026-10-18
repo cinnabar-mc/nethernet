@@ -28,6 +28,19 @@ The WebRTC-based network protocol used in newer versions of Minecraft. It provid
 - **[`nethernet-tokio`](nethernet-tokio)** - an async tokio wrapper over the sans-io crate, exposing `NetherServer` and `NetherClient`.
 - **[`bevy-nethernet`](bevy-nethernet)** - a Bevy plugin wrapping the sans-io crate directly, for games that want to drive it from their own tick rather than through tokio.
 
+### Driving the core
+
+`Session::new(local_addr, is_controlling, session_id, now)` takes a caller-selected
+SDP origin identifier and a monotonic time. Choose a distinct identifier for each
+local session; the returned `Description` retains it for every encoding.
+`Admitted::answer` takes the same inputs when creating a server session. The Tokio
+and Bevy adapters generate these identifiers at their runtime boundary.
+
+`HttpSignalerInput::Request` carries both `now: Instant` for answer deadlines and
+`wall: SystemTime` for credential expiry. Supply the receive time from each clock;
+UTC changes do not alter pending-answer deadlines. HTTP execution stays in the
+runtime adapters.
+
 ### Features
 
 - Secure communication over WebRTC (DTLS/SCTP)
@@ -93,11 +106,199 @@ with `ConnectionConfig::allow_unsigned_answers`; an identity that is set still s
 optional over LAN discovery. In `bevy-nethernet`, `NetherHttpServer::set_identity` is required
 the same way and joins are answered with 503 until it is called, unless
 `NetherHttpServer::allow_unsigned_answers(true)` opts out. Offers over
-HTTP are validated against `HttpSignalerConfig::token_trust` alone, and `ConnectionConfig::token_trust` applies only to offers over LAN discovery. It
+HTTP are validated against `HttpSignalerConfig::token_trust` alone, and `ConnectionConfig::token_trust` applies to LAN and caller-bridge offers. It
 defaults to accepting any self-signed token while still binding it to the certificate the
 peer presents. `nethernet_tokio::util::jwks::Jwks::minecraft` fetches the keys needed to
 require a token issued by the Minecraft authorization service instead.
 
+### Server ownership
+
+`ConnectionConfig::max_sessions` bounds negotiating, queued and accepted Tokio
+server sessions together. A reservation is retained through actual driver
+retirement and every session or receiver handle; closing a connection while
+keeping its receivers does not free it. The existing `max_pending` and
+`max_pending_per_network_id` separately limit negotiations. Excess offers are
+refused with `IncomingConnectionIgnored` (HTTP responds with 403); setting `max_sessions` to zero refuses
+all offers.
+Refusal delivery retains at most one best-effort send; further excess offers may
+expire while that signaling operation is stalled.
+
+The listener owns its pending negotiations and bounded late-candidate queues.
+Closing or dropping it cancels unaccepted peers through metadata, answer delivery
+and channel establishment. Sessions already returned by `accept()` or `Stream`
+continue independently and preserve their accepted receive FIFO. Candidate
+overflow retires only the affected peer. Session commands apply backpressure at
+their caller; `send_before` retains its original admission deadline while waiting
+for capacity.
+
+### Client identities
+
+`ConnectionConfig::identity` accepts an `Arc<dyn SdpIdentity>`. Use
+`SelfSignedIdentity::new(now, lifetime)` for signed-out client offers. Its token
+carries base64 DER public keys in `cpk` and `x5u`, and signs the SDP fingerprints.
+Borrow `signing_key()` when a later application login must use the same key.
+Time and lifetime are explicit inputs; expired identities cannot sign offers.
+
+`ServerIdentity` retains its existing JWK token format and also implements
+`SdpIdentity`. Account authentication, credentials and refresh belong to an
+application-owned implementation of that interface.
+
+For an explicitly authorized service route, `TokenTrust::ServerAnswer(provider)`
+accepts a self-signed ES384 server token or delegates an RS256 token to the supplied
+provider. Both paths verify the token's own detached SDP fingerprint signature.
+An invalid provider token never falls back to self-signed trust. Self-signed server
+token timestamps are not player credential validity; the caller's original
+transport deadline still applies. This mode is accepted only by `verify_answer`,
+not offer admission. It does not authorize a route, authenticate a player, remember
+a key or make a trust choice for the application. `Provider` remains strict, and
+`Any` retains its existing unverified-token behavior.
+
 ## License
 
 This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+
+## Caller-owned signaling services
+
+`nethernet-tokio::CallerSignaling::new(local_id, remote_id, config)` returns a
+transport backend and a `CallerSignalingDriver`. Create one bridge per concurrent
+connection and poll each driver's `recv` alongside your shared service socket.
+The bridge opens no sockets and starts no tasks or runtime. The Tokio client
+continues to own its UDP socket and connected-session task.
+
+For Player Messaging, `local_id` is the advertised NetherNet ID and `remote_id`
+is the peer's messaging UUID. Submit each request's signal text and original
+`deadline()` to the service, with `requires_peer_receipt()` as the delivery policy.
+Complete it with `SignalDelivery::ServiceAccepted` or `PeerReceived` only after
+the corresponding service evidence arrives. Offers require both service acceptance
+and peer receipt by default. If `request.cancelled()` completes, cancel the service
+handle; a partially written request has an ambiguous outcome and must not be resent
+automatically. Caller signaling makes one connection attempt regardless of the
+convenience client's `attempts` setting.
+
+On receipt, call `driver.try_deliver(sender_uuid, signal_text)` using the
+**authenticated envelope sender**, not its advertised NetherNet ID. Acknowledge
+the original service envelope only after admission succeeds. Incoming queue
+capacity is bounded, and outgoing capacity includes requests held by the caller.
+A second active subscription returns an error. Dropping a subscription discards
+its queued old signals and allows a fresh attempt; dropping the driver closes
+that bridge without closing the shared service socket.
+
+Keep account, messaging UUID, advertised network ID, multiplayer token and P-384
+key ownership in the application. Supply its `SdpIdentity` through
+`ConnectionConfig::identity`; the bridge creates no replacement identity key.
+Service signaling alone does not supply STUN/TURN credentials or select a relay
+policy; those inputs remain with the application.
+
+`CallerServerSignaling::new(local_id, config)` returns a bounded accepting
+backend and `CallerServerSignalingDriver` for unsolicited offers from multiple
+authenticated senders on one caller-owned service connection. Bind it with
+`NetherServer::bind_with`. Supply the existing answer `identity` and an explicit
+`token_trust` for offers; the bridge chooses neither. `set_token_trust(None)`
+disables later caller-bridge offer admission. Existing HTTP and LAN policies
+remain unchanged. `ServerSignaling::signals()` is fallible so a duplicate caller
+listener fails synchronously before spawning transport work.
+
+Use the same `SignalRequest`, original deadlines and delivery evidence as client
+bridges. Incoming `try_deliver` commits immediately; `prepare_delivery_before`
+retains a cancel-safe capacity wait and checks the original deadline at actual
+queue commitment. Only then acknowledge its authenticated service envelope.
+Sender and connection ID jointly identify a route. Unpolled offer waits reserve
+bounded route capacity and release it on drop; duplicates and unknown candidates
+cannot create or replace a route. `max_routes` and `max_routes_per_sender` include
+negotiating, accepted and retained closed receiver lifetimes. Closing the
+listener preserves already accepted peers, while dropping the service driver
+ends their transport and preserves accepted data before one receive error.
+
+Configured UDP ICE sessions can gather server-reflexive and TURN relay candidates.
+The pure `nethernet::session::IceConfig` owns resolved endpoints, credential
+expiry, gathering deadlines and candidate policy. `Session::new` remains
+host-only; use `Session::new_with_ice` for configured paths. Full ICE callers drive
+gathering to `GatheringState::Complete` before encoding their SDP. Trickle callers
+drain `Session::poll_local_candidate` or `Connection::poll_local_signal` while
+continuing to feed packets and time.
+
+The optional Tokio client adapter accepts `ConnectionConfig::client_ice`:
+
+```rust,ignore
+let servers = nethernet_tokio::resolve_ice_servers(
+    &acquired_credentials.ice_servers,
+    local_bind_address,
+    original_credential_expiry,
+    resolution_deadline,
+).await?;
+let config = nethernet_tokio::ConnectionConfig {
+    client_ice: Some(nethernet_tokio::ClientIceConfig {
+        ice: nethernet::session::IceConfig { servers, ..Default::default() },
+        bind_addr: Some(local_bind_address),
+    }),
+    ..Default::default()
+};
+```
+
+The accepting adapter uses `ConnectionConfig::server_ice` with
+`ServerIceConfig { ice, bind_addr }`. Its bind address is explicit, including the
+outer UDP family; the same pure configuration, bounded endpoints and absolute
+TURN credential expiry apply. Full mode gathers before encoding/signing its
+answer. Trickle mode continues gathering during initial answer delivery, but
+late candidate sends wait until the answer and its initial candidates have
+actually completed in order. `NetherServer::set_server_ice` replaces configuration
+for later offers; it never extends an existing credential's expiry. Use
+`Session::update_turn_credentials` to renew a live allocation.
+
+A pure caller that gathers its own accepting session can use
+`Admitted::prepare_answer(&mut session, description, now, wall)`, then transfer
+that exact session synchronously with `PreparedAnswer::finish`. Preparation
+rechecks offer validity at the supplied current wall time and signs the original
+DTLS fingerprints. The caller retains its allocation on any preparation error
+and must close/drain it. This API creates no service account, credential source,
+HTTP client, socket or runtime.
+
+The application acquires and renews service credentials. DNS runs only in the
+adapter; the core receives numeric endpoints. Full mode gathers before signing
+the offer. Trickle mode continues UDP gathering while signaling is pending and
+sends later candidates through the retained signaling owner. Runtime session
+handles accept credential rotation through `update_turn_credentials`. Cancelling
+negotiation or dropping the driver stops its state and attempts relay release.
+
+This path supports UDP STUN and TURN with IPv4 relay allocations over IPv4 or
+IPv6 outer UDP. Explicit IPv6 relay allocation and TURN TCP/TLS remain incomplete.
+The Bevy LAN and HTTP clients accept `set_ice_config(Some(ClientIceConfig {
+    bind_addr: local_interface,
+    ice: IceConfig { servers, ..Default::default() },
+}))` using types from `bevy_nethernet::prelude` and `nethernet::session`.
+`local_interface` is a concrete numeric local address with an optional ephemeral
+port; all server endpoints must have the same family. HTTP joins gather Full
+candidates before encoding/signing the offer. LAN carries Trickle candidates,
+including those gathered after its initial offer. Active clients expose
+`update_turn_credentials` for password renewal under the original expiry.
+
+Outbound Bevy clients poll their nonblocking UDP socket and pure connection on
+`update`, without a socket thread or Tokio dependency. Call updates regularly;
+pausing frames also pauses transport progress. Each client owns an exclusive UDP
+socket, including its TURN allocation tuples. The server adapter retains its
+existing shared-socket worker and command/event queues; this does not multiplex
+multiple relay allocations onto a shared TURN tuple. Outbound work reads at most
+64 datagrams and drains at most 1024 core outputs per update. Transport delivery
+and application delivery each retain at most 1024 messages and 16 MiB; exceeding a
+receive budget closes the client explicitly. Sends apply core expiry immediately
+and return `WouldBlock` before admitting more work when the drain budget is full.
+Cancellation drops the socket owner after finite best-effort relay release.
+Initial HTTP hostname resolution/platform TLS setup are synchronous explicit
+setup; frame retries reuse their prepared target and trust configuration.
+
+The Tokio driver admits reliable messages into one FIFO shared with the application
+receiver. Its packet budget is twice the default receiver capacity; its byte budget
+is the default capacity times the protocol segment size. Application backpressure
+does not block transport timers or signaling. Accepted messages remain available
+after transport retirement, followed by EOF on local cancellation or authenticated
+peer close, or one explicit error on transport failure or receive overflow. Dropping
+the reliable receiver closes the session when the next reliable message arrives;
+unreliable receive remains best effort. Existing TURN allocations require the same
+username during password rotation. A new username requires a new socket and allocation.
+
+Before a remote description installs ICE credentials, the core discards peer
+checks for RTC to retry while continuing configured STUN/TURN transactions.
+Signaling completion still has to fit the peers' original establishment budgets.
+An authenticated DTLS peer close delivers any complete final message, routes its
+close reply through the selected ICE path, then releases transport state once and
+emits `SessionEvent::PeerClosed`. Transport failures emit `SessionEvent::Failed`.

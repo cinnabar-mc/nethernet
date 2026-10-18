@@ -30,11 +30,14 @@ pub struct Connection {
     connection_id: u64,
     remote_network_id: String,
     remote_identity: Option<String>,
+    ice_mode: IceMode,
+    local_ufrag: String,
+    next_candidate_index: usize,
 }
 
 impl Connection {
     pub fn connect(
-        session: Session,
+        mut session: Session,
         description: Description,
         connection_id: u64,
         remote_network_id: String,
@@ -48,6 +51,8 @@ impl Connection {
             remote_network_id.clone(),
             SignalKind::Offer,
         );
+        let next_candidate_index = session.local_candidates().len();
+        while session.poll_local_candidate().is_some() {}
 
         (
             Self {
@@ -55,6 +60,9 @@ impl Connection {
                 connection_id,
                 remote_network_id,
                 remote_identity: None,
+                ice_mode,
+                local_ufrag: description.ice.ufrag,
+                next_candidate_index,
             },
             signals,
         )
@@ -88,24 +96,63 @@ impl Connection {
             now,
         ))?;
 
-        let signals = Self::describe(
-            &session,
-            &description,
+        let signals = Self::answer_signals(&session, &description, offer, ice_mode);
+        let candidates = Self::take_described_candidates(&mut session);
+        Ok((
+            Self::accepted(
+                session,
+                description,
+                offer,
+                remote_identity,
+                ice_mode,
+                candidates,
+            ),
+            signals,
+        ))
+    }
+
+    /// Encodes the prepared session's current candidates without transferring its allocation owner.
+    pub(crate) fn answer_signals(
+        session: &Session,
+        description: &Description,
+        offer: &Signal,
+        ice_mode: IceMode,
+    ) -> Vec<Signal> {
+        Self::describe(
+            session,
+            description,
             ice_mode,
             offer.connection_id,
             offer.network_id.clone(),
             SignalKind::Answer,
-        );
+        )
+    }
 
-        Ok((
-            Self {
-                session,
-                connection_id: offer.connection_id,
-                remote_network_id: offer.network_id.clone(),
-                remote_identity,
-            },
-            signals,
-        ))
+    /// Marks only the current description's candidates as sent, leaving later gathered ones for trickle.
+    pub(crate) fn take_described_candidates(session: &mut Session) -> usize {
+        let count = session.local_candidates().len();
+        while session.poll_local_candidate().is_some() {}
+        count
+    }
+
+    /// Adopts an already applied remote description after all fallible answer preparation succeeds.
+    pub(crate) fn accepted(
+        session: Session,
+        description: Description,
+        offer: &Signal,
+        remote_identity: Option<String>,
+        ice_mode: IceMode,
+        next_candidate_index: usize,
+    ) -> Self {
+        Self {
+            session,
+            connection_id: offer.connection_id,
+            remote_network_id: offer.network_id.clone(),
+            remote_identity,
+            ice_mode,
+            local_ufrag: description.ice.ufrag,
+            next_candidate_index,
+        }
     }
 
     fn describe(
@@ -117,7 +164,7 @@ impl Connection {
         kind: SignalKind,
     ) -> Vec<Signal> {
         let sdp = match ice_mode {
-            IceMode::Full => description.encode_full(&[session.local_candidate().clone()]),
+            IceMode::Full => description.encode_full(session.local_candidates()),
             IceMode::Trickle => description.encode_trickle(),
         };
 
@@ -127,11 +174,13 @@ impl Connection {
         }];
 
         if ice_mode == IceMode::Trickle {
-            signals.push(Signal::candidate(
-                connection_id,
-                format_ice_candidate(0, session.local_candidate(), &description.ice.ufrag),
-                remote_network_id,
-            ));
+            for (index, candidate) in session.local_candidates().iter().enumerate() {
+                signals.push(Signal::candidate(
+                    connection_id,
+                    format_ice_candidate(index, candidate, &description.ice.ufrag),
+                    remote_network_id.clone(),
+                ));
+            }
         }
 
         signals
@@ -185,6 +234,37 @@ impl Connection {
 
     pub fn connection_id(&self) -> u64 {
         self.connection_id
+    }
+
+    /// One candidate gathered after the initial signals. The runtime sends it through the same signaling owner.
+    pub fn poll_local_signal(&mut self) -> Option<Signal> {
+        if self.ice_mode != IceMode::Trickle {
+            return None;
+        }
+        let candidate = self.session.poll_local_candidate()?;
+        let index = self.next_candidate_index;
+        self.next_candidate_index += 1;
+        Some(Signal::candidate(
+            self.connection_id,
+            format_ice_candidate(index, &candidate, &self.local_ufrag),
+            self.remote_network_id.clone(),
+        ))
+    }
+
+    /// Cancels all transport timers and queues best-effort relay deallocation sends.
+    pub fn close(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        self.session.close(now)
+    }
+
+    /// Rotates one TURN allocation's credential using the caller's clock.
+    pub fn update_turn_credentials(
+        &mut self,
+        server: SocketAddr,
+        credentials: crate::session::TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        self.session
+            .update_turn_credentials(server, credentials, now)
     }
 }
 
@@ -272,7 +352,7 @@ mod tests {
     fn assert_connects(ice_mode: IceMode) {
         let mut now = Instant::now();
 
-        let (offer_session, offer_description) = Session::new(addr(40200), true, now).unwrap();
+        let (offer_session, offer_description) = Session::new(addr(40200), true, 1, now).unwrap();
         let (mut offerer, offer_signals) = Connection::connect(
             offer_session,
             offer_description,
@@ -285,7 +365,8 @@ mod tests {
         assert_eq!(offer.signal_type, SignalType::Offer);
 
         let (remote_description, remote_candidates) = Connection::parse_offer(&offer).unwrap();
-        let (answer_session, answer_description) = Session::new(addr(40201), false, now).unwrap();
+        let (answer_session, answer_description) =
+            Session::new(addr(40201), false, 2, now).unwrap();
         let (mut answerer, answer_signals) = Connection::accept(
             answer_session,
             answer_description,
@@ -327,7 +408,7 @@ mod tests {
                 match output {
                     SessionOutput::Send(data, to) => outbox.push((data, to)),
                     SessionOutput::Event(SessionEvent::Ready) => offerer_ready = true,
-                    SessionOutput::Event(SessionEvent::Failed) => {
+                    SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                         panic!("session failed unexpectedly")
                     }
                     SessionOutput::Message(..) => {}
@@ -335,8 +416,9 @@ mod tests {
                 }
             }
             for (data, to) in outbox {
+                assert_eq!(to, addr(40201));
                 answerer
-                    .handle(ConnectionInput::Packet(data.into(), to, now))
+                    .handle(ConnectionInput::Packet(data.into(), addr(40200), now))
                     .unwrap();
             }
 
@@ -346,7 +428,7 @@ mod tests {
                 match output {
                     SessionOutput::Send(data, to) => outbox.push((data, to)),
                     SessionOutput::Event(SessionEvent::Ready) => answerer_ready = true,
-                    SessionOutput::Event(SessionEvent::Failed) => {
+                    SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                         panic!("session failed unexpectedly")
                     }
                     SessionOutput::Message(..) => {}
@@ -354,8 +436,9 @@ mod tests {
                 }
             }
             for (data, to) in outbox {
+                assert_eq!(to, addr(40200));
                 offerer
-                    .handle(ConnectionInput::Packet(data.into(), to, now))
+                    .handle(ConnectionInput::Packet(data.into(), addr(40201), now))
                     .unwrap();
             }
 
@@ -387,7 +470,7 @@ mod tests {
     #[test]
     fn signals_for_a_different_connection_are_ignored() {
         let now = Instant::now();
-        let (session, description) = Session::new(addr(40210), true, now).unwrap();
+        let (session, description) = Session::new(addr(40210), true, 1, now).unwrap();
         let (mut offerer, _) =
             Connection::connect(session, description, 1, 7.to_string(), IceMode::Full);
         let unrelated = Signal::answer(999, "irrelevant".to_string(), "7".to_string());
@@ -414,7 +497,8 @@ mod tests {
         let now = Instant::now();
         let wall_clock = SystemTime::now();
 
-        let (offer_session, mut offer_description) = Session::new(addr(40220), true, now).unwrap();
+        let (offer_session, mut offer_description) =
+            Session::new(addr(40220), true, 1, now).unwrap();
         let offerer_identity = signed_by("offerer.example", &mut offer_description);
         let offerer_envelope = offer_description.identity.clone().unwrap();
 
@@ -444,7 +528,7 @@ mod tests {
         );
 
         let (answer_session, mut answer_description) =
-            Session::new(addr(40221), false, now).unwrap();
+            Session::new(addr(40221), false, 2, now).unwrap();
         let answerer_identity = signed_by("answerer.example", &mut answer_description);
         let answerer_envelope = answer_description.identity.clone().unwrap();
 

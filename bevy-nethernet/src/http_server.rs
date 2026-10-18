@@ -435,6 +435,7 @@ impl NetherHttpServer {
                 connection,
                 request: Box::new(request),
                 now,
+                wall: SystemTime::now(),
             });
         }
 
@@ -511,7 +512,7 @@ impl NetherHttpServer {
         let signaled_player = offer.player.clone().map(|player| Arc::new(*player));
         let answered = policy
             .admit(&offer.signal(), offer.client_address, SystemTime::now())
-            .and_then(|admitted| admitted.answer(self.session_local_addr, now));
+            .and_then(|admitted| admitted.answer(self.session_local_addr, rand::random(), now));
         match answered {
             Ok(Answered {
                 connection,

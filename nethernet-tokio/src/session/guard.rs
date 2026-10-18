@@ -1,0 +1,112 @@
+//! Concrete cancellation owners for gathering and connected transports.
+use super::ServerLease;
+use nethernet::connection::Connection;
+use nethernet::sans::Sans;
+use nethernet::session::{Session, SessionOutput};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::net::UdpSocket;
+
+/// Uses the runtime's monotonic clock, including Tokio's deterministic test clock.
+pub(crate) fn transport_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
+/// Keeps an allocation owned while the asynchronous full-gather operation can be cancelled.
+pub(crate) struct GatheringGuard {
+    pub core: Option<Session>,
+    socket: Arc<UdpSocket>,
+    server_capacity: Option<Arc<ServerLease>>,
+}
+
+impl GatheringGuard {
+    pub fn new(core: Session, socket: Arc<UdpSocket>) -> Self {
+        Self {
+            core: Some(core),
+            socket,
+            server_capacity: None,
+        }
+    }
+    /// Holds the accepting reservation through canceled gather and allocation destruction.
+    pub(crate) fn with_server_capacity(mut self, capacity: Arc<ServerLease>) -> Self {
+        self.server_capacity = Some(capacity);
+        self
+    }
+}
+
+impl Drop for GatheringGuard {
+    fn drop(&mut self) {
+        if let Some(core) = &mut self.core {
+            let _ = core.close(transport_now());
+            while let Some(output) = core.poll() {
+                if let SessionOutput::Send(data, to) = output {
+                    let _ = self.socket.try_send_to(&data, to);
+                }
+            }
+        }
+    }
+}
+
+/// Owns the core during negotiation and after spawning; aborting either future still releases its allocations.
+pub(crate) struct ConnectionGuard {
+    core: Option<Connection>,
+    socket: Arc<UdpSocket>,
+    // Field order retains capacity through core and socket destruction after Drop runs.
+    server_capacity: Option<Arc<ServerLease>>,
+}
+
+impl ConnectionGuard {
+    pub fn new(core: Connection, socket: Arc<UdpSocket>) -> Self {
+        Self {
+            core: Some(core),
+            socket,
+            server_capacity: None,
+        }
+    }
+
+    /// Retains server admission through actual driver destruction, including an unpolled abort.
+    pub(crate) fn with_server_capacity(mut self, capacity: Option<Arc<ServerLease>>) -> Self {
+        self.server_capacity = capacity;
+        self
+    }
+
+    /// Borrows the actor's two owned resources without another socket owner outside this guard.
+    pub(crate) fn parts(&mut self) -> (&mut Connection, &UdpSocket) {
+        (
+            self.core
+                .as_mut()
+                .expect("connection is owned until its single handoff"),
+            self.socket.as_ref(),
+        )
+    }
+
+    /// Borrows the owned connection until it is handed to the session driver.
+    pub fn core(&mut self) -> &mut Connection {
+        self.core
+            .as_mut()
+            .expect("connection is owned until its single handoff")
+    }
+
+    /// Transfers ownership synchronously, with no cancellation point between the two drivers.
+    pub fn take(&mut self) -> Connection {
+        self.core
+            .take()
+            .expect("connection is handed off only once")
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(capacity) = &self.server_capacity {
+            capacity.retire_route();
+        }
+        if let Some(core) = &mut self.core {
+            let _ = core.close(transport_now());
+            while let Some(output) = core.poll() {
+                if let SessionOutput::Send(data, to) = output {
+                    let _ = self.socket.try_send_to(&data, to);
+                }
+            }
+        }
+    }
+}

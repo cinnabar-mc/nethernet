@@ -12,6 +12,10 @@ use crate::sans::Sans;
 use dtls::EndpointEvent;
 pub use dtls::ResolvedRole;
 use ice::IceLayer;
+pub use ice::{
+    GatheringState, IceConfig, IceError, IcePolicy, IceServer, MAX_ICE_SERVERS,
+    MAX_TURN_CREDENTIAL_BYTES, TurnCredentials,
+};
 use rtc::datachannel::message::Message as DcepMessage;
 use rtc::ice::candidate::Candidate;
 use rtc::ice::state::ConnectionState as IceConnectionState;
@@ -37,8 +41,10 @@ pub enum Channel {
 pub enum SessionEvent {
     /// Both data channels are open.
     Ready,
-    /// ICE or SCTP failed, or the session did not become ready in time; emitted once.
+    /// A transport failed or establishment expired; emitted once.
     Failed,
+    /// The authenticated DTLS peer closed; transport state and timers have been retired.
+    PeerClosed,
 }
 
 pub enum SessionOutput {
@@ -73,7 +79,7 @@ struct Channels {
     unreliable_stream_id: Option<StreamId>,
     reassembly: Framing,
     ready_emitted: bool,
-    failed_emitted: bool,
+    terminal_emitted: bool,
 }
 
 impl Channels {
@@ -95,13 +101,12 @@ impl Channels {
 /// ICE, DTLS and SCTP stacks bound to one local address, with one reliable and one unreliable channel.
 pub struct Session {
     is_controlling: bool,
-    local_addr: SocketAddr,
     ice: IceLayer,
     certificate: Option<rtc::dtls::crypto::Certificate>,
 
     pending_role_fingerprint: Option<(ResolvedRole, (String, String))>,
     remote_max_message_size: u32,
-    early_packets: VecDeque<Vec<u8>>,
+    early_packets: VecDeque<rtc::shared::TaggedBytesMut>,
 
     remote: Option<RemoteInfo>,
     dtls: Option<DtlsLayer>,
@@ -117,16 +122,44 @@ pub use dtls::DtlsLayer;
 
 impl Session {
     /// The controlling side is the offerer: it announces the DTLS server role and opens the data channels.
+    /// The caller supplies a distinct SDP origin identifier for each local session.
     pub fn new(
         local_addr: SocketAddr,
         is_controlling: bool,
+        session_id: u64,
         now: Instant,
     ) -> Result<(Session, Description), ProtocolError> {
         let ice = IceLayer::new(local_addr, is_controlling, now)?;
+        Self::from_ice(is_controlling, session_id, ice)
+    }
+
+    /// Creates a session with resolved UDP STUN/TURN servers. Drain its initial sends and waits immediately.
+    /// Full ICE callers wait for `GatheringState::Complete` before encoding SDP; trickle callers poll candidates.
+    pub fn new_with_ice(
+        local_addr: SocketAddr,
+        is_controlling: bool,
+        session_id: u64,
+        config: IceConfig,
+        now: Instant,
+    ) -> Result<(Session, Description), ProtocolError> {
+        let ice = IceLayer::with_config(local_addr, is_controlling, config, now)?;
+        let (mut session, description) = Self::from_ice(is_controlling, session_id, ice)?;
+        session.pump(now)?;
+        session.push_wait(now);
+        Ok((session, description))
+    }
+
+    /// Constructs the shared DTLS description after the caller selects its ICE configuration.
+    fn from_ice(
+        is_controlling: bool,
+        session_id: u64,
+        ice: IceLayer,
+    ) -> Result<(Session, Description), ProtocolError> {
         let certificate = certificate::generate()?;
         let fingerprint = certificate::fingerprint(&certificate)?;
 
         let local_description = Description {
+            session_id,
             ice: ice.local_credentials().clone(),
             dtls_role: if is_controlling {
                 DtlsRole::Server
@@ -140,7 +173,6 @@ impl Session {
 
         let session = Self {
             is_controlling,
-            local_addr,
             ice,
             certificate: Some(certificate),
             pending_role_fingerprint: None,
@@ -165,6 +197,55 @@ impl Session {
 
     pub fn local_candidate(&self) -> &Candidate {
         self.ice.local_candidate()
+    }
+
+    /// Every candidate gathered so far and allowed by this session's policy.
+    pub fn local_candidates(&self) -> &[Candidate] {
+        self.ice.local_candidates()
+    }
+
+    /// Drains each gathered candidate once. Callers send these incrementally when using trickle ICE.
+    pub fn poll_local_candidate(&mut self) -> Option<Candidate> {
+        self.ice.poll_local_candidate()
+    }
+
+    /// Finite gathering state, independent of the remote description or connectivity checks.
+    pub fn gathering_state(&self) -> GatheringState {
+        self.ice.gathering_state()
+    }
+
+    /// Rotates the password for one resolved TURN endpoint; the allocation username must remain unchanged.
+    pub fn update_turn_credentials(
+        &mut self,
+        server: SocketAddr,
+        credentials: TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        let result = self.ice.update_credentials(server, credentials, now);
+        if self.ice.selected_route_failed() {
+            self.fail(now)?;
+        }
+        result?;
+        self.pump(now)?;
+        self.push_wait(now);
+        Ok(())
+    }
+
+    /// Cancels gathering, checks and relay timers immediately. Drain best-effort deallocation sends before dropping.
+    pub fn close(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        if self.ice.gathering_state() == GatheringState::Closed {
+            return Ok(());
+        }
+        self.output.clear();
+        self.early_packets.clear();
+        self.ice.close(now);
+        self.dtls = None;
+        self.sctp = None;
+        self.establish_started = None;
+        while let Some((data, to)) = self.ice.poll_write()? {
+            self.output.push_back(SessionOutput::Send(data, to));
+        }
+        Ok(())
     }
 
     /// The selected ICE remote address, else the first candidate's.
@@ -216,7 +297,7 @@ impl Session {
     }
 
     fn start_transports_on_selected_pair(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        if self.dtls.is_some() {
+        if self.dtls.is_some() || self.channels.terminal_emitted {
             return Ok(());
         }
         let Some(remote_addr) = self.ice.selected_remote_addr() else {
@@ -228,7 +309,11 @@ impl Session {
         self.start_transports(remote_addr, resolved_role, fingerprint, now)?;
 
         for packet in std::mem::take(&mut self.early_packets) {
-            self.read_dtls(&packet, now)?;
+            if Some(packet.transport.local_addr) == self.ice.selected_local_addr()
+                && Some(packet.transport.peer_addr) == self.ice.selected_remote_addr()
+            {
+                self.read_dtls(&packet.message, now)?;
+            }
         }
         Ok(())
     }
@@ -244,8 +329,9 @@ impl Session {
             .certificate
             .take()
             .ok_or_else(|| ProtocolError::Other("transports already started".to_string()))?;
+        let selected_local = self.ice.selected_local_addr().ok_or(IceError::Server)?;
         let dtls = DtlsLayer::new(
-            self.local_addr,
+            selected_local,
             remote_addr,
             resolved_role,
             certificate,
@@ -253,7 +339,7 @@ impl Session {
             now,
         )?;
         let sctp = SctpLayer::new(
-            self.local_addr,
+            selected_local,
             remote_addr,
             resolved_role,
             self.remote_max_message_size,
@@ -273,19 +359,19 @@ impl Session {
         from: SocketAddr,
         now: Instant,
     ) -> Result<(), ProtocolError> {
-        if self.ice.handle_read(data, from, now)? {
-            self.pump(now)?;
-            return Ok(());
-        }
-
-        if self.dtls.is_none() {
-            if self.early_packets.len() < MAX_EARLY_PACKETS {
-                self.early_packets.push_back(data.to_vec());
+        self.ice.handle_read(data, from, now)?;
+        self.pump(now)?;
+        while let Some(packet) = self.ice.poll_read() {
+            if self.dtls.is_none() {
+                if self.early_packets.len() < MAX_EARLY_PACKETS {
+                    self.early_packets.push_back(packet);
+                }
+            } else if Some(packet.transport.local_addr) == self.ice.selected_local_addr()
+                && Some(packet.transport.peer_addr) == self.ice.selected_remote_addr()
+            {
+                self.read_dtls(&packet.message, now)?;
             }
-            return Ok(());
         }
-
-        self.read_dtls(data, now)?;
         self.pump(now)?;
         Ok(())
     }
@@ -294,18 +380,53 @@ impl Session {
         if let Some(dtls) = &mut self.dtls {
             let events = dtls.handle_read(data, now)?;
             for event in events {
-                self.handle_dtls_event(event, now);
+                self.handle_dtls_event(event, now)?;
             }
         }
         Ok(())
     }
 
-    fn handle_dtls_event(&mut self, event: EndpointEvent, now: Instant) {
-        if let EndpointEvent::ApplicationData(data) = event
-            && let Some(sctp) = &mut self.sctp
-        {
-            sctp.handle_read(&data, now);
+    fn handle_dtls_event(
+        &mut self,
+        event: EndpointEvent,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        match event {
+            EndpointEvent::ApplicationData(data) => {
+                if let Some(sctp) = &mut self.sctp {
+                    sctp.handle_read(&data, now);
+                }
+                Ok(())
+            }
+            EndpointEvent::HandshakeComplete => Ok(()),
+            EndpointEvent::PeerClosed => self.peer_closed(now),
+            _ => Ok(()),
         }
+    }
+
+    /// Delivers complete final data and routes close_notify before releasing the relay allocation.
+    fn peer_closed(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        let mut final_output = std::mem::take(&mut self.output);
+        final_output.retain(|output| !matches!(output, SessionOutput::Wait(..)));
+        let flush = (|| {
+            if let Some(sctp) = &mut self.sctp {
+                drain_dcep_and_data(sctp, &mut self.channels, &mut final_output, now)?;
+            }
+            if let Some(dtls) = &mut self.dtls {
+                while let Some((data, to)) = dtls.poll_transmit() {
+                    self.ice.send_selected(data, to, now)?;
+                }
+            }
+            while let Some((data, to)) = self.ice.poll_write()? {
+                final_output.push_back(SessionOutput::Send(data, to));
+            }
+            Ok(())
+        })();
+        // A best-effort reply failure must never keep a removed DTLS association alive.
+        let teardown = self.terminate(SessionEvent::PeerClosed, now);
+        final_output.append(&mut self.output);
+        self.output = final_output;
+        flush.and(teardown)
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), ProtocolError> {
@@ -329,7 +450,7 @@ impl Session {
     }
 
     fn establish_deadline(&self) -> Option<Instant> {
-        if self.channels.ready_emitted || self.channels.failed_emitted {
+        if self.channels.ready_emitted || self.channels.terminal_emitted {
             return None;
         }
         self.establish_started.map(|at| at + self.establish_within)
@@ -389,7 +510,10 @@ impl Session {
     }
 
     fn pump(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        while let Some((data, to)) = self.ice.poll_write() {
+        if self.ice.selected_route_failed() {
+            self.fail(now)?;
+        }
+        while let Some((data, to)) = self.ice.poll_write()? {
             self.output.push_back(SessionOutput::Send(data, to));
         }
         while let Some(event) = self.ice.poll_event() {
@@ -401,7 +525,7 @@ impl Session {
                         | IceConnectionState::Closed
                 )
             {
-                self.fail();
+                self.fail(now)?;
             }
         }
         self.start_transports_on_selected_pair(now)?;
@@ -430,16 +554,20 @@ impl Session {
             }
 
             while let Some((data, to)) = dtls.poll_transmit() {
-                self.output.push_back(SessionOutput::Send(data, to));
+                self.ice.send_selected(data, to, now)?;
             }
         }
+        while let Some((data, to)) = self.ice.poll_write()? {
+            self.output.push_back(SessionOutput::Send(data, to));
+        }
         if failed {
-            self.fail();
+            self.fail(now)?;
         }
 
         if self.channels.reliable_stream_id.is_some()
             && self.channels.unreliable_stream_id.is_some()
             && !self.channels.ready_emitted
+            && !self.channels.terminal_emitted
         {
             self.channels.ready_emitted = true;
             self.output
@@ -450,18 +578,34 @@ impl Session {
             .establish_deadline()
             .is_some_and(|deadline| now >= deadline)
         {
-            self.fail();
+            self.fail(now)?;
         }
 
         Ok(())
     }
 
-    fn fail(&mut self) {
-        if !self.channels.failed_emitted {
-            self.channels.failed_emitted = true;
-            self.output
-                .push_back(SessionOutput::Event(SessionEvent::Failed));
+    fn fail(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        self.terminate(SessionEvent::Failed, now)
+    }
+
+    /// Retains accepted data/readiness in order, retiring protocol work before the single terminal outcome.
+    fn terminate(&mut self, terminal: SessionEvent, now: Instant) -> Result<(), ProtocolError> {
+        if !self.channels.terminal_emitted {
+            self.channels.terminal_emitted = true;
+            let mut accepted = std::mem::take(&mut self.output);
+            accepted.retain(|output| {
+                matches!(
+                    output,
+                    SessionOutput::Message(..) | SessionOutput::Event(SessionEvent::Ready)
+                )
+            });
+            let teardown = self.close(now);
+            accepted.append(&mut self.output);
+            accepted.push_back(SessionOutput::Event(terminal));
+            self.output = accepted;
+            teardown?;
         }
+        Ok(())
     }
 }
 
@@ -471,6 +615,23 @@ impl Sans for Session {
     type Error = ProtocolError;
 
     fn handle(&mut self, msg: SessionInput) -> Result<(), ProtocolError> {
+        let now = match &msg {
+            SessionInput::Packet(_, _, now)
+            | SessionInput::RemoteDescription(_, _, now)
+            | SessionInput::RemoteCandidate(_, now)
+            | SessionInput::Send(_, _, now)
+            | SessionInput::Timeout(now) => *now,
+        };
+        self.ice.expire(now);
+        if self.ice.selected_route_failed() {
+            self.fail(now)?;
+        }
+        if self.ice.gathering_state() == GatheringState::Closed {
+            return match msg {
+                SessionInput::Packet(..) | SessionInput::Timeout(..) => Ok(()),
+                _ => Err(IceError::Closed.into()),
+            };
+        }
         match msg {
             SessionInput::Packet(data, from, now) => self.handle_packet(&data, from, now),
             SessionInput::RemoteDescription(remote, candidates, now) => {
@@ -603,492 +764,4 @@ fn drain_dcep_and_data(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::Bytes;
-    use std::net::Ipv4Addr;
-    use std::time::Duration;
-
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
-    }
-
-    fn drain(session: &mut Session) -> (usize, Option<Duration>) {
-        let mut failed = 0;
-        let mut shortest_wait: Option<Duration> = None;
-        while let Some(output) = session.poll() {
-            match output {
-                SessionOutput::Event(SessionEvent::Failed) => failed += 1,
-                SessionOutput::Wait(wait) => {
-                    shortest_wait = Some(shortest_wait.map_or(wait, |w| w.min(wait)))
-                }
-                _ => {}
-            }
-        }
-        (failed, shortest_wait)
-    }
-
-    #[test]
-    fn a_session_that_never_becomes_ready_fails_once_at_its_deadline() {
-        let start = Instant::now();
-        let (mut session, _) = Session::new(addr(40110), true, start).unwrap();
-        let (peer, peer_description) = Session::new(addr(40111), false, start).unwrap();
-        session.set_establish_deadline(Duration::from_secs(3));
-
-        let sdp = peer_description.encode_full(&[peer.local_candidate().clone()]);
-        let (description, candidates) = Description::parse(&sdp).unwrap();
-        let offer = SessionInput::RemoteDescription(description, candidates, start);
-        session.handle(offer).unwrap();
-        let (failed, wait) = drain(&mut session);
-        assert_eq!(failed, 0);
-        assert!(wait.unwrap() <= Duration::from_secs(3));
-
-        session
-            .handle(SessionInput::Timeout(start + Duration::from_millis(2999)))
-            .unwrap();
-        assert_eq!(drain(&mut session).0, 0);
-
-        session
-            .handle(SessionInput::Timeout(start + Duration::from_secs(3)))
-            .unwrap();
-        assert_eq!(drain(&mut session).0, 1);
-
-        session
-            .handle(SessionInput::Timeout(start + Duration::from_secs(60)))
-            .unwrap();
-        let (failed, wait) = drain(&mut session);
-        assert_eq!(failed, 0);
-        assert!(wait.is_none_or(|w| w > Duration::ZERO));
-    }
-
-    #[test]
-    fn the_wait_schedules_the_establish_deadline() {
-        let start = Instant::now();
-        let (mut session, _) = Session::new(addr(40112), true, start).unwrap();
-        let (peer, peer_description) = Session::new(addr(40113), false, start).unwrap();
-        session.set_establish_deadline(Duration::from_millis(50));
-        let sdp = peer_description.encode_full(&[peer.local_candidate().clone()]);
-        let (description, candidates) = Description::parse(&sdp).unwrap();
-        session
-            .handle(SessionInput::RemoteDescription(
-                description,
-                candidates,
-                start,
-            ))
-            .unwrap();
-        let (_, wait) = drain(&mut session);
-        assert!(wait.unwrap() <= Duration::from_millis(50));
-    }
-
-    #[test]
-    fn a_ready_session_never_fails_on_the_deadline() {
-        let (mut offerer, mut answerer, now) = connected_pair();
-        offerer.set_establish_deadline(Duration::from_secs(1));
-        answerer.set_establish_deadline(Duration::from_secs(1));
-        let _ = drain(&mut offerer);
-        let _ = drain(&mut answerer);
-
-        for session in [&mut offerer, &mut answerer] {
-            session
-                .handle(SessionInput::Timeout(now + Duration::from_secs(2)))
-                .unwrap();
-            assert_eq!(drain(session).0, 0);
-        }
-    }
-
-    fn connected_pair() -> (Session, Session, Instant) {
-        let mut now = Instant::now();
-
-        let (mut offerer, offer) = Session::new(addr(40100), true, now).unwrap();
-        let (mut answerer, answer) = Session::new(addr(40101), false, now).unwrap();
-
-        let offer_sdp = offer.encode_full(&[offerer.local_candidate().clone()]);
-        let answer_sdp = answer.encode_full(&[answerer.local_candidate().clone()]);
-
-        let (parsed_offer, offer_candidates) = Description::parse(&offer_sdp).unwrap();
-        let (parsed_answer, answer_candidates) = Description::parse(&answer_sdp).unwrap();
-
-        answerer
-            .handle(SessionInput::RemoteDescription(
-                parsed_offer,
-                offer_candidates,
-                now,
-            ))
-            .unwrap();
-        offerer
-            .handle(SessionInput::RemoteDescription(
-                parsed_answer,
-                answer_candidates,
-                now,
-            ))
-            .unwrap();
-
-        let mut offerer_ready = false;
-        let mut answerer_ready = false;
-
-        for _ in 0..5000 {
-            let mut progressed = false;
-
-            let mut offerer_outbox = Vec::new();
-            while let Some(output) = offerer.poll() {
-                progressed = true;
-                match output {
-                    SessionOutput::Send(data, to) => offerer_outbox.push((data, to)),
-                    SessionOutput::Event(SessionEvent::Ready) => offerer_ready = true,
-                    SessionOutput::Event(SessionEvent::Failed) => {
-                        panic!("session failed unexpectedly")
-                    }
-                    SessionOutput::Message(..) => panic!("unexpected message before Ready"),
-                    SessionOutput::Wait(_) => {}
-                }
-            }
-            for (data, to) in offerer_outbox {
-                assert_eq!(to, addr(40101));
-                answerer
-                    .handle(SessionInput::Packet(data.into(), addr(40100), now))
-                    .unwrap();
-            }
-
-            let mut answerer_outbox = Vec::new();
-            while let Some(output) = answerer.poll() {
-                progressed = true;
-                match output {
-                    SessionOutput::Send(data, to) => answerer_outbox.push((data, to)),
-                    SessionOutput::Event(SessionEvent::Ready) => answerer_ready = true,
-                    SessionOutput::Event(SessionEvent::Failed) => {
-                        panic!("session failed unexpectedly")
-                    }
-                    SessionOutput::Message(..) => panic!("unexpected message before Ready"),
-                    SessionOutput::Wait(_) => {}
-                }
-            }
-            for (data, to) in answerer_outbox {
-                assert_eq!(to, addr(40100));
-                offerer
-                    .handle(SessionInput::Packet(data.into(), addr(40101), now))
-                    .unwrap();
-            }
-
-            if offerer_ready && answerer_ready {
-                break;
-            }
-
-            if !progressed {
-                now += Duration::from_millis(5);
-                offerer.handle(SessionInput::Timeout(now)).unwrap();
-                answerer.handle(SessionInput::Timeout(now)).unwrap();
-            }
-        }
-
-        assert!(offerer_ready, "offerer never became ready");
-        assert!(answerer_ready, "answerer never became ready");
-        assert_eq!(offerer.remote_addr(), Some(addr(40101)));
-        assert_eq!(answerer.remote_addr(), Some(addr(40100)));
-
-        while offerer.poll().is_some() {}
-        while answerer.poll().is_some() {}
-        (offerer, answerer, now)
-    }
-
-    fn forward(
-        from: &mut Session,
-        to: &mut Session,
-        (from_addr, to_addr): (SocketAddr, SocketAddr),
-        ready: &mut bool,
-        now: Instant,
-    ) -> bool {
-        let outputs: Vec<_> = std::iter::from_fn(|| from.poll()).collect();
-        let progressed = !outputs.is_empty();
-        for output in outputs {
-            match output {
-                SessionOutput::Send(data, dest) if dest == to_addr => to
-                    .handle(SessionInput::Packet(data.into(), from_addr, now))
-                    .unwrap(),
-                SessionOutput::Event(SessionEvent::Ready) => *ready = true,
-                _ => {}
-            }
-        }
-        progressed
-    }
-
-    fn drive_until_ready(
-        offerer: &mut Session,
-        answerer: &mut Session,
-        mut now: Instant,
-    ) -> (bool, bool) {
-        let (mut offerer_ready, mut answerer_ready) = (false, false);
-        for _ in 0..5000 {
-            let sent = (addr(40100), addr(40101));
-            let answered = (addr(40101), addr(40100));
-            let progressed = forward(offerer, answerer, sent, &mut offerer_ready, now)
-                | forward(answerer, offerer, answered, &mut answerer_ready, now);
-            if offerer_ready && answerer_ready {
-                break;
-            }
-            if !progressed {
-                now += Duration::from_millis(5);
-                offerer.handle(SessionInput::Timeout(now)).unwrap();
-                answerer.handle(SessionInput::Timeout(now)).unwrap();
-            }
-        }
-        (offerer_ready, answerer_ready)
-    }
-
-    #[test]
-    fn no_remote_address_is_reported_before_ice_selects_a_pair() {
-        let now = Instant::now();
-        let (mut offerer, _) = Session::new(addr(40100), true, now).unwrap();
-        let (answerer, answer) = Session::new(addr(40101), false, now).unwrap();
-        let answer_sdp = answer.encode_full(&[answerer.local_candidate().clone()]);
-        let (parsed_answer, answer_candidates) = Description::parse(&answer_sdp).unwrap();
-
-        offerer
-            .handle(SessionInput::RemoteDescription(
-                parsed_answer,
-                answer_candidates,
-                now,
-            ))
-            .unwrap();
-
-        assert_eq!(offerer.remote_addr(), None);
-    }
-
-    #[test]
-    fn transports_follow_the_ice_selected_pair_past_a_dead_first_candidate() {
-        let now = Instant::now();
-        let (mut offerer, offer) = Session::new(addr(40100), true, now).unwrap();
-        let (mut answerer, answer) = Session::new(addr(40101), false, now).unwrap();
-        let (dead, _) = Session::new(addr(40199), false, now).unwrap();
-
-        let offer_sdp = offer.encode_full(&[offerer.local_candidate().clone()]);
-        let answer_sdp = answer.encode_full(&[
-            dead.local_candidate().clone(),
-            answerer.local_candidate().clone(),
-        ]);
-        let (parsed_offer, offer_candidates) = Description::parse(&offer_sdp).unwrap();
-        let (parsed_answer, answer_candidates) = Description::parse(&answer_sdp).unwrap();
-        assert_eq!(answer_candidates[0].addr(), addr(40199));
-
-        answerer
-            .handle(SessionInput::RemoteDescription(
-                parsed_offer,
-                offer_candidates,
-                now,
-            ))
-            .unwrap();
-        offerer
-            .handle(SessionInput::RemoteDescription(
-                parsed_answer,
-                answer_candidates,
-                now,
-            ))
-            .unwrap();
-
-        let (offerer_ready, answerer_ready) = drive_until_ready(&mut offerer, &mut answerer, now);
-        assert!(offerer_ready, "offerer never became ready");
-        assert!(answerer_ready, "answerer never became ready");
-        assert_eq!(offerer.remote_addr(), Some(addr(40101)));
-    }
-
-    #[test]
-    fn a_send_is_written_without_waiting_for_a_timeout() {
-        let (mut offerer, _answerer, now) = connected_pair();
-
-        offerer
-            .handle(SessionInput::Send(
-                Channel::Reliable,
-                Bytes::from_static(b"now"),
-                now,
-            ))
-            .unwrap();
-
-        let sent = std::iter::from_fn(|| offerer.poll())
-            .any(|output| matches!(output, SessionOutput::Send(..)));
-        assert!(sent, "the send stayed buffered until the next timeout");
-    }
-
-    fn reliable_messages_after_exchange(
-        receiver: &mut Session,
-        sender: &mut Session,
-        mut now: Instant,
-    ) -> Vec<Vec<u8>> {
-        let mut received = Vec::new();
-        for _ in 0..500 {
-            let mut progressed = false;
-            let outbox: Vec<_> = std::iter::from_fn(|| sender.poll()).collect();
-            for output in outbox {
-                if let SessionOutput::Send(data, to) = output {
-                    progressed = true;
-                    receiver
-                        .handle(SessionInput::Packet(data.into(), to, now))
-                        .unwrap();
-                }
-            }
-            let outbox: Vec<_> = std::iter::from_fn(|| receiver.poll()).collect();
-            for output in outbox {
-                match output {
-                    SessionOutput::Send(data, to) => {
-                        progressed = true;
-                        sender
-                            .handle(SessionInput::Packet(data.into(), to, now))
-                            .unwrap();
-                    }
-                    SessionOutput::Message(Channel::Reliable, data) => received.push(data),
-                    _ => {}
-                }
-            }
-            if !received.is_empty() {
-                break;
-            }
-            if !progressed {
-                now += Duration::from_millis(5);
-                sender.handle(SessionInput::Timeout(now)).unwrap();
-                receiver.handle(SessionInput::Timeout(now)).unwrap();
-            }
-        }
-        received
-    }
-
-    #[test]
-    fn we_advertise_the_vanilla_max_message_size() {
-        let (_, offer) = Session::new(addr(40100), true, Instant::now()).unwrap();
-        assert_eq!(offer.sctp_max_message_size, 262144);
-    }
-
-    #[test]
-    fn a_peer_may_send_one_sctp_message_up_to_our_advertised_size() {
-        let (mut offerer, mut answerer, now) = connected_pair();
-        let payload = vec![7u8; 200_000];
-
-        let stream_id = answerer.channels.stream_id(Channel::Reliable).unwrap();
-        let mut stream = answerer
-            .sctp
-            .as_mut()
-            .unwrap()
-            .association_mut()
-            .unwrap()
-            .stream(stream_id)
-            .unwrap();
-        stream
-            .write_with_ppi(
-                now,
-                &MessageSegment::new(0, Bytes::from(payload.clone())).encode(),
-                PayloadProtocolIdentifier::Binary,
-            )
-            .expect("a 200 KB message fits the offerer's advertised max-message-size");
-        answerer.pump(now).unwrap();
-
-        let received = reliable_messages_after_exchange(&mut offerer, &mut answerer, now);
-        assert_eq!(received, vec![payload]);
-    }
-
-    #[test]
-    fn full_handshake_and_bidirectional_data_exchange() {
-        let (mut offerer, mut answerer, mut now) = connected_pair();
-
-        offerer
-            .handle(SessionInput::Send(
-                Channel::Reliable,
-                Bytes::from_static(b"hello from offerer (reliable)"),
-                now,
-            ))
-            .unwrap();
-        offerer
-            .handle(SessionInput::Send(
-                Channel::Unreliable,
-                Bytes::from_static(b"hello from offerer (unreliable)"),
-                now,
-            ))
-            .unwrap();
-        answerer
-            .handle(SessionInput::Send(
-                Channel::Reliable,
-                Bytes::from_static(b"hello from answerer (reliable)"),
-                now,
-            ))
-            .unwrap();
-        answerer
-            .handle(SessionInput::Send(
-                Channel::Unreliable,
-                Bytes::from_static(b"hello from answerer (unreliable)"),
-                now,
-            ))
-            .unwrap();
-
-        let mut offerer_received = Vec::new();
-        let mut answerer_received = Vec::new();
-
-        for _ in 0..200 {
-            let mut progressed = false;
-
-            let mut offerer_outbox = Vec::new();
-            while let Some(output) = offerer.poll() {
-                progressed = true;
-                match output {
-                    SessionOutput::Send(data, to) => offerer_outbox.push((data, to)),
-                    SessionOutput::Event(_) | SessionOutput::Wait(_) => {}
-                    SessionOutput::Message(channel, data) => offerer_received.push((channel, data)),
-                }
-            }
-            for (data, to) in offerer_outbox {
-                answerer
-                    .handle(SessionInput::Packet(data.into(), to, now))
-                    .unwrap();
-            }
-
-            let mut answerer_outbox = Vec::new();
-            while let Some(output) = answerer.poll() {
-                progressed = true;
-                match output {
-                    SessionOutput::Send(data, to) => answerer_outbox.push((data, to)),
-                    SessionOutput::Event(_) | SessionOutput::Wait(_) => {}
-                    SessionOutput::Message(channel, data) => {
-                        answerer_received.push((channel, data))
-                    }
-                }
-            }
-            for (data, to) in answerer_outbox {
-                offerer
-                    .handle(SessionInput::Packet(data.into(), to, now))
-                    .unwrap();
-            }
-
-            if offerer_received.len() >= 2 && answerer_received.len() >= 2 {
-                break;
-            }
-
-            if !progressed {
-                now += Duration::from_millis(5);
-                offerer.handle(SessionInput::Timeout(now)).unwrap();
-                answerer.handle(SessionInput::Timeout(now)).unwrap();
-            }
-        }
-
-        assert!(
-            answerer_received
-                .contains(&(Channel::Reliable, b"hello from offerer (reliable)".to_vec())),
-            "answerer never received the reliable message: {answerer_received:?}"
-        );
-        assert!(
-            answerer_received.contains(&(
-                Channel::Unreliable,
-                b"hello from offerer (unreliable)".to_vec()
-            )),
-            "answerer never received the unreliable message: {answerer_received:?}"
-        );
-        assert!(
-            offerer_received.contains(&(
-                Channel::Reliable,
-                b"hello from answerer (reliable)".to_vec()
-            )),
-            "offerer never received the reliable message: {offerer_received:?}"
-        );
-        assert!(
-            offerer_received.contains(&(
-                Channel::Unreliable,
-                b"hello from answerer (unreliable)".to_vec()
-            )),
-            "offerer never received the unreliable message: {offerer_received:?}"
-        );
-    }
-}
+mod tests;

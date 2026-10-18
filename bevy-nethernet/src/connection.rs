@@ -594,6 +594,9 @@ mod routing_tests {
                 while let Some(output) = peer.connection.poll() {
                     match output {
                         SessionOutput::Send(data, to) => {
+                            if !peer.selected {
+                                peer.router.note_sent(to, &0);
+                            }
                             socket.send_to(&data, to).unwrap();
                         }
                         SessionOutput::Event(SessionEvent::Ready) => peer.ready = true,

@@ -48,6 +48,8 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
         socket.set_nonblocking(true).unwrap();
         let mut server = TurnPeer::new(socket.local_addr().unwrap());
         let mut now = Instant::now();
+        let establish_within = Duration::from_secs(10);
+        let deadline = now + establish_within;
         let config = ClientIceConfig {
             bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             ice: IceConfig {
@@ -64,8 +66,8 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
                 ..Default::default()
             },
         };
-        let mut client = Outbound::new(Some(&config), Duration::from_secs(10), now).unwrap();
-        let mut answerer = Outbound::new(Some(&config), Duration::from_secs(10), now).unwrap();
+        let mut client = Outbound::new(Some(&config), establish_within, now).unwrap();
+        let mut answerer = Outbound::new(Some(&config), establish_within, now).unwrap();
         assert_ne!(
             client.socket.local_addr().unwrap(),
             answerer.socket.local_addr().unwrap()
@@ -175,7 +177,11 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
         );
         assert!(server.indications > 0);
         client.close(now);
-        turn_update(&socket, &mut server);
+        // A nonblocking read may precede kernel delivery; keep the original finite budget.
+        while server.allocation_count() > 1 && Instant::now() < deadline {
+            turn_update(&socket, &mut server);
+            std::thread::yield_now();
+        }
         assert_eq!(
             server.allocation_count(),
             1,
@@ -184,7 +190,10 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
         assert!(client.poll_event().is_none() && client.poll_local_signal().is_none());
         assert!(client.send(Channel::Reliable, b"late", now).is_err());
         answerer.close(now);
-        turn_update(&socket, &mut server);
+        while server.allocation_count() > 0 && Instant::now() < deadline {
+            turn_update(&socket, &mut server);
+            std::thread::yield_now();
+        }
         assert_eq!(server.allocation_count(), 0);
     }
 }
@@ -208,15 +217,19 @@ fn absolute_credential_expiry_stops_frame_gathering_and_delivery_bounds_count_by
         },
     };
     let mut transport = Outbound::new(Some(&config), Duration::from_secs(10), start).unwrap();
-    for _ in 0..20 {
-        transport.update(start).unwrap();
+    while Instant::now() < expiry {
+        transport.update(Instant::now()).unwrap();
         turn_update(&socket, &mut server);
         if transport.gathering_complete() {
             break;
         }
+        std::thread::yield_now();
     }
     assert!(transport.gathering_complete());
-    transport.connect(1, "peer".into(), IceMode::Full).unwrap();
+    let offers = transport.connect(1, "peer".into(), IceMode::Full).unwrap();
+    let (_, candidates) = Connection::parse_offer(&offers[0]).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].candidate_type(), CandidateType::Relay);
     transport.update(expiry).unwrap();
     assert!(
         transport

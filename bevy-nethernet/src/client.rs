@@ -7,8 +7,8 @@ use bevy_ecs::prelude::*;
 use nethernet::connection::{IceMode, Timeouts};
 use nethernet::identity::verify_answer;
 use nethernet::prelude::{
-    LanSignaler, LanSignalerConfig, LanSignalerInput, LanSignalerOutput, Sans, ServerData,
-    ServerIdentity, SignalErrorCode, TokenTrust,
+    LanSignaler, LanSignalerConfig, LanSignalerError, LanSignalerInput, LanSignalerOutput, Sans,
+    ServerData, ServerIdentity, SignalErrorCode, TokenTrust,
 };
 use nethernet::protocol::constants::{LAN_DISCOVERY_PORT, MAX_DATAGRAM_SIZE};
 use nethernet::protocol::{Signal, SignalType};
@@ -206,8 +206,7 @@ impl NetherClient {
                     .augment(&signal.data, SystemTime::now())
                     .map_err(std::io::Error::other)?;
             }
-            self.signaler
-                .handle(LanSignalerInput::Signal(signal, now))
+            self.send_signal(signal, now)
                 .map_err(std::io::Error::other)?;
         }
 
@@ -327,11 +326,7 @@ impl NetherClient {
             .as_mut()
             .and_then(Outbound::poll_local_signal)
         {
-            if self
-                .signaler
-                .handle(LanSignalerInput::Signal(signal, now))
-                .is_err()
-            {
+            if self.send_signal(signal, now).is_err() {
                 self.fail_connection();
                 return;
             }
@@ -369,6 +364,14 @@ impl NetherClient {
         self.remote_addr = None;
         self.rtt = None;
         self.events.push_back(NetherClientEvent::Disconnected);
+    }
+
+    /// An undiscovered target stays under the attempt deadline; other carrier errors remain failures.
+    fn send_signal(&mut self, signal: Signal, now: Instant) -> Result<(), LanSignalerError> {
+        match self.signaler.handle(LanSignalerInput::Signal(signal, now)) {
+            Ok(()) | Err(LanSignalerError::UnknownNetwork(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn handle_signal(&mut self, signal: Signal, now: Instant) {

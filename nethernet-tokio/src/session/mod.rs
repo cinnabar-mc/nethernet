@@ -91,6 +91,7 @@ impl Session {
         observation
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn(
         socket: Arc<UdpSocket>,
         connection: SansConnection,

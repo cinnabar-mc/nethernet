@@ -233,6 +233,7 @@ impl IceLayer {
 
     /// Routes according to the local ICE candidate, retaining relay identity until wrapping.
     fn route(&mut self, msg: TaggedBytesMut) -> Result<(), ProtocolError> {
+        self.expire(msg.now);
         if let Some(server) = self
             .servers
             .iter_mut()
@@ -253,6 +254,10 @@ impl IceLayer {
         to: SocketAddr,
         now: Instant,
     ) -> Result<(), ProtocolError> {
+        self.expire(now);
+        if self.selected_route_failed() {
+            return Err(IceError::Closed.into());
+        }
         let Some((local, remote)) = self.agent.get_selected_candidate_pair() else {
             return Err(IceError::Server.into());
         };
@@ -291,6 +296,15 @@ impl IceLayer {
 
     pub fn poll_event(&mut self) -> Option<Event> {
         self.agent.poll_event().map(|tagged| tagged.event)
+    }
+
+    /// Enforces credential, allocation and permission expiry before caller operations use a path.
+    pub fn expire(&mut self, now: Instant) {
+        for server in &mut self.servers {
+            server.expire(now);
+        }
+        self.prune_retired_candidates();
+        self.update_gathering();
     }
 
     /// Advances gathering and dependency lifetimes using only caller time.
@@ -454,6 +468,12 @@ impl IceLayer {
         credentials: TurnCredentials,
         now: Instant,
     ) -> Result<(), ProtocolError> {
+        self.servers
+            .iter()
+            .find(|server| server.addr == addr)
+            .ok_or(IceError::Configuration)?
+            .validate_replacement(&credentials, now)?;
+        self.expire(now);
         // Capture any queued request's old integrity key before a credential rotation.
         self.collect_writes()?;
         self.servers

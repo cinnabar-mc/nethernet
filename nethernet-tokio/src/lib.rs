@@ -14,7 +14,7 @@ pub use builders::*;
 pub use credentials::{Credentials, IceServer};
 pub use error::{NetherError, Result};
 pub use nethernet::identity::{
-    PlayerInfo, SdpIdentity, SelfSignedIdentity, ServerIdentity, TokenTrust,
+    PlayerInfo, SdpIdentity, SelfSignedIdentity, ServerIdentity, TokenIdentity, TokenTrust,
 };
 pub use protocol::packet::discovery::{MessagePacket, RequestPacket, ResponsePacket, ServerData};
 pub use protocol::{Message, MessageSegment, Signal, SignalType};

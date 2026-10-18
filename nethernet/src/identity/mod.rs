@@ -7,6 +7,7 @@ pub mod jws;
 pub mod jwt;
 pub mod player;
 pub mod server;
+pub mod token;
 pub mod trust;
 
 pub use client::SelfSignedIdentity;
@@ -15,6 +16,7 @@ pub use envelope::{
 };
 pub use player::PlayerInfo;
 pub use server::ServerIdentity;
+pub use token::TokenIdentity;
 pub use trust::{TokenTrust, validate_sdp, verify_answer};
 
 /// An identity that signs the fingerprints of a locally generated SDP description.

@@ -95,7 +95,24 @@ impl From<JwkSet> for MinecraftKeys {
 }
 
 impl Jwk {
+    /// Validates decoded RSA material before it enters a reusable verification key set.
+    pub fn validate_rs256(&self) -> Result<()> {
+        self.rsa_public_key().map(|_| ())
+    }
+
+    /// Verifies one RS256 signature with the same validated public-key construction.
     pub fn verify_rs256(&self, signing_input: &[u8], signature: &[u8]) -> Result<()> {
+        let key = self.rsa_public_key()?;
+        let signature = Signature::try_from(signature)
+            .map_err(|_| IdentityError::Untrusted("signature mismatch".to_string()))?;
+
+        VerifyingKey::<Sha256>::new(key)
+            .verify(signing_input, &signature)
+            .map_err(|_| IdentityError::Untrusted("signature mismatch".to_string()))
+    }
+
+    /// Keeps acquisition validation and signature verification on one RSA decoding path.
+    fn rsa_public_key(&self) -> Result<RsaPublicKey> {
         if self.kty != "RSA" {
             return Err(IdentityError::Untrusted(format!(
                 "unsupported key type {}",
@@ -107,16 +124,16 @@ impl Jwk {
             return Err(IdentityError::Untrusted("incomplete RSA key".to_string()));
         };
 
-        let modulus = BoxedUint::from_be_slice_vartime(&decode(n)?);
-        let exponent = BoxedUint::from_be_slice_vartime(&decode(e)?);
-        let key = RsaPublicKey::new(modulus, exponent)
-            .map_err(|e| IdentityError::Untrusted(format!("invalid RSA key: {}", e)))?;
-        let signature = Signature::try_from(signature)
-            .map_err(|_| IdentityError::Untrusted("signature mismatch".to_string()))?;
-
-        VerifyingKey::<Sha256>::new(key)
-            .verify(signing_input, &signature)
-            .map_err(|_| IdentityError::Untrusted("signature mismatch".to_string()))
+        let modulus = decode(n)?;
+        let exponent = decode(e)?;
+        if modulus.is_empty() || exponent.is_empty() {
+            return Err(IdentityError::Untrusted("incomplete RSA key".to_string()));
+        }
+        RsaPublicKey::new(
+            BoxedUint::from_be_slice_vartime(&modulus),
+            BoxedUint::from_be_slice_vartime(&exponent),
+        )
+        .map_err(|e| IdentityError::Untrusted(format!("invalid RSA key: {}", e)))
     }
 }
 

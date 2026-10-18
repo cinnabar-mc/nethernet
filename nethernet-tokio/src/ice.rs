@@ -206,7 +206,7 @@ mod tests {
             ..Default::default()
         };
         let resolved = resolve_ice_servers(
-            &[v6.clone()],
+            std::slice::from_ref(&v6),
             SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0),
             expires,
             deadline,

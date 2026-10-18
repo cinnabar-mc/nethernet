@@ -195,15 +195,16 @@ impl TurnPeer {
         &mut self,
         to: SocketAddr,
         request: &Message,
-        mut attributes: Vec<Box<dyn Setter>>,
+        attributes: Vec<Box<dyn Setter>>,
         signed: bool,
     ) {
-        let mut setters: Vec<Box<dyn Setter + '_>> = vec![
-            Box::new(request.transaction_id),
-            Box::new(MessageType::new(request.typ.method, CLASS_SUCCESS_RESPONSE)),
-        ];
-        setters.append(&mut attributes);
         let provider = rtc::crypto::default_provider().unwrap();
+        let mut setters: Vec<Box<dyn Setter + '_>> = attributes;
+        setters.insert(
+            0,
+            Box::new(MessageType::new(request.typ.method, CLASS_SUCCESS_RESPONSE)),
+        );
+        setters.insert(0, Box::new(request.transaction_id));
         if signed {
             setters.push(Box::new(
                 MessageIntegrity::new_long_term_integrity_with_provider(

@@ -80,17 +80,7 @@ fn step(endpoints: &mut [Endpoint; 2], server: &mut TurnPeer, now: &mut Instant)
     for endpoint in &mut *endpoints {
         progressed |= endpoint.drain(server);
     }
-    while let Some((to, data)) = server.packets.pop_front() {
-        let endpoint = endpoints
-            .iter_mut()
-            .find(|endpoint| endpoint.local == to)
-            .unwrap();
-        endpoint
-            .session
-            .handle(SessionInput::Packet(data.into(), server.addr, *now))
-            .unwrap();
-        progressed = true;
-    }
+    progressed |= deliver_server_packets(endpoints, server, *now);
     if !progressed {
         *now += Duration::from_millis(10);
         for endpoint in endpoints {
@@ -100,6 +90,27 @@ fn step(endpoints: &mut [Endpoint; 2], server: &mut TurnPeer, now: &mut Instant)
                 .unwrap();
         }
     }
+}
+
+/// Delivers finite queued server responses without advancing caller time.
+fn deliver_server_packets(
+    endpoints: &mut [Endpoint; 2],
+    server: &mut TurnPeer,
+    now: Instant,
+) -> bool {
+    let mut progressed = false;
+    while let Some((to, data)) = server.packets.pop_front() {
+        let endpoint = endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.local == to)
+            .unwrap();
+        endpoint
+            .session
+            .handle(SessionInput::Packet(data.into(), server.addr, now))
+            .unwrap();
+        progressed = true;
+    }
+    progressed
 }
 
 /// Completes gathering and applies full descriptions before the actual secured transport handshake.
@@ -711,13 +722,31 @@ fn advance_pair_to(
 #[test]
 fn scheduled_permission_stale_nonce_preserves_relay_and_recovers_on_its_next_refresh() {
     let (mut endpoints, mut server, mut now) = pair(false);
-    let target = now + Duration::from_secs(119);
-    advance_pair_to(&mut endpoints, &mut server, &mut now, target);
     server.stale_permissions_once = true;
-    now += Duration::from_millis(1100);
-    for endpoint in &mut endpoints {
-        endpoint.session.handle(SessionInput::Timeout(now)).unwrap();
+    let challenge_deadline = now + Duration::from_secs(120);
+    // Allocation maintenance starts before relay nomination and the secured handshake.
+    // Observe its actual batch rather than deriving the allocation epoch from Ready.
+    for _ in 0..60000 {
+        for endpoint in &mut endpoints {
+            endpoint.drain(&mut server);
+        }
+        if server.stale_permission_responses != 0 {
+            break;
+        }
+        deliver_server_packets(&mut endpoints, &mut server, now);
+        now += Duration::from_millis(10);
+        for endpoint in &mut endpoints {
+            endpoint.session.handle(SessionInput::Timeout(now)).unwrap();
+        }
     }
+    assert_eq!(
+        server.stale_permission_responses, 1,
+        "the scheduled permission batch was never challenged"
+    );
+    assert!(
+        now <= challenge_deadline,
+        "scheduled permission maintenance exceeded its finite cadence"
+    );
     // A concurrent allocation refresh is already signed with the old nonce when the permission challenge arrives.
     endpoints[0]
         .session

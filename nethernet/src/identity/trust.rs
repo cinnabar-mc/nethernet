@@ -25,6 +25,12 @@ pub enum TokenTrust {
     /// A configured provider's signature, issuer, audience, identity and temporal policy.
     Provider(Arc<dyn TokenVerifier>),
 
+    /// Server answers on an explicitly authorized route: RS256 uses the configured provider;
+    /// ES384 must be self-signed by the token's own `cpk`, then bind the SDP fingerprints.
+    /// Server token timestamps do not grant or extend transport admission. This policy cannot
+    /// authenticate offers; the application must authorize the exact service route separately.
+    ServerAnswer(Arc<dyn TokenVerifier>),
+
     /// Any well-formed unexpired token; signature, issuer and audience are not checked.
     Any,
 }
@@ -34,18 +40,31 @@ impl fmt::Debug for TokenTrust {
         match self {
             Self::Minecraft(keys) => f.debug_tuple("Minecraft").field(keys).finish(),
             Self::Provider(_) => f.write_str("Provider(..)"),
+            Self::ServerAnswer(_) => f.write_str("ServerAnswer(..)"),
             Self::Any => f.write_str("Any"),
         }
     }
 }
 
 impl TokenTrust {
-    /// Parses the token and checks its expiry, plus signature, issuer and audience under `Minecraft`.
+    /// Applies the selected token policy; server answers keep server and provider validity distinct.
     pub fn claims(&self, identity: &Identity, now: SystemTime) -> Result<Claims> {
         if let Self::Provider(verifier) = self {
             return verifier.verify(&identity.assertion.token, now);
         }
         let jws = Jws::parse(&identity.assertion.token)?;
+        if let Self::ServerAnswer(provider) = self {
+            if identity.idp.protocol != super::envelope::DEFAULT_IDP_PROTOCOL {
+                return Err(IdentityError::Untrusted(
+                    "invalid server identity protocol".to_owned(),
+                ));
+            }
+            return if jws.header.alg == "RS256" {
+                provider.verify(&identity.assertion.token, now)
+            } else {
+                super::server::verify_token(&jws)
+            };
+        }
         let claims = jws.claims()?;
         claims.check_expiry(now)?;
 
@@ -98,7 +117,18 @@ impl TokenTrust {
 }
 
 /// Checks the token, then that the key in its `cpk` claim signed the SDP fingerprints.
+/// Server-answer policy must use `verify_answer` and cannot authenticate an offer here.
 pub fn validate_sdp(sdp: &str, trust: &TokenTrust, now: SystemTime) -> Result<Claims> {
+    if matches!(trust, TokenTrust::ServerAnswer(_)) {
+        return Err(IdentityError::Untrusted(
+            "server answer policy cannot authenticate an offer".to_owned(),
+        ));
+    }
+    validate_assertion(sdp, trust, now)
+}
+
+/// Shares the token/fingerprint verification owner without treating a server policy as player admission.
+fn validate_assertion(sdp: &str, trust: &TokenTrust, now: SystemTime) -> Result<Claims> {
     let identity = Identity::from_sdp(sdp)?;
     let claims = trust.claims(&identity, now)?;
 
@@ -119,12 +149,18 @@ pub fn verify_answer(
     trust: Option<&TokenTrust>,
     now: SystemTime,
 ) -> Result<Option<Claims>> {
-    trust.map(|trust| validate_sdp(sdp, trust, now)).transpose()
+    trust
+        .map(|trust| validate_assertion(sdp, trust, now))
+        .transpose()
 }
 
 #[cfg(test)]
 #[path = "token_trust_tests.rs"]
 mod token_trust_tests;
+
+#[cfg(test)]
+#[path = "server_answer_tests.rs"]
+mod server_answer_tests;
 
 #[cfg(test)]
 mod tests {

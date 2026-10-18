@@ -2,6 +2,7 @@
 use crate::identity::error::{IdentityError, Result};
 use crate::identity::jwk::EcJwk;
 use crate::identity::jws::Jws;
+use crate::identity::jwt::Claims;
 use crate::identity::{Assertion, Identity, Idp, fingerprint_payload, sdp_fingerprints};
 use p384::SecretKey;
 use p384::ecdsa::{SigningKey, VerifyingKey};
@@ -31,7 +32,7 @@ impl ServerIdentity {
         Self::generate_with_expiry(domain, now, Some(DEFAULT_TOKEN_LIFETIME))
     }
 
-    /// A `None` lifetime omits `exp`, and validators in this crate refuse tokens without one.
+    /// A `None` lifetime omits `exp`; explicit self-signed server-answer trust does not require it.
     pub fn generate_with_expiry(
         domain: impl Into<String>,
         now: SystemTime,
@@ -144,6 +145,18 @@ impl ServerIdentity {
             &self.identity_value(answer, now)?,
         ))
     }
+}
+
+/// Verifies a server token with its own P-384 key, without applying player credential timestamps.
+/// Supplied timestamps still use the shared bounded NumericDate parser.
+/// The caller must still authorize its route and verify the detached SDP fingerprint signature.
+pub(super) fn verify_token(token: &Jws) -> Result<Claims> {
+    let claims = token.claims()?;
+    token.verify_es384(&claims.client_public_key()?)?;
+    for name in ["iat", "nbf", "exp"] {
+        claims.numeric_date(name)?;
+    }
+    Ok(claims)
 }
 
 fn mint_token(

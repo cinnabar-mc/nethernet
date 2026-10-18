@@ -637,9 +637,7 @@ impl Server {
 
     /// The nearest dependency retransmission, refresh, allocation or credential deadline.
     pub fn poll_timeout(&mut self) -> Option<Instant> {
-        if self.client.is_none() {
-            return None;
-        }
+        self.client.as_ref()?;
         [
             self.credential_expiry,
             self.allocation_expiry,

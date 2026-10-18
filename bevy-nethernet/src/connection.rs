@@ -467,7 +467,8 @@ mod routing_tests {
     #[test]
     fn two_sessions_become_ready_through_the_shared_socket_routing() {
         let mut now = Instant::now();
-        let (client_session, client_description) = Session::new(addr(40200), true, now).unwrap();
+        let (client_session, client_description) =
+            Session::new(addr(40200), true, rand::random(), now).unwrap();
         let client_ufrag = client_description.ice.ufrag.clone();
         let (client, offers) = Connection::connect(
             client_session,
@@ -478,7 +479,8 @@ mod routing_tests {
         );
         let offer = offers.into_iter().next().unwrap();
 
-        let (server_session, server_description) = Session::new(addr(40201), false, now).unwrap();
+        let (server_session, server_description) =
+            Session::new(addr(40201), false, rand::random(), now).unwrap();
         let server_ufrag = server_description.ice.ufrag.clone();
         let (remote_description, remote_candidates) = Connection::parse_offer(&offer).unwrap();
         let (server, answers) = Connection::accept(

@@ -250,7 +250,7 @@ impl NetherServer {
         })?;
 
         let answered = admitted
-            .answer(bound_addr, Instant::now())
+            .answer(bound_addr, rand::random(), Instant::now())
             .map_err(|e| (Some(e.code()), NetherError::from(e)))?;
         let player = answered.player.map(Arc::new).or(signaled_player);
         let connection = answered.connection;

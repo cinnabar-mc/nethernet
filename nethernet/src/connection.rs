@@ -272,7 +272,7 @@ mod tests {
     fn assert_connects(ice_mode: IceMode) {
         let mut now = Instant::now();
 
-        let (offer_session, offer_description) = Session::new(addr(40200), true, now).unwrap();
+        let (offer_session, offer_description) = Session::new(addr(40200), true, 1, now).unwrap();
         let (mut offerer, offer_signals) = Connection::connect(
             offer_session,
             offer_description,
@@ -285,7 +285,8 @@ mod tests {
         assert_eq!(offer.signal_type, SignalType::Offer);
 
         let (remote_description, remote_candidates) = Connection::parse_offer(&offer).unwrap();
-        let (answer_session, answer_description) = Session::new(addr(40201), false, now).unwrap();
+        let (answer_session, answer_description) =
+            Session::new(addr(40201), false, 2, now).unwrap();
         let (mut answerer, answer_signals) = Connection::accept(
             answer_session,
             answer_description,
@@ -387,7 +388,7 @@ mod tests {
     #[test]
     fn signals_for_a_different_connection_are_ignored() {
         let now = Instant::now();
-        let (session, description) = Session::new(addr(40210), true, now).unwrap();
+        let (session, description) = Session::new(addr(40210), true, 1, now).unwrap();
         let (mut offerer, _) =
             Connection::connect(session, description, 1, 7.to_string(), IceMode::Full);
         let unrelated = Signal::answer(999, "irrelevant".to_string(), "7".to_string());
@@ -414,7 +415,8 @@ mod tests {
         let now = Instant::now();
         let wall_clock = SystemTime::now();
 
-        let (offer_session, mut offer_description) = Session::new(addr(40220), true, now).unwrap();
+        let (offer_session, mut offer_description) =
+            Session::new(addr(40220), true, 1, now).unwrap();
         let offerer_identity = signed_by("offerer.example", &mut offer_description);
         let offerer_envelope = offer_description.identity.clone().unwrap();
 
@@ -444,7 +446,7 @@ mod tests {
         );
 
         let (answer_session, mut answer_description) =
-            Session::new(addr(40221), false, now).unwrap();
+            Session::new(addr(40221), false, 2, now).unwrap();
         let answerer_identity = signed_by("answerer.example", &mut answer_description);
         let answerer_envelope = answer_description.identity.clone().unwrap();
 

@@ -338,7 +338,7 @@ impl NetherServer {
 
         let answered = policy
             .admit(&offer, signaled_from, SystemTime::now())
-            .and_then(|admitted| admitted.answer(self.session_local_addr, now));
+            .and_then(|admitted| admitted.answer(self.session_local_addr, rand::random(), now));
         let Answered {
             connection,
             signals,

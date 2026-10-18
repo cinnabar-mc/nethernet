@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -245,6 +245,7 @@ impl HttpSignalingServer {
                                 connection,
                                 request,
                                 now: Instant::now(),
+                                wall: SystemTime::now(),
                             }) {
                                 tracing::debug!("Failed to handle a request: {}", e);
                             }

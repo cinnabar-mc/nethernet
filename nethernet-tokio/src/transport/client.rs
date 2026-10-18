@@ -174,8 +174,8 @@ impl NetherClient {
             .local_addr()
             .map_err(|e| (None, NetherError::from(e)))?;
 
-        let (mut session, description) = SansSession::new(bound_addr, true, Instant::now())
-            .map_err(|e| {
+        let (mut session, description) =
+            SansSession::new(bound_addr, true, rand::random(), Instant::now()).map_err(|e| {
                 (
                     Some(SignalErrorCode::FailedToCreatePeerConnection),
                     NetherError::from(e),
@@ -549,8 +549,13 @@ mod tests {
                     }
                 };
                 let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-                let (session, description) =
-                    SansSession::new(socket.local_addr().unwrap(), false, Instant::now()).unwrap();
+                let (session, description) = SansSession::new(
+                    socket.local_addr().unwrap(),
+                    false,
+                    rand::random(),
+                    Instant::now(),
+                )
+                .unwrap();
                 let (remote, candidates) = SansConnection::parse_offer(&offer).unwrap();
                 let (connection, answers) = SansConnection::accept(
                     session,

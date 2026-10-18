@@ -28,6 +28,19 @@ The WebRTC-based network protocol used in newer versions of Minecraft. It provid
 - **[`nethernet-tokio`](nethernet-tokio)** - an async tokio wrapper over the sans-io crate, exposing `NetherServer` and `NetherClient`.
 - **[`bevy-nethernet`](bevy-nethernet)** - a Bevy plugin wrapping the sans-io crate directly, for games that want to drive it from their own tick rather than through tokio.
 
+### Driving the core
+
+`Session::new(local_addr, is_controlling, session_id, now)` takes a caller-selected
+SDP origin identifier and a monotonic time. Choose a distinct identifier for each
+local session; the returned `Description` retains it for every encoding.
+`Admitted::answer` takes the same inputs when creating a server session. The Tokio
+and Bevy adapters generate these identifiers at their runtime boundary.
+
+`HttpSignalerInput::Request` carries both `now: Instant` for answer deadlines and
+`wall: SystemTime` for credential expiry. Supply the receive time from each clock;
+UTC changes do not alter pending-answer deadlines. HTTP execution stays in the
+runtime adapters.
+
 ### Features
 
 - Secure communication over WebRTC (DTLS/SCTP)

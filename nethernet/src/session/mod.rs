@@ -117,9 +117,11 @@ pub use dtls::DtlsLayer;
 
 impl Session {
     /// The controlling side is the offerer: it announces the DTLS server role and opens the data channels.
+    /// The caller supplies a distinct SDP origin identifier for each local session.
     pub fn new(
         local_addr: SocketAddr,
         is_controlling: bool,
+        session_id: u64,
         now: Instant,
     ) -> Result<(Session, Description), ProtocolError> {
         let ice = IceLayer::new(local_addr, is_controlling, now)?;
@@ -127,6 +129,7 @@ impl Session {
         let fingerprint = certificate::fingerprint(&certificate)?;
 
         let local_description = Description {
+            session_id,
             ice: ice.local_credentials().clone(),
             dtls_role: if is_controlling {
                 DtlsRole::Server
@@ -631,8 +634,8 @@ mod tests {
     #[test]
     fn a_session_that_never_becomes_ready_fails_once_at_its_deadline() {
         let start = Instant::now();
-        let (mut session, _) = Session::new(addr(40110), true, start).unwrap();
-        let (peer, peer_description) = Session::new(addr(40111), false, start).unwrap();
+        let (mut session, _) = Session::new(addr(40110), true, 1, start).unwrap();
+        let (peer, peer_description) = Session::new(addr(40111), false, 2, start).unwrap();
         session.set_establish_deadline(Duration::from_secs(3));
 
         let sdp = peer_description.encode_full(&[peer.local_candidate().clone()]);
@@ -664,8 +667,8 @@ mod tests {
     #[test]
     fn the_wait_schedules_the_establish_deadline() {
         let start = Instant::now();
-        let (mut session, _) = Session::new(addr(40112), true, start).unwrap();
-        let (peer, peer_description) = Session::new(addr(40113), false, start).unwrap();
+        let (mut session, _) = Session::new(addr(40112), true, 1, start).unwrap();
+        let (peer, peer_description) = Session::new(addr(40113), false, 2, start).unwrap();
         session.set_establish_deadline(Duration::from_millis(50));
         let sdp = peer_description.encode_full(&[peer.local_candidate().clone()]);
         let (description, candidates) = Description::parse(&sdp).unwrap();
@@ -699,8 +702,8 @@ mod tests {
     fn connected_pair() -> (Session, Session, Instant) {
         let mut now = Instant::now();
 
-        let (mut offerer, offer) = Session::new(addr(40100), true, now).unwrap();
-        let (mut answerer, answer) = Session::new(addr(40101), false, now).unwrap();
+        let (mut offerer, offer) = Session::new(addr(40100), true, 1, now).unwrap();
+        let (mut answerer, answer) = Session::new(addr(40101), false, 2, now).unwrap();
 
         let offer_sdp = offer.encode_full(&[offerer.local_candidate().clone()]);
         let answer_sdp = answer.encode_full(&[answerer.local_candidate().clone()]);
@@ -837,8 +840,8 @@ mod tests {
     #[test]
     fn no_remote_address_is_reported_before_ice_selects_a_pair() {
         let now = Instant::now();
-        let (mut offerer, _) = Session::new(addr(40100), true, now).unwrap();
-        let (answerer, answer) = Session::new(addr(40101), false, now).unwrap();
+        let (mut offerer, _) = Session::new(addr(40100), true, 1, now).unwrap();
+        let (answerer, answer) = Session::new(addr(40101), false, 2, now).unwrap();
         let answer_sdp = answer.encode_full(&[answerer.local_candidate().clone()]);
         let (parsed_answer, answer_candidates) = Description::parse(&answer_sdp).unwrap();
 
@@ -856,9 +859,9 @@ mod tests {
     #[test]
     fn transports_follow_the_ice_selected_pair_past_a_dead_first_candidate() {
         let now = Instant::now();
-        let (mut offerer, offer) = Session::new(addr(40100), true, now).unwrap();
-        let (mut answerer, answer) = Session::new(addr(40101), false, now).unwrap();
-        let (dead, _) = Session::new(addr(40199), false, now).unwrap();
+        let (mut offerer, offer) = Session::new(addr(40100), true, 1, now).unwrap();
+        let (mut answerer, answer) = Session::new(addr(40101), false, 2, now).unwrap();
+        let (dead, _) = Session::new(addr(40199), false, 2, now).unwrap();
 
         let offer_sdp = offer.encode_full(&[offerer.local_candidate().clone()]);
         let answer_sdp = answer.encode_full(&[
@@ -951,7 +954,7 @@ mod tests {
 
     #[test]
     fn we_advertise_the_vanilla_max_message_size() {
-        let (_, offer) = Session::new(addr(40100), true, Instant::now()).unwrap();
+        let (_, offer) = Session::new(addr(40100), true, 1, Instant::now()).unwrap();
         assert_eq!(offer.sctp_max_message_size, 262144);
     }
 

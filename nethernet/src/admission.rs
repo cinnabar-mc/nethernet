@@ -148,9 +148,15 @@ impl Admitted<'_> {
         self.player.as_ref()
     }
 
-    pub fn answer(self, local_addr: SocketAddr, now: Instant) -> Result<Answered, AdmissionError> {
+    /// Creates an answer using the caller's distinct local SDP origin identifier.
+    pub fn answer(
+        self,
+        local_addr: SocketAddr,
+        session_id: u64,
+        now: Instant,
+    ) -> Result<Answered, AdmissionError> {
         let (mut session, description) =
-            Session::new(local_addr, false, now).map_err(AdmissionError::Session)?;
+            Session::new(local_addr, false, session_id, now).map_err(AdmissionError::Session)?;
         if let Some(within) = self.policy.establish_deadline {
             session.set_establish_deadline(within);
         }
@@ -235,7 +241,8 @@ mod tests {
     }
 
     fn loopback_offer() -> Signal {
-        let (session, description) = Session::new(loopback(40300), true, Instant::now()).unwrap();
+        let (session, description) =
+            Session::new(loopback(40300), true, 1, Instant::now()).unwrap();
         let (_, signals) = Connection::connect(
             session,
             description,
@@ -257,7 +264,7 @@ mod tests {
         let answered = policy
             .admit(&loopback_offer(), None, SystemTime::now())
             .unwrap()
-            .answer(loopback(40301), Instant::now())
+            .answer(loopback(40301), 2, Instant::now())
             .unwrap();
         let answer = &answered.signals[0];
         assert_eq!(answer.signal_type, SignalType::Answer);
@@ -280,7 +287,7 @@ mod tests {
         let answered = policy
             .admit(&loopback_offer(), Some(public_peer()), SystemTime::now())
             .unwrap()
-            .answer(loopback(40302), Instant::now())
+            .answer(loopback(40302), 2, Instant::now())
             .unwrap();
         assert!(
             answered
@@ -298,7 +305,7 @@ mod tests {
         let answered = policy
             .admit(&loopback_offer(), Some(public_peer()), SystemTime::now())
             .unwrap()
-            .answer(loopback(40303), Instant::now())
+            .answer(loopback(40303), 2, Instant::now())
             .unwrap();
         assert!(answered.inferred.is_empty());
     }

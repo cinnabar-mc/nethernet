@@ -13,7 +13,6 @@ use rtc::sdp::description::session::{
 };
 use rtc::sdp::util::ConnectionRole;
 use std::io::Cursor;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SCTP_PORT: u16 = 5000;
 
@@ -28,6 +27,8 @@ pub enum DtlsRole {
 /// A peer's ICE credentials, DTLS setup and certificate fingerprint as carried in SDP.
 #[derive(Clone)]
 pub struct Description {
+    /// Caller-selected SDP origin identifier, retained across encodings of this session.
+    pub session_id: u64,
     pub ice: Credentials,
     pub dtls_role: DtlsRole,
     /// Algorithm and digest from the `fingerprint` attribute.
@@ -44,7 +45,7 @@ impl Description {
         let media = self
             .base_media()
             .with_value_attribute("ice-options".to_string(), "trickle".to_string());
-        Self::session(media, self.identity.as_deref()).marshal()
+        self.session(media).marshal()
     }
 
     /// Embeds the candidates and ends the list with `end-of-candidates`.
@@ -54,7 +55,7 @@ impl Description {
             media = media.with_candidate(candidate::attribute_value(index, c, &self.ice.ufrag));
         }
         media = media.with_value_attribute(ATTR_KEY_END_OF_CANDIDATES.to_string(), "".to_string());
-        Self::session(media, self.identity.as_deref()).marshal()
+        self.session(media).marshal()
     }
 
     /// Needs exactly one media section and a setup of `active` or `actpass`; unparsable candidates are skipped.
@@ -110,6 +111,7 @@ impl Description {
 
         Ok((
             Self {
+                session_id: session.origin.session_id,
                 ice: Credentials { ufrag, pwd },
                 dtls_role,
                 fingerprint: (algorithm.to_string(), value.to_string()),
@@ -120,7 +122,7 @@ impl Description {
         ))
     }
 
-    fn session(media: MediaDescription, identity: Option<&str>) -> SessionDescription {
+    fn session(&self, media: MediaDescription) -> SessionDescription {
         let mut attributes = vec![
             Attribute {
                 key: ATTR_KEY_GROUP.to_string(),
@@ -135,7 +137,7 @@ impl Description {
                 value: Some(" WMS".to_string()),
             },
         ];
-        if let Some(identity) = identity {
+        if let Some(identity) = &self.identity {
             attributes.push(Attribute {
                 key: ATTR_KEY_IDENTITY.to_string(),
                 value: Some(identity.to_string()),
@@ -146,7 +148,7 @@ impl Description {
             version: 0,
             origin: Origin {
                 username: "-".to_string(),
-                session_id: session_id(),
+                session_id: self.session_id,
                 session_version: 2,
                 network_type: "IN".to_string(),
                 address_type: "IP4".to_string(),
@@ -216,13 +218,6 @@ fn connection_role(role: DtlsRole) -> ConnectionRole {
     }
 }
 
-fn session_id() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +226,7 @@ mod tests {
 
     fn description(role: DtlsRole) -> Description {
         Description {
+            session_id: 42,
             ice: Credentials {
                 ufrag: "abcd".to_string(),
                 pwd: "0123456789abcdef01234567".to_string(),
@@ -259,7 +255,10 @@ mod tests {
 
     #[test]
     fn trickle_roundtrip() {
-        let encoded = description(DtlsRole::Server).encode_trickle();
+        let local = description(DtlsRole::Server);
+        let encoded = local.encode_trickle();
+        assert_eq!(encoded, local.encode_trickle());
+        assert!(encoded.contains("o=- 42 2 IN IP4 127.0.0.1\r\n"));
         assert!(encoded.contains("a=setup:actpass"));
         assert!(encoded.contains("a=sctp-port:5000"));
         assert!(encoded.contains("a=max-message-size:65536"));
@@ -268,6 +267,7 @@ mod tests {
         assert!(!encoded.contains("a=candidate:"));
 
         let (parsed, candidates) = Description::parse(&encoded).unwrap();
+        assert_eq!(parsed.session_id, local.session_id);
         assert_eq!(parsed.ice.ufrag, "abcd");
         assert_eq!(parsed.ice.pwd, "0123456789abcdef01234567");
         assert_eq!(parsed.dtls_role, DtlsRole::Server);
@@ -282,7 +282,10 @@ mod tests {
     #[test]
     fn full_ice_embeds_candidates() {
         let candidates = vec![host_candidate("192.168.1.10", 54321)];
-        let encoded = description(DtlsRole::Server).encode_full(&candidates);
+        let local = description(DtlsRole::Server);
+        let encoded = local.encode_full(&candidates);
+        assert_eq!(encoded, local.encode_full(&candidates));
+        assert!(encoded.contains("o=- 42 2 IN IP4 127.0.0.1\r\n"));
 
         assert!(encoded.contains("a=candidate:"));
         assert!(encoded.contains("192.168.1.10"));

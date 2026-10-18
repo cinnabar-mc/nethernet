@@ -1,8 +1,8 @@
 //! Original finite RTC peer for driving real data-channel delivery and encrypted peer closure.
 use crate::session::guard::transport_now;
 use bytes::{BufMut, BytesMut};
-use nethernet::protocol::constants::RELIABLE_CHANNEL;
-use rtc::data_channel::RTCDataChannelId;
+use nethernet::protocol::constants::{RELIABLE_CHANNEL, UNRELIABLE_CHANNEL};
+use rtc::data_channel::{RTCDataChannelId, RTCDataChannelInit};
 use rtc::dtls::content::ContentType;
 use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent};
@@ -16,16 +16,17 @@ use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
-pub(super) struct Peer {
+pub(crate) struct Peer {
     pc: RTCPeerConnection,
     socket: UdpSocket,
     buffer: Vec<u8>,
     reliable: Option<RTCDataChannelId>,
+    unreliable: Option<RTCDataChannelId>,
 }
 
 impl Peer {
-    /// Answers the actual NetherNet offer using RTC's existing ICE, DTLS, SCTP and DCEP owners.
-    pub async fn answer(offer: String) -> (Self, String) {
+    /// Constructs the same finite real RTC/UDP peer for either side of an offer exchange.
+    async fn new() -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let now = transport_now();
@@ -52,19 +53,56 @@ impl Peer {
         .unwrap();
         pc.add_local_candidate(RTCIceCandidate::from(&candidate).to_json().unwrap())
             .unwrap();
-        pc.set_remote_description(now, RTCSessionDescription::offer(offer).unwrap())
+        Self {
+            pc,
+            socket,
+            buffer: vec![0; 65536],
+            reliable: None,
+            unreliable: None,
+        }
+    }
+
+    /// Answers the actual NetherNet offer using RTC's existing ICE, DTLS, SCTP and DCEP owners.
+    pub async fn answer(offer: String) -> (Self, String) {
+        let mut peer = Self::new().await;
+        let now = transport_now();
+        peer.pc
+            .set_remote_description(now, RTCSessionDescription::offer(offer).unwrap())
             .unwrap();
-        let answer = pc.create_answer(None).unwrap();
-        pc.set_local_description(now, answer.clone()).unwrap();
-        (
-            Self {
-                pc,
-                socket,
-                buffer: vec![0; 65536],
-                reliable: None,
-            },
-            answer.sdp,
-        )
+        let answer = peer.pc.create_answer(None).unwrap();
+        peer.pc.set_local_description(now, answer.clone()).unwrap();
+        (peer, answer.sdp)
+    }
+
+    /// Offers both source-defined NetherNet data channels through the actual RTC owner.
+    pub async fn offer() -> (Self, String) {
+        let mut peer = Self::new().await;
+        peer.pc.create_data_channel(RELIABLE_CHANNEL, None).unwrap();
+        peer.pc
+            .create_data_channel(
+                UNRELIABLE_CHANNEL,
+                Some(RTCDataChannelInit {
+                    ordered: false,
+                    max_retransmits: Some(0),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let offer = peer.pc.create_offer(None).unwrap();
+        peer.pc
+            .set_local_description(transport_now(), offer.clone())
+            .unwrap();
+        (peer, offer.sdp)
+    }
+
+    /// Applies the real transport answer without constructing or completing a ready signal.
+    pub fn apply_answer(&mut self, answer: String) {
+        self.pc
+            .set_remote_description(
+                transport_now(),
+                RTCSessionDescription::answer(answer).unwrap(),
+            )
+            .unwrap();
     }
 
     /// Flushes currently available protocol datagrams without creating a background task.
@@ -77,12 +115,13 @@ impl Peer {
         }
         while let Some(event) = self.pc.poll_event() {
             if let RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(id)) = event
-                && self
-                    .pc
-                    .data_channel(id)
-                    .is_some_and(|channel| channel.label() == RELIABLE_CHANNEL)
+                && let Some(channel) = self.pc.data_channel(id)
             {
-                self.reliable = Some(id);
+                match channel.label() {
+                    RELIABLE_CHANNEL => self.reliable = Some(id),
+                    UNRELIABLE_CHANNEL => self.unreliable = Some(id),
+                    _ => {}
+                }
             }
         }
         while self.pc.poll_read().is_some() {}
@@ -111,6 +150,11 @@ impl Peer {
 
     pub fn ready(&self) -> bool {
         self.reliable.is_some()
+    }
+
+    /// Requires both actual channel-open events before testing a server's ready handoff.
+    pub fn both_ready(&self) -> bool {
+        self.reliable.is_some() && self.unreliable.is_some()
     }
 
     /// Sends one original NetherNet reliable message, framed by its source protocol convention.

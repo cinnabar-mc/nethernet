@@ -34,6 +34,12 @@ struct Answered {
     retirement: ServerRetirement,
 }
 
+struct Forwarding {
+    commands: mpsc::Sender<Command>,
+    close: CancellationToken,
+    retirement: ServerRetirement,
+}
+
 impl Peer {
     /// Keeps every fallible stage in the original listener-owned worker.
     pub(super) async fn run(mut self, offer: Signal, slot: PendingSlot, lease: Arc<ServerLease>) {
@@ -83,11 +89,39 @@ impl Peer {
         if transport_now() >= deadline {
             return Err(timeout());
         }
+        let Forwarding {
+            commands,
+            close,
+            mut retirement,
+        } = self.handoff(answered, slot).await?;
+        // Forwarding retains no Session or receiver handle; dropping all public owners stops the actor.
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.listener.cancelled() => break,
+                _ = self.config.cancel_token.cancelled() => break,
+                _ = self.stop.cancelled() => { close.cancel(); retirement.preserve_queued(); break; },
+                _ = close.cancelled() => { retirement.preserve_queued(); break; },
+                signal = self.signals.recv() => {
+                    let Some(signal) = signal else { break; };
+                    if self.forward(signal, &commands, &close, None).await.is_err() {
+                        if close.is_cancelled() { retirement.preserve_queued(); }
+                        break;
+                    }
+                }
+            }
+        }
+        drop(retirement);
+        Ok(())
+    }
+
+    /// Waits for the actual actor's readiness and transfers its receiver ownership once.
+    async fn handoff(&mut self, answered: Answered, slot: PendingSlot) -> OfferResult<Forwarding> {
         let Answered {
             accepted,
             mut ready,
             deadline,
-            mut retirement,
+            retirement,
         } = answered;
         let close = accepted.session.close_token();
         let commands = accepted.session.signal_sender();
@@ -114,25 +148,11 @@ impl Peer {
         }
         drop(slot);
         self.incoming.try_send(accepted).map_err(|_| closed())?;
-        // Forwarding retains no Session or receiver handle; dropping all public owners stops the actor.
-        loop {
-            tokio::select! {
-                biased;
-                _ = self.listener.cancelled() => break,
-                _ = self.config.cancel_token.cancelled() => break,
-                _ = self.stop.cancelled() => { close.cancel(); retirement.preserve_queued(); break; },
-                _ = close.cancelled() => { retirement.preserve_queued(); break; },
-                signal = self.signals.recv() => {
-                    let Some(signal) = signal else { break; };
-                    if self.forward(signal, &commands, &close, None).await.is_err() {
-                        if close.is_cancelled() { retirement.preserve_queued(); }
-                        break;
-                    }
-                }
-            }
-        }
-        drop(retirement);
-        Ok(())
+        Ok(Forwarding {
+            commands,
+            close,
+            retirement,
+        })
     }
 
     /// Reads metadata and dispatches the answer without extending the core's established deadline.
@@ -283,3 +303,6 @@ fn socket_error(error: std::io::Error) -> (Option<SignalErrorCode>, NetherError)
         error.into(),
     )
 }
+
+#[cfg(test)]
+mod tests;

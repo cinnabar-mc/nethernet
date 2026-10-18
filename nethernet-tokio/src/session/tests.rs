@@ -222,7 +222,7 @@ async fn local_cancel_and_driver_abort_retain_accepted_data_with_distinct_outcom
     .expect("shutdown lost accepted data or failed to publish its terminal outcome");
 }
 
-mod peer;
+use super::test_peer as peer;
 
 #[tokio::test]
 async fn an_expired_queued_send_is_refused_before_sctp_admission() {

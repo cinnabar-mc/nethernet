@@ -377,7 +377,10 @@ impl Server {
                         })
                     {
                         self.discard_peer(peer);
-                    } else if request.is_some_and(|request| request.method != METHOD_CHANNEL_BIND) {
+                    } else if request.is_some_and(|request| {
+                        // Gathering can finish before RTC exhausts its Binding transaction.
+                        !matches!(request.method, METHOD_BINDING | METHOD_CHANNEL_BIND)
+                    }) {
                         self.retire();
                     }
                 }

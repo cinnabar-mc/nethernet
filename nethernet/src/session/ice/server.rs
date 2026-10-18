@@ -6,26 +6,32 @@ use bytes::BytesMut;
 use rtc::ice::candidate::CandidateType;
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
-use rtc::stun::attributes::{ATTR_ERROR_CODE, ATTR_MESSAGE_INTEGRITY, ATTR_REALM};
+use rtc::stun::attributes::{
+    ATTR_ERROR_CODE, ATTR_MESSAGE_INTEGRITY, ATTR_NONCE, ATTR_REALM, ATTR_XOR_PEER_ADDRESS,
+};
 use rtc::stun::error_code::{CODE_STALE_NONCE, CODE_UNAUTHORIZED, ErrorCodeAttribute};
 use rtc::stun::integrity::MessageIntegrity;
 use rtc::stun::message::{
-    CLASS_ERROR_RESPONSE, CLASS_REQUEST, CLASS_SUCCESS_RESPONSE, Getter, METHOD_ALLOCATE,
-    METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION, METHOD_REFRESH, Message, Method, Setter,
-    TransactionId, is_stun_message,
+    CLASS_ERROR_RESPONSE, CLASS_INDICATION, CLASS_REQUEST, CLASS_SUCCESS_RESPONSE, Getter,
+    METHOD_ALLOCATE, METHOD_BINDING, METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION, METHOD_DATA,
+    METHOD_REFRESH, Message, Method, Setter, TransactionId, is_stun_message,
 };
 use rtc::stun::textattrs::Realm;
 use rtc::stun::xoraddr::XorMappedAddress;
 use rtc::turn::client::{Client, ClientConfig, Event};
 use rtc::turn::proto::lifetime::Lifetime;
+use rtc::turn::proto::peeraddr::PeerAddress;
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
-use std::time::Instant;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 
 const MAX_PENDING_PACKETS: usize = 64;
 const MAX_PENDING_BYTES: usize = 256 * 1024;
 const MAX_PERMISSION_ATTEMPTS: u8 = 3;
-const MAX_MAINTENANCE_TRANSACTIONS: usize = MAX_REMOTE_CANDIDATES * 2 + 8;
+// RFC 8656 section 9 fixes permission lifetime independently of allocation lifetime.
+const PERMISSION_LIFETIME: Duration = Duration::from_secs(300);
+const MAX_AUTH_ATTRIBUTE_BYTES: usize = 763;
+const MAX_SERVER_TRANSACTIONS: usize = MAX_REMOTE_CANDIDATES * 2 + 8;
 
 pub(super) enum ServerEvent {
     Candidate(CandidateType, SocketAddr),
@@ -34,13 +40,15 @@ pub(super) enum ServerEvent {
 
 struct Permission {
     pending: Option<TransactionId>,
-    ready: bool,
+    valid_until: Option<Instant>,
     attempts: u8,
 }
 
 struct TrackedRequest {
     method: Method,
-    integrity_key: Vec<u8>,
+    integrity_key: Option<Vec<u8>>,
+    permission_peers: Vec<IpAddr>,
+    permission_refresh: bool,
 }
 
 pub(super) struct Server {
@@ -51,6 +59,7 @@ pub(super) struct Server {
     binding: Option<TransactionId>,
     allocating: bool,
     credential_expiry: Option<Instant>,
+    username: Option<String>,
     allocation_expiry: Option<Instant>,
     initial_credentials: Option<TurnCredentials>,
     realm: Option<String>,
@@ -58,7 +67,7 @@ pub(super) struct Server {
     manual_refresh_pending: bool,
     refresh_nonce_retries: u8,
     permissions: HashMap<SocketAddr, Permission>,
-    maintenance: HashMap<TransactionId, TrackedRequest>,
+    requests: HashMap<TransactionId, TrackedRequest>,
     pending: VecDeque<TaggedBytesMut>,
     pending_bytes: usize,
     events: VecDeque<ServerEvent>,
@@ -72,6 +81,9 @@ impl Server {
             IceServer::Stun(_) => None,
             IceServer::Turn(_, credentials) => Some(credentials),
         };
+        let allocation_username = initial_credentials
+            .as_ref()
+            .map(|credentials| credentials.username.clone());
         let allocating = initial_credentials.is_some();
         let credential_expiry = initial_credentials
             .as_ref()
@@ -113,6 +125,7 @@ impl Server {
             binding,
             allocating,
             credential_expiry,
+            username: allocation_username,
             allocation_expiry: None,
             initial_credentials,
             realm: None,
@@ -120,7 +133,7 @@ impl Server {
             manual_refresh_pending: false,
             refresh_nonce_retries: 0,
             permissions: HashMap::new(),
-            maintenance: HashMap::new(),
+            requests: HashMap::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
             events: VecDeque::new(),
@@ -143,40 +156,48 @@ impl Server {
 
     /// Demultiplexes only source-bound server traffic. Unknown transactions never affect lifetime.
     pub fn handle_read(&mut self, mut msg: TaggedBytesMut) -> Result<(), IceError> {
+        self.expire(msg.now);
         let Some(client) = &self.client else {
             return Ok(());
         };
         let mut response = decode_stun(&msg.message);
-        let owned = response
-            .as_ref()
-            .is_some_and(|response| client.has_transaction(&response.transaction_id));
-        if owned && let Some(response) = &mut response {
-            if matches!(
-                response.typ.method,
-                METHOD_ALLOCATE | METHOD_CREATE_PERMISSION | METHOD_REFRESH | METHOD_CHANNEL_BIND
-            ) {
-                let provider = certificate::crypto_provider().map_err(|_| IceError::Server)?;
-                if let Some(key) = self
-                    .maintenance
-                    .get(&response.transaction_id)
-                    .map(|request| &request.integrity_key)
-                    .or(self.integrity_key.as_ref())
+        let mut owned = false;
+        if let Some(response) = &mut response {
+            if response.typ.class == CLASS_INDICATION {
+                // Indications never own a transaction, even if their ID collides with a request.
+                if response.typ.method != METHOD_DATA {
+                    return Ok(());
+                }
+            } else {
+                let Some(request) = self.requests.get(&response.transaction_id) else {
+                    return Ok(());
+                };
+                // Validate the entire transaction envelope before integrity exemptions or RTC mutation.
+                if !client.has_transaction(&response.transaction_id)
+                    || !matches!(
+                        response.typ.class,
+                        CLASS_SUCCESS_RESPONSE | CLASS_ERROR_RESPONSE
+                    )
+                    || response.typ.method != request.method
                 {
-                    if self
-                        .maintenance
-                        .get(&response.transaction_id)
-                        .is_some_and(|request| request.method != response.typ.method)
-                    {
-                        return Ok(());
-                    }
-                    // Authentication challenges can omit integrity; all other responses on UDP must verify.
-                    if !(authentication_challenge(response)
-                        && response.get(ATTR_MESSAGE_INTEGRITY).is_err())
+                    return Ok(());
+                }
+                let provider = certificate::crypto_provider().map_err(|_| IceError::Server)?;
+                if let Some(key) = &request.integrity_key {
+                    let challenge = authentication_challenge(response)
+                        && valid_challenge(response, self.realm.as_deref());
+                    if !(challenge && response.get(ATTR_MESSAGE_INTEGRITY).is_err())
                         && MessageIntegrity::check(response, key, provider.crypto()).is_err()
                     {
                         return Ok(());
                     }
-                } else if response.typ.method == METHOD_ALLOCATE && unauthorized(response) {
+                    if authentication_challenge(response) && !challenge {
+                        return Ok(());
+                    }
+                } else if request.method == METHOD_ALLOCATE {
+                    if !unauthorized(response) || !valid_challenge(response, None) {
+                        return Ok(());
+                    }
                     let realm =
                         Realm::get_from_as(response, ATTR_REALM).map_err(|_| IceError::Server)?;
                     let credentials = self.initial_credentials.take().ok_or(IceError::Server)?;
@@ -190,39 +211,40 @@ impl Server {
                         .map_err(|_| IceError::Server)?,
                     );
                     self.realm = Some(realm.text);
-                } else {
-                    return Err(IceError::Server);
+                } else if request.method != METHOD_BINDING {
+                    return Ok(());
                 }
-            }
-        }
-        if owned && let Some(response) = &response {
-            if response.typ.method == METHOD_REFRESH {
-                self.manual_refresh_pending = false;
-                if response.typ.class == CLASS_SUCCESS_RESPONSE {
-                    self.refresh_nonce_retries = 0;
-                    let mut lifetime = Lifetime::default();
-                    lifetime.get_from(response).map_err(|_| IceError::Server)?;
-                    self.allocation_expiry = msg.now.checked_add(lifetime.0);
-                    if lifetime.0.is_zero() || self.allocation_expiry.is_none() {
-                        self.retire();
-                        return Ok(());
-                    }
-                } else if response.typ.class == CLASS_ERROR_RESPONSE && !stale_nonce(response) {
+                owned = true;
+                let permission_peers = request.permission_peers.clone();
+                if request.permission_refresh
+                    && response.typ.class == CLASS_ERROR_RESPONSE
+                    && !stale_nonce(response)
+                {
                     self.retire();
                     return Ok(());
                 }
-            }
-            self.maintenance.remove(&response.transaction_id);
-            if response.typ.method == METHOD_CREATE_PERMISSION
-                && response.typ.class == CLASS_ERROR_RESPONSE
-                && !self
-                    .permissions
-                    .values()
-                    .any(|permission| permission.pending == Some(response.transaction_id))
-            {
-                // RTC refreshes all permissions in a single transaction without an event on failure.
-                self.retire();
-                return Ok(());
+                // A scheduled permission 438 must reach RTC to install its nonce. RTC retries
+                // at its next 120-second refresh, within the existing 300-second admission.
+                self.requests.remove(&response.transaction_id);
+                if response.typ.method == METHOD_REFRESH {
+                    self.manual_refresh_pending = false;
+                    if response.typ.class == CLASS_SUCCESS_RESPONSE {
+                        self.refresh_nonce_retries = 0;
+                        let mut lifetime = Lifetime::default();
+                        lifetime.get_from(response).map_err(|_| IceError::Server)?;
+                        self.allocation_expiry = msg.now.checked_add(lifetime.0);
+                        if lifetime.0.is_zero() || self.allocation_expiry.is_none() {
+                            self.retire();
+                            return Ok(());
+                        }
+                    } else if !stale_nonce(response) {
+                        self.retire();
+                        return Ok(());
+                    }
+                }
+                if response.typ.class == CLASS_SUCCESS_RESPONSE {
+                    self.renew_permissions(&permission_peers, msg.now)?;
+                }
             }
         }
         // Save the advertised lifetime before RTC consumes its allocation response.
@@ -316,7 +338,10 @@ impl Server {
                         && permission.pending == Some(id)
                     {
                         permission.pending = None;
-                        permission.ready = true;
+                        permission.valid_until = Some(
+                            now.checked_add(PERMISSION_LIFETIME)
+                                .ok_or(IceError::Server)?,
+                        );
                         self.flush_peer(peer, now)?;
                     }
                 }
@@ -339,7 +364,7 @@ impl Server {
                     }
                 }
                 Event::TransactionTimeout(id) => {
-                    let request = self.maintenance.remove(&id);
+                    let request = self.requests.remove(&id);
                     if self.binding == Some(id) {
                         self.binding = None;
                     } else if self.allocating {
@@ -357,7 +382,8 @@ impl Server {
                 Event::DataIndicationOrChannelData(_, peer, data) => {
                     if let Some(relay) = self.relay
                         && self.permissions.iter().any(|(allowed, permission)| {
-                            allowed.ip() == peer.ip() && permission.ready
+                            allowed.ip() == peer.ip()
+                                && permission.valid_until.is_some_and(|expiry| now < expiry)
                         })
                     {
                         self.events.push_back(ServerEvent::Data(TaggedBytesMut {
@@ -375,16 +401,17 @@ impl Server {
 
     /// Sends through an existing permission or admits bounded data until its permission completes.
     pub fn send(&mut self, msg: TaggedBytesMut) -> Result<(), IceError> {
+        self.expire(msg.now);
         let peer = msg.transport.peer_addr;
         let relay = self.relay.ok_or(IceError::Server)?;
         if peer.is_ipv4() != relay.is_ipv4() {
             return Err(IceError::Configuration);
         }
-        if self
-            .permissions
-            .get(&peer)
-            .is_some_and(|permission| permission.ready)
-        {
+        if self.permissions.get(&peer).is_some_and(|permission| {
+            permission
+                .valid_until
+                .is_some_and(|expiry| msg.now < expiry)
+        }) {
             return self
                 .client
                 .as_mut()
@@ -419,7 +446,7 @@ impl Server {
         }
         let permission = self.permissions.entry(peer).or_insert(Permission {
             pending: None,
-            ready: false,
+            valid_until: None,
             attempts: 0,
         });
         if permission.attempts >= MAX_PERMISSION_ATTEMPTS {
@@ -458,7 +485,7 @@ impl Server {
     fn discard_peer(&mut self, peer: SocketAddr) {
         if let Some(permission) = self.permissions.get_mut(&peer) {
             permission.pending = None;
-            permission.ready = false;
+            permission.valid_until = None;
             permission.attempts = MAX_PERMISSION_ATTEMPTS;
         }
         self.pending
@@ -466,32 +493,48 @@ impl Server {
         self.pending_bytes = self.pending.iter().map(|packet| packet.message.len()).sum();
     }
 
-    /// Tracks silent RTC refresh transactions so timeout cannot leave an expired route selected.
+    /// Retains the method, original integrity key and permission scope of every RTC request.
     pub fn poll_write(&mut self) -> Result<Option<TaggedBytesMut>, IceError> {
         let Some(msg) = self.client.as_mut().and_then(|client| client.poll_write()) else {
             return Ok(None);
         };
         if let Some(request) = decode_stun(&msg.message)
             && request.typ.class == CLASS_REQUEST
-            && matches!(
-                request.typ.method,
-                METHOD_ALLOCATE | METHOD_REFRESH | METHOD_CREATE_PERMISSION | METHOD_CHANNEL_BIND
-            )
-            && request.get(ATTR_MESSAGE_INTEGRITY).is_ok()
         {
-            if self.maintenance.len() >= MAX_MAINTENANCE_TRANSACTIONS
-                && !self.maintenance.contains_key(&request.transaction_id)
+            if self.requests.len() >= MAX_SERVER_TRANSACTIONS
+                && !self.requests.contains_key(&request.transaction_id)
             {
                 self.retire();
                 return Err(IceError::PendingLimit);
             }
-            if let Some(key) = &self.integrity_key {
-                self.maintenance
-                    .entry(request.transaction_id)
-                    .or_insert_with(|| TrackedRequest {
+            if !self.requests.contains_key(&request.transaction_id) {
+                let permission_refresh = request.typ.method == METHOD_CREATE_PERMISSION
+                    && !self
+                        .permissions
+                        .values()
+                        .any(|permission| permission.pending == Some(request.transaction_id));
+                let permission_peers = if matches!(
+                    request.typ.method,
+                    METHOD_CREATE_PERMISSION | METHOD_CHANNEL_BIND
+                ) {
+                    permission_peers(&request)?
+                } else {
+                    Vec::new()
+                };
+                let integrity_key = if request.get(ATTR_MESSAGE_INTEGRITY).is_ok() {
+                    Some(self.integrity_key.clone().ok_or(IceError::Server)?)
+                } else {
+                    None
+                };
+                self.requests.insert(
+                    request.transaction_id,
+                    TrackedRequest {
                         method: request.typ.method,
-                        integrity_key: key.clone(),
-                    });
+                        integrity_key,
+                        permission_peers,
+                        permission_refresh,
+                    },
+                );
             }
         }
         Ok(Some(msg))
@@ -508,16 +551,15 @@ impl Server {
         credentials: TurnCredentials,
         now: Instant,
     ) -> Result<(), IceError> {
-        if credentials.valid_until <= now || self.credential_expiry.is_none() {
-            return Err(IceError::Credentials);
-        }
+        self.validate_replacement(&credentials, now)?;
+        self.expire(now);
         let client = self.client.as_mut().ok_or(IceError::Closed)?;
         // Do not accumulate an unbounded stream of caller-triggered refreshes.
         if self.manual_refresh_pending
             || self.relay.is_none()
             || self.allocation_expiry.is_none_or(|expiry| expiry <= now)
             || self
-                .maintenance
+                .requests
                 .values()
                 .any(|request| request.method == METHOD_REFRESH)
         {
@@ -543,16 +585,52 @@ impl Server {
         Ok(())
     }
 
-    /// Retires expired credentials or allocations before accepting any more network input.
-    pub fn handle_timeout(&mut self, now: Instant) -> Result<(), IceError> {
+    /// Rejects username changes before any allocation, queued transaction or secret is mutated.
+    pub fn validate_replacement(
+        &self,
+        credentials: &TurnCredentials,
+        now: Instant,
+    ) -> Result<(), IceError> {
+        if credentials.valid_until <= now
+            || self.username.as_deref() != Some(credentials.username.as_str())
+        {
+            return Err(IceError::Credentials);
+        }
+        Ok(())
+    }
+
+    /// Bounds permission admission without owning RTC's refresh or retransmission engine.
+    fn renew_permissions(&mut self, peers: &[IpAddr], now: Instant) -> Result<(), IceError> {
+        let expiry = now
+            .checked_add(PERMISSION_LIFETIME)
+            .ok_or(IceError::Server)?;
+        for (peer, permission) in &mut self.permissions {
+            if peers.contains(&peer.ip()) && permission.valid_until.is_some() {
+                permission.valid_until = Some(expiry);
+            }
+        }
+        Ok(())
+    }
+
+    /// Expires state before every incoming or outgoing use, independently of Timeout ordering.
+    pub fn expire(&mut self, now: Instant) {
         if [self.credential_expiry, self.allocation_expiry]
             .into_iter()
             .flatten()
+            .chain(
+                self.permissions
+                    .values()
+                    .filter_map(|permission| permission.valid_until),
+            )
             .any(|deadline| now >= deadline)
         {
             self.retire();
-            return Ok(());
         }
+    }
+
+    /// Advances only the dependency-owned transaction and maintenance timers.
+    pub fn handle_timeout(&mut self, now: Instant) -> Result<(), IceError> {
+        self.expire(now);
         if let Some(client) = &mut self.client {
             client.handle_timeout(now).map_err(|_| IceError::Server)?;
         }
@@ -573,11 +651,17 @@ impl Server {
         ]
         .into_iter()
         .flatten()
+        .chain(
+            self.permissions
+                .values()
+                .filter_map(|permission| permission.valid_until),
+        )
         .min()
     }
 
     /// Emits one best-effort deallocation and immediately relinquishes all state and timers.
     pub fn close(&mut self, now: Instant) -> Vec<TaggedBytesMut> {
+        self.expire(now);
         let mut packets = Vec::new();
         if let Some(client) = &mut self.client {
             while client.poll_write().is_some() {}
@@ -601,6 +685,7 @@ impl Server {
         self.binding = None;
         self.allocating = false;
         self.credential_expiry = None;
+        self.username = None;
         self.allocation_expiry = None;
         self.initial_credentials = None;
         self.realm = None;
@@ -608,7 +693,7 @@ impl Server {
         self.manual_refresh_pending = false;
         self.refresh_nonce_retries = 0;
         self.permissions.clear();
-        self.maintenance.clear();
+        self.requests.clear();
         self.pending.clear();
         self.pending_bytes = 0;
         self.events.clear();
@@ -636,6 +721,30 @@ fn decode_stun(data: &[u8]) -> Option<Message> {
     Some(message)
 }
 
+/// Retains the exact bounded IP scope encoded by RTC, including batched permission refreshes.
+fn permission_peers(request: &Message) -> Result<Vec<IpAddr>, IceError> {
+    let mut peers = Vec::new();
+    for attribute in &request.attributes.0 {
+        if attribute.typ != ATTR_XOR_PEER_ADDRESS {
+            continue;
+        }
+        let mut one = Message {
+            transaction_id: request.transaction_id,
+            ..Default::default()
+        };
+        one.attributes.0.push(attribute.clone());
+        let mut peer = PeerAddress::default();
+        peer.get_from(&one).map_err(|_| IceError::Server)?;
+        if !peers.contains(&peer.ip) {
+            if peers.len() >= MAX_REMOTE_CANDIDATES {
+                return Err(IceError::CandidateLimit);
+            }
+            peers.push(peer.ip);
+        }
+    }
+    Ok(peers)
+}
+
 /// A stale nonce is the only refresh error for which RTC can keep and retry the same allocation.
 fn stale_nonce(message: &Message) -> bool {
     let mut code = ErrorCodeAttribute::default();
@@ -645,6 +754,21 @@ fn stale_nonce(message: &Message) -> bool {
 /// The long-term-authentication handshake permits unsigned 401/438 challenges.
 fn authentication_challenge(message: &Message) -> bool {
     message.typ.class == CLASS_ERROR_RESPONSE && (stale_nonce(message) || unauthorized(message))
+}
+
+/// Challenges stay in the established realm and carry bounded, nonempty nonce material.
+fn valid_challenge(message: &Message, realm: Option<&str>) -> bool {
+    let Ok(nonce) = message.get(ATTR_NONCE) else {
+        return false;
+    };
+    let Ok(challenge_realm) = Realm::get_from_as(message, ATTR_REALM) else {
+        return false;
+    };
+    !nonce.is_empty()
+        && nonce.len() <= MAX_AUTH_ATTRIBUTE_BYTES
+        && !challenge_realm.text.is_empty()
+        && challenge_realm.text.len() <= MAX_AUTH_ATTRIBUTE_BYTES
+        && realm.is_none_or(|realm| realm == challenge_realm.text)
 }
 
 /// Only a 401 allocation challenge is allowed to establish the initial realm and integrity key.

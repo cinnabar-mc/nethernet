@@ -27,6 +27,7 @@ pub enum IceError {
 }
 
 /// A bounded TURN credential with an explicit caller-monotonic expiry; intentionally has no Debug implementation.
+/// An existing allocation accepts password rotation only; changing username requires a fresh transport tuple.
 #[derive(Clone)]
 pub struct TurnCredentials {
     pub(super) username: String,

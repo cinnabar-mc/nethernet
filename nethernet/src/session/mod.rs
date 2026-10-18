@@ -212,14 +212,18 @@ impl Session {
         self.ice.gathering_state()
     }
 
-    /// Rotates the credential for one resolved TURN endpoint and retains its existing allocation.
+    /// Rotates the password for one resolved TURN endpoint; the allocation username must remain unchanged.
     pub fn update_turn_credentials(
         &mut self,
         server: SocketAddr,
         credentials: TurnCredentials,
         now: Instant,
     ) -> Result<(), ProtocolError> {
-        self.ice.update_credentials(server, credentials, now)?;
+        let result = self.ice.update_credentials(server, credentials, now);
+        if self.ice.selected_route_failed() {
+            self.fail(now)?;
+        }
+        result?;
         self.pump(now)?;
         self.push_wait(now);
         Ok(())
@@ -291,7 +295,7 @@ impl Session {
     }
 
     fn start_transports_on_selected_pair(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        if self.dtls.is_some() {
+        if self.dtls.is_some() || self.channels.failed_emitted {
             return Ok(());
         }
         let Some(remote_addr) = self.ice.selected_remote_addr() else {
@@ -470,7 +474,7 @@ impl Session {
 
     fn pump(&mut self, now: Instant) -> Result<(), ProtocolError> {
         if self.ice.selected_route_failed() {
-            self.fail(now);
+            self.fail(now)?;
         }
         while let Some((data, to)) = self.ice.poll_write()? {
             self.output.push_back(SessionOutput::Send(data, to));
@@ -484,7 +488,7 @@ impl Session {
                         | IceConnectionState::Closed
                 )
             {
-                self.fail(now);
+                self.fail(now)?;
             }
         }
         self.start_transports_on_selected_pair(now)?;
@@ -520,7 +524,7 @@ impl Session {
             self.output.push_back(SessionOutput::Send(data, to));
         }
         if failed {
-            self.fail(now);
+            self.fail(now)?;
         }
 
         if self.channels.reliable_stream_id.is_some()
@@ -537,22 +541,27 @@ impl Session {
             .establish_deadline()
             .is_some_and(|deadline| now >= deadline)
         {
-            self.fail(now);
+            self.fail(now)?;
         }
 
         Ok(())
     }
 
-    fn fail(&mut self, now: Instant) {
+    fn fail(&mut self, now: Instant) -> Result<(), ProtocolError> {
         if !self.channels.failed_emitted {
             self.channels.failed_emitted = true;
+            self.output.clear();
             self.ice.close(now);
             self.dtls = None;
             self.sctp = None;
             self.early_packets.clear();
+            while let Some((data, to)) = self.ice.poll_write()? {
+                self.output.push_back(SessionOutput::Send(data, to));
+            }
             self.output
                 .push_back(SessionOutput::Event(SessionEvent::Failed));
         }
+        Ok(())
     }
 }
 
@@ -562,6 +571,17 @@ impl Sans for Session {
     type Error = ProtocolError;
 
     fn handle(&mut self, msg: SessionInput) -> Result<(), ProtocolError> {
+        let now = match &msg {
+            SessionInput::Packet(_, _, now)
+            | SessionInput::RemoteDescription(_, _, now)
+            | SessionInput::RemoteCandidate(_, now)
+            | SessionInput::Send(_, _, now)
+            | SessionInput::Timeout(now) => *now,
+        };
+        self.ice.expire(now);
+        if self.ice.selected_route_failed() {
+            self.fail(now)?;
+        }
         if self.ice.gathering_state() == GatheringState::Closed {
             return match msg {
                 SessionInput::Packet(..) | SessionInput::Timeout(..) => Ok(()),

@@ -599,3 +599,238 @@ fn a_connection_trickles_candidates_gathered_after_the_initial_offer_once() {
     assert!(connection.poll_local_signal().is_none());
     connection.close(now).unwrap();
 }
+
+#[test]
+fn a_selected_relay_expires_before_send_even_without_a_timeout_input() {
+    for credential_expiry in [false, true] {
+        let (mut endpoints, mut server, mut now) = pair(false);
+        let expired = if credential_expiry {
+            let expires = now + Duration::from_secs(2);
+            endpoints[0]
+                .session
+                .update_turn_credentials(
+                    server.addr,
+                    TurnCredentials::new(USER.to_string(), PASSWORD.to_string(), expires).unwrap(),
+                    now,
+                )
+                .unwrap();
+            for _ in 0..20 {
+                step(&mut endpoints, &mut server, &mut now);
+            }
+            expires
+        } else {
+            // Allocation success advertised 600 seconds before this handshake became ready.
+            now + Duration::from_secs(601)
+        };
+        while endpoints[0].session.poll().is_some() {}
+        let result = endpoints[0].session.handle(SessionInput::Send(
+            Channel::Unreliable,
+            b"must not leave an expired relay".as_slice().into(),
+            expired,
+        ));
+        let output: Vec<_> = std::iter::from_fn(|| endpoints[0].session.poll()).collect();
+        assert!(
+            !output
+                .iter()
+                .any(|output| matches!(output, SessionOutput::Send(..))),
+            "Send used an expired selected relay before its Timeout input (credential expiry: {credential_expiry})"
+        );
+        assert!(
+            result.is_err()
+                || output
+                    .iter()
+                    .any(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed))),
+            "expiry neither rejected Send nor failed its session"
+        );
+        assert_eq!(
+            endpoints[0].session.gathering_state(),
+            GatheringState::Closed
+        );
+        endpoints[0]
+            .session
+            .handle(SessionInput::Timeout(expired + Duration::from_secs(1000)))
+            .unwrap();
+        assert!(endpoints[0].session.poll().is_none());
+    }
+}
+
+#[test]
+fn changing_turn_username_preserves_the_original_allocation_and_credentials() {
+    let (mut endpoints, mut server, mut now) = pair(false);
+    let result = endpoints[0].session.update_turn_credentials(
+        server.addr,
+        TurnCredentials::new(
+            "a-different-original-test-user".to_owned(),
+            PASSWORD.to_owned(),
+            now + Duration::from_secs(2400),
+        )
+        .unwrap(),
+        now,
+    );
+    assert!(
+        matches!(result, Err(ProtocolError::Ice(IceError::Credentials))),
+        "a different username must require a fresh allocation rather than mutate a live one"
+    );
+    endpoints[0]
+        .session
+        .handle(SessionInput::Send(
+            Channel::Unreliable,
+            b"original allocation still works".as_slice().into(),
+            now,
+        ))
+        .unwrap();
+    for _ in 0..100 {
+        step(&mut endpoints, &mut server, &mut now);
+        if !endpoints[1].received.is_empty() {
+            break;
+        }
+    }
+    assert!(endpoints[1].received.contains(&(
+        Channel::Unreliable,
+        b"original allocation still works".to_vec()
+    )));
+    assert_eq!(server.allocation_count(), 2);
+}
+
+/// Keeps consent alive while deterministically advancing to a scheduled maintenance boundary.
+fn advance_pair_to(
+    endpoints: &mut [Endpoint; 2],
+    server: &mut TurnPeer,
+    now: &mut Instant,
+    target: Instant,
+) {
+    for _ in 0..60000 {
+        if *now >= target {
+            return;
+        }
+        step(endpoints, server, now);
+    }
+    panic!("finite relay pair did not reach its maintenance boundary");
+}
+
+#[test]
+fn scheduled_permission_stale_nonce_preserves_relay_and_recovers_on_its_next_refresh() {
+    let (mut endpoints, mut server, mut now) = pair(false);
+    let target = now + Duration::from_secs(119);
+    advance_pair_to(&mut endpoints, &mut server, &mut now, target);
+    server.stale_permissions_once = true;
+    now += Duration::from_millis(1100);
+    for endpoint in &mut endpoints {
+        endpoint.session.handle(SessionInput::Timeout(now)).unwrap();
+    }
+    // A concurrent allocation refresh is already signed with the old nonce when the permission challenge arrives.
+    endpoints[0]
+        .session
+        .update_turn_credentials(
+            server.addr,
+            TurnCredentials::new(
+                USER.to_owned(),
+                PASSWORD.to_owned(),
+                now + Duration::from_secs(2400),
+            )
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+    let retry = now + Duration::from_secs(121);
+    advance_pair_to(&mut endpoints, &mut server, &mut now, retry);
+    assert_eq!(server.stale_permission_responses, 1);
+    assert!(
+        server.renewed_nonce_permissions > 0,
+        "scheduled permission refresh never used RTC's renewed nonce"
+    );
+    assert_eq!(server.allocation_count(), 2);
+    endpoints[0]
+        .session
+        .handle(SessionInput::Send(
+            Channel::Unreliable,
+            b"permission maintenance recovered".as_slice().into(),
+            now,
+        ))
+        .unwrap();
+    for _ in 0..100 {
+        step(&mut endpoints, &mut server, &mut now);
+        if !endpoints[1].received.is_empty() {
+            break;
+        }
+    }
+    assert!(endpoints[1].received.contains(&(
+        Channel::Unreliable,
+        b"permission maintenance recovered".to_vec()
+    )));
+}
+
+#[test]
+fn owned_turn_transactions_ignore_wrong_methods_and_reflected_requests() {
+    use rtc::stun::message::{CLASS_SUCCESS_RESPONSE, METHOD_BINDING, Message, MessageType};
+    use rtc::stun::xoraddr::XorMappedAddress;
+    for reflected_request in [false, true] {
+        let (mut endpoints, mut server, now) = pair(false);
+        while endpoints[0].session.poll().is_some() {}
+        endpoints[0]
+            .session
+            .update_turn_credentials(
+                server.addr,
+                TurnCredentials::new(
+                    USER.to_owned(),
+                    PASSWORD.to_owned(),
+                    now + Duration::from_secs(2400),
+                )
+                .unwrap(),
+                now,
+            )
+            .unwrap();
+        let request = std::iter::from_fn(|| endpoints[0].session.poll())
+            .find_map(|output| match output {
+                SessionOutput::Send(data, to) => {
+                    assert_eq!(to, server.addr);
+                    Some(data)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let mut parsed = Message::new();
+        parsed.raw = request.clone();
+        parsed.decode().unwrap();
+        assert_eq!(parsed.typ.method, rtc::stun::message::METHOD_REFRESH);
+        server.receive(endpoints[0].local, request.clone());
+        let (_, correct) = server.packets.pop_front().unwrap();
+        let wrong = if reflected_request {
+            request
+        } else {
+            let mut wrong = Message::new();
+            wrong
+                .build(&[
+                    Box::new(parsed.transaction_id),
+                    Box::new(MessageType::new(METHOD_BINDING, CLASS_SUCCESS_RESPONSE)),
+                    Box::new(XorMappedAddress {
+                        ip: endpoints[0].local.ip(),
+                        port: endpoints[0].local.port(),
+                    }),
+                ])
+                .unwrap();
+            wrong.raw
+        };
+        endpoints[0]
+            .session
+            .handle(SessionInput::Packet(wrong.into(), server.addr, now))
+            .unwrap();
+        endpoints[0]
+            .session
+            .handle(SessionInput::Packet(correct.into(), server.addr, now))
+            .unwrap();
+        endpoints[0]
+            .session
+            .update_turn_credentials(
+                server.addr,
+                TurnCredentials::new(
+                    USER.to_owned(),
+                    PASSWORD.to_owned(),
+                    now + Duration::from_secs(3600),
+                )
+                .unwrap(),
+                now,
+            )
+            .expect("a wrong-method response consumed the real authenticated refresh transaction");
+    }
+}

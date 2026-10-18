@@ -398,6 +398,7 @@ impl Session {
             }
             EndpointEvent::HandshakeComplete => Ok(()),
             EndpointEvent::PeerClosed => self.peer_closed(now),
+            _ => Ok(()),
         }
     }
 

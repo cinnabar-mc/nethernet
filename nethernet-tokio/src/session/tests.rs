@@ -109,3 +109,62 @@ fn pending_reliable_delivery_has_explicit_packet_and_byte_limits() {
             .is_err()
     );
 }
+
+mod peer;
+
+#[tokio::test]
+async fn accepted_reliable_tail_survives_authenticated_peer_close_before_receiver_eof() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let now = transport_now();
+        let (core, description) =
+            SansSession::new(socket.local_addr().unwrap(), true, 1, now).unwrap();
+        let (mut core, offer) =
+            SansConnection::connect(core, description, 1, "peer".into(), IceMode::Full);
+        let (mut peer, answer) = peer::Peer::answer(offer[0].data.clone()).await;
+        core.handle(ConnectionInput::Signal(
+            crate::protocol::Signal::answer(1, answer, "peer".into()),
+            transport_now(),
+        ))
+        .unwrap();
+        let (session, mut reliable, _unreliable, mut ready) =
+            Session::spawn(socket, core, Addr::default(), Addr::default());
+        let mut established = false;
+        while !established || !peer.ready() {
+            tokio::select! {
+                result = &mut ready, if !established => { result.unwrap(); established = true; },
+                _ = peer.turn() => {},
+            }
+        }
+        for index in 0..PACKET_CHANNEL_CAPACITY {
+            peer.send(index);
+            peer.flush().await;
+        }
+        while reliable.rx.len() < PACKET_CHANNEL_CAPACITY {
+            peer.turn().await;
+        }
+        for index in PACKET_CHANNEL_CAPACITY..PACKET_CHANNEL_CAPACITY + 2 {
+            peer.send(index);
+        }
+        while peer.outstanding() != 0 {
+            peer.turn().await;
+        }
+        assert!(
+            !session.is_closed().await,
+            "the driver failed before authenticated peer close"
+        );
+        peer.close_dtls().await;
+        session.closed().await;
+        for index in 0..PACKET_CHANNEL_CAPACITY + 2 {
+            let packet = reliable
+                .recv()
+                .await
+                .unwrap()
+                .expect("accepted reliable tail disappeared before ordinary receiver EOF");
+            assert_eq!(packet.as_ref(), &(index as u32).to_be_bytes());
+        }
+        assert!(reliable.recv().await.unwrap().is_none());
+    })
+    .await
+    .expect("finite secured-driver closing-delivery regression stalled");
+}

@@ -4,6 +4,78 @@ use futures::{FutureExt, StreamExt, poll};
 
 const PEER: &str = "00000000-0000-0000-0000-000000000002";
 
+/// A complete service burst can exceed the immediate queue without losing FIFO delivery.
+#[tokio::test]
+async fn a_service_batch_larger_than_the_caller_queue_waits_and_preserves_order() {
+    let config = CallerSignalingConfig::default();
+    let capacity = config.capacity.get();
+    let (caller, mut driver) = CallerSignaling::new("7".into(), PEER.into(), config).unwrap();
+    let mut incoming = caller.signals().unwrap();
+    let mut offer = Box::pin(caller.signal(Signal::offer(9, "sdp".into(), PEER.into())));
+    assert!(poll!(offer.as_mut()).is_pending());
+    driver
+        .recv()
+        .await
+        .unwrap()
+        .finish(Ok(SignalDelivery::PeerReceived));
+    offer.await.unwrap();
+    for index in 0..capacity {
+        driver
+            .try_deliver(
+                PEER,
+                &Signal::candidate(9, index.to_string(), PEER.into()).to_string(),
+            )
+            .unwrap();
+    }
+    let waiting: Vec<_> = (capacity..capacity * 2)
+        .map(|index| {
+            driver
+                .prepare_delivery(
+                    PEER,
+                    &Signal::candidate(9, index.to_string(), PEER.into()).to_string(),
+                )
+                .unwrap()
+        })
+        .collect();
+    let deliver = async {
+        for wait in waiting {
+            wait.await
+                .expect("valid service burst lost to immediate queue capacity");
+        }
+    };
+    let receive = async {
+        for index in 0..capacity * 2 {
+            assert_eq!(incoming.next().await.unwrap().data, index.to_string());
+        }
+    };
+    futures::join!(deliver, receive);
+
+    for index in 0..capacity {
+        driver
+            .try_deliver(
+                PEER,
+                &Signal::candidate(9, index.to_string(), PEER.into()).to_string(),
+            )
+            .unwrap();
+    }
+    let mut abandoned = Box::pin(
+        driver
+            .prepare_delivery(PEER, "CANDIDATEADD 9 abandoned")
+            .unwrap(),
+    );
+    assert!(poll!(abandoned.as_mut()).is_pending());
+    drop(abandoned);
+    for index in 0..capacity {
+        assert_eq!(incoming.next().await.unwrap().data, index.to_string());
+    }
+    assert!(incoming.next().now_or_never().is_none());
+    let stale = driver
+        .prepare_delivery(PEER, "CANDIDATEADD 9 retired")
+        .unwrap();
+    drop(incoming);
+    assert_eq!(stale.await, Err(CallerSignalingError::RouteMismatch));
+}
+
 /// Creates a small bridge so every queue limit can be exercised without I/O.
 fn bridge() -> (CallerSignaling, CallerSignalingDriver) {
     CallerSignaling::new(

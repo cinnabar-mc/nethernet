@@ -330,6 +330,53 @@ impl CallerSignalingDriver {
         sender: &str,
         wire: &str,
     ) -> std::result::Result<(), CallerSignalingError> {
+        let signal = self.decode(sender, wire)?;
+        let inbox = self.inbox.lock().unwrap_or_else(|error| error.into_inner());
+        check_subscription(&inbox, &signal)?;
+        self.incoming.try_send(signal).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => CallerSignalingError::Capacity,
+            mpsc::error::TrySendError::Closed(_) => CallerSignalingError::Closed,
+        })
+    }
+
+    /// Validates an envelope now and returns an owned, cancel-safe incoming admission future.
+    /// Retain this future while driving service I/O; acknowledge only after it succeeds.
+    /// Dropping it before admission sends nothing. The caller owns its original deadline.
+    pub fn prepare_delivery(
+        &self,
+        sender: &str,
+        wire: &str,
+    ) -> std::result::Result<
+        impl std::future::Future<Output = std::result::Result<(), CallerSignalingError>> + Send + use<>,
+        CallerSignalingError,
+    > {
+        let signal = self.decode(sender, wire)?;
+        check_subscription(
+            &self.inbox.lock().unwrap_or_else(|error| error.into_inner()),
+            &signal,
+        )?;
+        let incoming = self.incoming.clone();
+        let inbox = self.inbox.clone();
+        let closed = self.closed.clone();
+        Ok(async move {
+            if closed.is_cancelled() {
+                return Err(CallerSignalingError::Closed);
+            }
+            let inbox = inbox.lock().unwrap_or_else(|error| error.into_inner());
+            check_subscription(&inbox, &signal)?;
+            incoming.try_send(signal).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => CallerSignalingError::Capacity,
+                mpsc::error::TrySendError::Closed(_) => CallerSignalingError::Closed,
+            })
+        })
+    }
+
+    /// Bounds and decodes authenticated routing input without admitting it to the subscription.
+    fn decode(
+        &self,
+        sender: &str,
+        wire: &str,
+    ) -> std::result::Result<Signal, CallerSignalingError> {
         if self.closed.is_cancelled() {
             return Err(CallerSignalingError::Closed);
         }
@@ -339,16 +386,8 @@ impl CallerSignalingDriver {
         if wire.len() > self.max_signal_bytes {
             return Err(CallerSignalingError::Capacity);
         }
-        let signal = Signal::from_string(wire, self.remote_id.clone())
-            .map_err(|_| CallerSignalingError::InvalidSignal)?;
-        let inbox = self.inbox.lock().unwrap_or_else(|error| error.into_inner());
-        if inbox.receiver.is_some() || inbox.connection_id != Some(signal.connection_id) {
-            return Err(CallerSignalingError::RouteMismatch);
-        }
-        self.incoming.try_send(signal).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => CallerSignalingError::Capacity,
-            mpsc::error::TrySendError::Closed(_) => CallerSignalingError::Closed,
-        })
+        Signal::from_string(wire, self.remote_id.clone())
+            .map_err(|_| CallerSignalingError::InvalidSignal)
     }
 
     /// Closes this bridge without closing the application's shared service connection.
@@ -356,6 +395,18 @@ impl CallerSignalingDriver {
         self.closed.cancel();
         self.outgoing.close();
         while self.outgoing.try_recv().is_ok() {}
+    }
+}
+
+/// Checks the current subscription again immediately before publishing a reserved signal.
+fn check_subscription(
+    inbox: &Inbox,
+    signal: &Signal,
+) -> std::result::Result<(), CallerSignalingError> {
+    if inbox.receiver.is_some() || inbox.connection_id != Some(signal.connection_id) {
+        Err(CallerSignalingError::RouteMismatch)
+    } else {
+        Ok(())
     }
 }
 

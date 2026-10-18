@@ -553,3 +553,42 @@ fn an_authenticated_dtls_peer_close_finishes_the_session_once() {
         "closed session retained work or emitted failure twice"
     );
 }
+
+#[test]
+fn an_authenticated_closing_datagram_delivers_its_final_complete_message_before_failure() {
+    let (mut receiver, mut peer, now) = connected_pair();
+    peer.handle(SessionInput::Send(
+        Channel::Reliable,
+        Bytes::from_static(b"final reliable payload"),
+        now,
+    ))
+    .unwrap();
+    let mut datagram = Vec::new();
+    while let Some(output) = peer.poll() {
+        if let SessionOutput::Send(data, to) = output {
+            assert_eq!(to, addr(40100));
+            datagram.extend(data);
+        }
+    }
+    assert!(
+        !datagram.is_empty(),
+        "the actual peer did not encode its final data"
+    );
+    peer.dtls.as_mut().unwrap().close_for_test(now).unwrap();
+    while let Some((data, to)) = peer.dtls.as_mut().unwrap().poll_transmit() {
+        assert_eq!(to, addr(40100));
+        datagram.extend(data);
+    }
+    assert!(datagram.len() <= crate::protocol::constants::MAX_DATAGRAM_SIZE);
+    receiver
+        .handle(SessionInput::Packet(datagram.into(), addr(40101), now))
+        .unwrap();
+    let output: Vec<_> = std::iter::from_fn(|| receiver.poll()).collect();
+    let data = output.iter().position(|output| matches!(output, SessionOutput::Message(Channel::Reliable, data) if data == b"final reliable payload")).expect("authenticated data preceding close_notify was lost");
+    let failed = output
+        .iter()
+        .position(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+        .expect("peer close did not terminate the session");
+    assert!(data < failed);
+    assert_eq!(receiver.gathering_state(), GatheringState::Closed);
+}

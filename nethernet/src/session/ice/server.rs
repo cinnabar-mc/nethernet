@@ -21,6 +21,7 @@ use rtc::stun::xoraddr::XorMappedAddress;
 use rtc::turn::client::{Client, ClientConfig, Event};
 use rtc::turn::proto::lifetime::Lifetime;
 use rtc::turn::proto::peeraddr::PeerAddress;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -507,7 +508,7 @@ impl Server {
                 self.retire();
                 return Err(IceError::PendingLimit);
             }
-            if !self.requests.contains_key(&request.transaction_id) {
+            if let Entry::Vacant(entry) = self.requests.entry(request.transaction_id) {
                 let permission_refresh = request.typ.method == METHOD_CREATE_PERMISSION
                     && !self
                         .permissions
@@ -526,15 +527,12 @@ impl Server {
                 } else {
                     None
                 };
-                self.requests.insert(
-                    request.transaction_id,
-                    TrackedRequest {
-                        method: request.typ.method,
-                        integrity_key,
-                        permission_peers,
-                        permission_refresh,
-                    },
-                );
+                entry.insert(TrackedRequest {
+                    method: request.typ.method,
+                    integrity_key,
+                    permission_peers,
+                    permission_refresh,
+                });
             }
         }
         Ok(Some(msg))

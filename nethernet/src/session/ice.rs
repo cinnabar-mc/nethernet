@@ -212,6 +212,11 @@ impl IceLayer {
 
     /// Sends STUN to the ICE engine and admits media only from a checked pair.
     fn read_effective(&mut self, msg: TaggedBytesMut) -> Result<(), ProtocolError> {
+        // Peer checks can precede the answer or its service receipt. RTC retries them;
+        // its inbound owner requires remote credentials before touching peer state.
+        if self.agent.get_remote_credentials().is_none() {
+            return Ok(());
+        }
         if is_stun_packet(&msg.message) {
             if self.agent.get_remote_candidates().len() >= config::MAX_REMOTE_CANDIDATES
                 && !self

@@ -206,3 +206,9 @@ pending limit closes the session;
 unreliable receive remains best effort. Existing TURN allocations require the
 same username during password rotation. A new username requires a new socket and
 allocation.
+
+Before a remote description installs ICE credentials, the core discards peer
+checks for RTC to retry while continuing configured STUN/TURN transactions.
+Signaling completion still has to fit the peers' original establishment budgets.
+An authenticated DTLS peer close delivers any complete final message, routes its
+close reply through the selected ICE path, then releases transport state once.

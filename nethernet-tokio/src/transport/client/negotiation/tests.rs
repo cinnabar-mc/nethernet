@@ -1,10 +1,14 @@
 use super::*;
+use crate::addr::Addr;
+use crate::session::Session as RuntimeSession;
 use crate::signaling::caller::SignalDelivery;
 use crate::signaling::caller::{CallerSignaling, CallerSignalingConfig};
+use bytes::Bytes;
 use futures::poll;
 use nethernet::connection::IceMode;
 use nethernet::session::IceConfig;
 use rtc::stun::message::{CLASS_REQUEST, METHOD_BINDING, Message};
+use std::sync::Arc;
 
 /// Holds real service completion while the remote RTC peer checks the actually advertised candidate.
 async fn peer_checks_before_handoff(mode: IceMode, answer_before_check: bool) {
@@ -117,11 +121,37 @@ async fn peer_checks_before_handoff(mode: IceMode, answer_before_check: bool) {
     negotiation
         .await
         .expect("negotiation could not finish after the receipt and answer arrived");
+    let (client, mut client_reliable, _client_unreliable, client_ready) = RuntimeSession::spawn(
+        Arc::new(client_socket),
+        client,
+        Addr::default(),
+        Addr::default(),
+    );
+    let (peer, mut peer_reliable, _peer_unreliable, peer_ready) = RuntimeSession::spawn(
+        Arc::new(peer_socket),
+        peer,
+        Addr::default(),
+        Addr::default(),
+    );
+    tokio::try_join!(client_ready, peer_ready)
+        .expect("early checks prevented actual channel establishment");
     client
-        .handle(ConnectionInput::Timeout(transport_now()))
+        .send(Bytes::from_static(b"secured data after early check"))
+        .await
         .unwrap();
-    client.close(transport_now()).unwrap();
-    peer.close(transport_now()).unwrap();
+    assert_eq!(
+        peer_reliable.recv().await.unwrap().unwrap(),
+        "secured data after early check"
+    );
+    peer.send(Bytes::from_static(b"secured reply after handoff"))
+        .await
+        .unwrap();
+    assert_eq!(
+        client_reliable.recv().await.unwrap().unwrap(),
+        "secured reply after handoff"
+    );
+    client.close().await.unwrap();
+    peer.close().await.unwrap();
 }
 
 #[tokio::test]

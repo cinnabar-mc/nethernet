@@ -41,7 +41,7 @@ pub enum Channel {
 pub enum SessionEvent {
     /// Both data channels are open.
     Ready,
-    /// ICE or SCTP failed, or the session did not become ready in time; emitted once.
+    /// A transport failed, the DTLS peer closed, or establishment expired; emitted once.
     Failed,
 }
 
@@ -378,18 +378,51 @@ impl Session {
         if let Some(dtls) = &mut self.dtls {
             let events = dtls.handle_read(data, now)?;
             for event in events {
-                self.handle_dtls_event(event, now);
+                self.handle_dtls_event(event, now)?;
             }
         }
         Ok(())
     }
 
-    fn handle_dtls_event(&mut self, event: EndpointEvent, now: Instant) {
-        if let EndpointEvent::ApplicationData(data) = event
-            && let Some(sctp) = &mut self.sctp
-        {
-            sctp.handle_read(&data, now);
+    fn handle_dtls_event(
+        &mut self,
+        event: EndpointEvent,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        match event {
+            EndpointEvent::ApplicationData(data) => {
+                if let Some(sctp) = &mut self.sctp {
+                    sctp.handle_read(&data, now);
+                }
+                Ok(())
+            }
+            EndpointEvent::HandshakeComplete => Ok(()),
+            EndpointEvent::PeerClosed => self.peer_closed(now),
         }
+    }
+
+    /// Delivers complete final data and routes close_notify before releasing the relay allocation.
+    fn peer_closed(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        let mut final_output = VecDeque::new();
+        let flush = (|| {
+            if let Some(sctp) = &mut self.sctp {
+                drain_dcep_and_data(sctp, &mut self.channels, &mut final_output, now)?;
+            }
+            if let Some(dtls) = &mut self.dtls {
+                while let Some((data, to)) = dtls.poll_transmit() {
+                    self.ice.send_selected(data, to, now)?;
+                }
+            }
+            while let Some((data, to)) = self.ice.poll_write()? {
+                final_output.push_back(SessionOutput::Send(data, to));
+            }
+            Ok(())
+        })();
+        // A best-effort reply failure must never keep a removed DTLS association alive.
+        let teardown = self.fail(now);
+        final_output.append(&mut self.output);
+        self.output = final_output;
+        flush.and(teardown)
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), ProtocolError> {

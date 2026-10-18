@@ -30,11 +30,14 @@ pub struct Connection {
     connection_id: u64,
     remote_network_id: String,
     remote_identity: Option<String>,
+    ice_mode: IceMode,
+    local_ufrag: String,
+    next_candidate_index: usize,
 }
 
 impl Connection {
     pub fn connect(
-        session: Session,
+        mut session: Session,
         description: Description,
         connection_id: u64,
         remote_network_id: String,
@@ -48,6 +51,8 @@ impl Connection {
             remote_network_id.clone(),
             SignalKind::Offer,
         );
+        let next_candidate_index = session.local_candidates().len();
+        while session.poll_local_candidate().is_some() {}
 
         (
             Self {
@@ -55,6 +60,9 @@ impl Connection {
                 connection_id,
                 remote_network_id,
                 remote_identity: None,
+                ice_mode,
+                local_ufrag: description.ice.ufrag,
+                next_candidate_index,
             },
             signals,
         )
@@ -96,6 +104,8 @@ impl Connection {
             offer.network_id.clone(),
             SignalKind::Answer,
         );
+        let next_candidate_index = session.local_candidates().len();
+        while session.poll_local_candidate().is_some() {}
 
         Ok((
             Self {
@@ -103,6 +113,9 @@ impl Connection {
                 connection_id: offer.connection_id,
                 remote_network_id: offer.network_id.clone(),
                 remote_identity,
+                ice_mode,
+                local_ufrag: description.ice.ufrag,
+                next_candidate_index,
             },
             signals,
         ))
@@ -117,7 +130,7 @@ impl Connection {
         kind: SignalKind,
     ) -> Vec<Signal> {
         let sdp = match ice_mode {
-            IceMode::Full => description.encode_full(&[session.local_candidate().clone()]),
+            IceMode::Full => description.encode_full(session.local_candidates()),
             IceMode::Trickle => description.encode_trickle(),
         };
 
@@ -127,11 +140,13 @@ impl Connection {
         }];
 
         if ice_mode == IceMode::Trickle {
-            signals.push(Signal::candidate(
-                connection_id,
-                format_ice_candidate(0, session.local_candidate(), &description.ice.ufrag),
-                remote_network_id,
-            ));
+            for (index, candidate) in session.local_candidates().iter().enumerate() {
+                signals.push(Signal::candidate(
+                    connection_id,
+                    format_ice_candidate(index, candidate, &description.ice.ufrag),
+                    remote_network_id.clone(),
+                ));
+            }
         }
 
         signals
@@ -185,6 +200,26 @@ impl Connection {
 
     pub fn connection_id(&self) -> u64 {
         self.connection_id
+    }
+
+    /// One candidate gathered after the initial signals. The runtime sends it through the same signaling owner.
+    pub fn poll_local_signal(&mut self) -> Option<Signal> {
+        if self.ice_mode != IceMode::Trickle {
+            return None;
+        }
+        let candidate = self.session.poll_local_candidate()?;
+        let index = self.next_candidate_index;
+        self.next_candidate_index += 1;
+        Some(Signal::candidate(
+            self.connection_id,
+            format_ice_candidate(index, &candidate, &self.local_ufrag),
+            self.remote_network_id.clone(),
+        ))
+    }
+
+    /// Cancels all transport timers and queues best-effort relay deallocation sends.
+    pub fn close(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        self.session.close(now)
     }
 }
 
@@ -336,8 +371,9 @@ mod tests {
                 }
             }
             for (data, to) in outbox {
+                assert_eq!(to, addr(40201));
                 answerer
-                    .handle(ConnectionInput::Packet(data.into(), to, now))
+                    .handle(ConnectionInput::Packet(data.into(), addr(40200), now))
                     .unwrap();
             }
 
@@ -355,8 +391,9 @@ mod tests {
                 }
             }
             for (data, to) in outbox {
+                assert_eq!(to, addr(40200));
                 offerer
-                    .handle(ConnectionInput::Packet(data.into(), to, now))
+                    .handle(ConnectionInput::Packet(data.into(), addr(40201), now))
                     .unwrap();
             }
 

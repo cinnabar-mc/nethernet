@@ -4,6 +4,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
+    #[error(transparent)]
+    Ice(#[from] crate::session::IceError),
+
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 

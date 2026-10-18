@@ -490,3 +490,66 @@ fn full_handshake_and_bidirectional_data_exchange() {
         "offerer never received the unreliable message: {offerer_received:?}"
     );
 }
+
+#[test]
+fn an_authenticated_dtls_peer_close_finishes_the_session_once() {
+    let (mut receiver, mut peer, now) = connected_pair();
+    peer.dtls.as_mut().unwrap().close_for_test(now).unwrap();
+    let close_packets: Vec<_> =
+        std::iter::from_fn(|| peer.dtls.as_mut().unwrap().poll_transmit()).collect();
+    assert!(
+        !close_packets.is_empty(),
+        "the actual DTLS peer did not emit close_notify"
+    );
+    for (data, to) in &close_packets {
+        assert_eq!(*to, addr(40100));
+        receiver
+            .handle(SessionInput::Packet(data.clone().into(), addr(40101), now))
+            .unwrap();
+    }
+    let output: Vec<_> = std::iter::from_fn(|| receiver.poll()).collect();
+    assert_eq!(
+        output
+            .iter()
+            .filter(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+            .count(),
+        1,
+        "RTC's authenticated peer-close event left a ready session alive"
+    );
+    assert_eq!(receiver.gathering_state(), GatheringState::Closed);
+    let failed = output
+        .iter()
+        .position(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+        .unwrap();
+    assert!(
+        output[..failed]
+            .iter()
+            .any(|output| matches!(output, SessionOutput::Send(_, to) if *to == addr(40101))),
+        "the authenticated close_notify reply was discarded during teardown"
+    );
+    assert!(
+        !output
+            .iter()
+            .any(|output| matches!(output, SessionOutput::Message(..) | SessionOutput::Wait(..)))
+    );
+    assert!(matches!(
+        receiver.handle(SessionInput::Send(
+            Channel::Reliable,
+            Bytes::from_static(b"closed"),
+            now
+        )),
+        Err(ProtocolError::Ice(IceError::Closed))
+    ));
+    for (data, _) in close_packets {
+        receiver
+            .handle(SessionInput::Packet(data.into(), addr(40101), now))
+            .unwrap();
+    }
+    receiver
+        .handle(SessionInput::Timeout(now + Duration::from_secs(1000)))
+        .unwrap();
+    assert!(
+        receiver.poll().is_none(),
+        "closed session retained work or emitted failure twice"
+    );
+}

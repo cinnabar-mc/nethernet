@@ -9,7 +9,7 @@ pub mod player;
 pub mod server;
 pub mod trust;
 
-pub use client::ClientIdentity;
+pub use client::SelfSignedIdentity;
 pub use envelope::{
     Assertion, Identity, Idp, canonical_fingerprint_json, fingerprint_payload, sdp_fingerprints,
 };

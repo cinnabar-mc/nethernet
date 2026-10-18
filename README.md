@@ -101,15 +101,14 @@ require a token issued by the Minecraft authorization service instead.
 ### Client identities
 
 `ConnectionConfig::identity` accepts an `Arc<dyn SdpIdentity>`. Use
-`ClientIdentity::self_signed(now, lifetime)` for signed-out offers, or
-`ClientIdentity::from_token(key, token, domain)` with an application-authenticated
-token. The token's `cpk` must match the signing key, and expiry is checked when
-signing the offer. The same key is available through `signing_key()` for an
-application login that binds to the transport identity.
+`SelfSignedIdentity::new(now, lifetime)` for signed-out client offers. Its token
+carries base64 DER public keys in `cpk` and `x5u`, and signs the SDP fingerprints.
+Borrow `signing_key()` when a later application login must use the same key.
+Time and lifetime are explicit inputs; expired identities cannot sign offers.
 
-Client self-signed tokens encode the public key as base64 DER in `cpk` and `x5u`.
-`ServerIdentity` keeps its existing answer format and also implements
-`SdpIdentity`. Credentials and refresh remain owned by the application.
+`ServerIdentity` retains its existing JWK token format and also implements
+`SdpIdentity`. Account authentication, credentials and refresh belong to an
+application-owned implementation of that interface.
 
 ## License
 

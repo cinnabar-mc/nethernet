@@ -78,6 +78,12 @@ pub struct AcceptedSession {
 }
 
 impl Session {
+    /// Observes actual actor admission in owning tests without advancing the driver.
+    #[cfg(test)]
+    fn queued_commands(&self) -> usize {
+        self.command_tx.len()
+    }
+
     pub(crate) fn spawn(
         socket: Arc<UdpSocket>,
         connection: SansConnection,

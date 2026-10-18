@@ -2,6 +2,7 @@ use bytes::Bytes;
 use nethernet_tokio::signaling::http::{HttpServerConfig, HttpSignaling, HttpSignalingServer};
 use nethernet_tokio::{
     AcceptedSession, ConnectionConfig, NetherClient, NetherError, NetherServer, ServerData,
+    SignalErrorCode,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,17 +46,98 @@ fn server_connection_config() -> ConnectionConfig {
 }
 
 async fn serve(config: HttpServerConfig) -> (String, NetherServer) {
+    serve_with_connection(config, server_connection_config()).await
+}
+
+/// Uses the same real HTTP/RTC owners with explicit server admission policy.
+async fn serve_with_connection(
+    config: HttpServerConfig,
+    connection: ConnectionConfig,
+) -> (String, NetherServer) {
     let signaling = HttpSignalingServer::bind("127.0.0.1:0".parse().unwrap(), config)
         .await
         .unwrap();
     signaling.set_server_data(ServerData::new("test".into(), "world".into()));
 
     let addr = signaling.local_addr();
-    let listener = NetherServer::bind_with(signaling, server_connection_config())
+    let listener = NetherServer::bind_with(signaling, connection)
         .await
         .unwrap();
 
     (format!("http://{addr}"), listener)
+}
+
+/// Makes one real HTTP/ICE/DTLS/SCTP attempt, without automatic negotiation replay.
+async fn connect_once(url: &str, peer: &str) -> Result<NetherClient, NetherError> {
+    let mut config = client_config();
+    config.attempts = 1;
+    NetherClient::connect_with(HttpSignaling::new(peer.into()).unwrap(), url.into(), config).await
+}
+
+#[tokio::test]
+async fn queued_and_live_accepted_sessions_hold_the_server_capacity() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let connection = ConnectionConfig {
+            max_sessions: 1,
+            ..server_connection_config()
+        };
+        let (url, mut listener) = serve_with_connection(server_config(), connection).await;
+        let first = connect_once(&url, "peer-one").await.unwrap();
+        assert!(
+            matches!(
+                connect_once(&url, "peer-two").await,
+                Err(NetherError::Signaled(
+                    SignalErrorCode::IncomingConnectionIgnored
+                ))
+            ),
+            "a connected session queued for accept must retain the server capacity"
+        );
+        let mut accepted = listener.accept().await.unwrap();
+        assert!(
+            matches!(
+                connect_once(&url, "peer-three").await,
+                Err(NetherError::Signaled(
+                    SignalErrorCode::IncomingConnectionIgnored
+                ))
+            ),
+            "transferring a live session to its consumer must not release server capacity"
+        );
+        first
+            .send(Bytes::from_static(b"original accepted peer"))
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.reliable.recv().await.unwrap().unwrap(),
+            "original accepted peer"
+        );
+        accepted.session.close().await.unwrap();
+        first.close().await.unwrap();
+        listener.close().await.unwrap();
+    })
+    .await
+    .expect("finite actual server admission fixture stalled");
+}
+
+#[tokio::test]
+async fn closing_the_listener_preserves_an_already_accepted_session() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (url, mut listener) = serve(server_config()).await;
+        let client = connect_once(&url, "accepted-peer").await.unwrap();
+        let mut accepted = listener.accept().await.unwrap();
+        listener.close().await.unwrap();
+        client
+            .send(Bytes::from_static(b"accepted before listener close"))
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.reliable.recv().await.unwrap().unwrap(),
+            "accepted before listener close"
+        );
+        accepted.session.close().await.unwrap();
+        client.close().await.unwrap();
+    })
+    .await
+    .expect("listener close ended or stalled an already accepted session");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -70,6 +70,9 @@ pub struct ConnectionConfig {
 
     /// The same cap for offers from one network id.
     pub max_pending_per_network_id: usize,
+
+    /// Total negotiating, queued accepted and live server sessions retained until retirement.
+    pub max_sessions: usize,
 }
 
 impl Default for ConnectionConfig {
@@ -86,6 +89,7 @@ impl Default for ConnectionConfig {
             infer_peer_candidates: true,
             max_pending: DEFAULT_MAX_PENDING,
             max_pending_per_network_id: DEFAULT_MAX_PENDING_PER_NETWORK_ID,
+            max_sessions: DEFAULT_MAX_PENDING,
         }
     }
 }

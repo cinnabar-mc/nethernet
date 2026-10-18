@@ -41,6 +41,30 @@ async fn connected_pair() -> (
 }
 
 #[tokio::test]
+async fn concurrent_sends_wait_outside_the_bounded_real_session_command_queue() {
+    use futures::poll;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ((sender, _sender_reliable), (receiver, _reliable, _unreliable)) =
+            connected_pair().await;
+        let mut held = Vec::new();
+        for _ in 0..command::COMMAND_CAPACITY * 2 {
+            let mut sending = Box::pin(sender.send(Bytes::from_static(b"bounded actual send")));
+            assert!(poll!(sending.as_mut()).is_pending());
+            held.push(sending);
+        }
+        assert!(
+            sender.queued_commands() <= command::COMMAND_CAPACITY,
+            "concurrent sends must retain excess payloads at their caller, not in an unbounded actor queue"
+        );
+        drop(held);
+        sender.close().await.unwrap();
+        receiver.close().await.unwrap();
+    })
+    .await
+    .expect("actual bounded-command fixture failed to establish");
+}
+
+#[tokio::test]
 async fn a_full_reliable_receiver_keeps_the_session_alive_and_preserves_order() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let ((sender, _sender_reliable), (receiver, mut reliable, mut unreliable)) =

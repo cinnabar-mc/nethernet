@@ -1,9 +1,10 @@
 //! LAN client: discovers servers by UDP broadcast and connects to one by network id.
-use crate::connection::{ConnectionEvent, SessionPool};
-use crate::socket::{bind_shared_socket, recv_discovery};
+use crate::connection::ConnectionEvent;
+use crate::outbound::{ClientIceConfig, Outbound, Received};
+use crate::socket::recv_discovery;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use nethernet::connection::{Connection, IceMode, Timeouts};
+use nethernet::connection::{IceMode, Timeouts};
 use nethernet::identity::verify_answer;
 use nethernet::prelude::{
     LanSignaler, LanSignalerConfig, LanSignalerInput, LanSignalerOutput, Sans, ServerData,
@@ -11,7 +12,7 @@ use nethernet::prelude::{
 };
 use nethernet::protocol::constants::{LAN_DISCOVERY_PORT, MAX_DATAGRAM_SIZE};
 use nethernet::protocol::{Signal, SignalType};
-use nethernet::session::{Channel, Session};
+use nethernet::session::{Channel, TurnCredentials};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime};
@@ -59,8 +60,8 @@ pub enum NetherClientEvent {
 pub struct NetherClient {
     signaler: LanSignaler,
     socket: UdpSocket,
-    pool: SessionPool<()>,
-    session_local_addr: SocketAddr,
+    transport: Option<Outbound>,
+    ice_config: Option<ClientIceConfig>,
     connected: bool,
     connecting_deadline: Option<Instant>,
     answered: bool,
@@ -73,8 +74,7 @@ pub struct NetherClient {
     rtt: Option<Duration>,
     identity: Option<ServerIdentity>,
     server_trust: Option<TokenTrust>,
-    received: VecDeque<Box<[u8]>>,
-    received_unreliable: VecDeque<Box<[u8]>>,
+    received: Received,
     events: VecDeque<NetherClientEvent>,
     buf: Box<[u8]>,
 }
@@ -98,13 +98,11 @@ impl NetherClient {
         socket.set_nonblocking(true)?;
         socket.set_broadcast(true)?;
 
-        let (session_socket, session_local_addr) = bind_shared_socket()?;
-
         Ok(Self {
             signaler: LanSignaler::new(network_id, config),
             socket,
-            pool: SessionPool::new(session_socket),
-            session_local_addr,
+            transport: None,
+            ice_config: None,
             connected: false,
             connecting_deadline: None,
             answered: false,
@@ -117,8 +115,7 @@ impl NetherClient {
             rtt: None,
             identity: None,
             server_trust: None,
-            received: VecDeque::new(),
-            received_unreliable: VecDeque::new(),
+            received: Received::default(),
             events: VecDeque::new(),
             buf: vec![0u8; MAX_DATAGRAM_SIZE].into_boxed_slice(),
         })
@@ -131,6 +128,25 @@ impl NetherClient {
     /// Signs outgoing offers with this identity.
     pub fn set_identity(&mut self, identity: ServerIdentity) {
         self.identity = Some(identity);
+    }
+
+    /// Configures numeric UDP STUN/TURN for subsequent attempts. LAN signaling sends candidates incrementally.
+    /// `None` preserves host-only operation; each attempt owns an exclusive UDP socket.
+    pub fn set_ice_config(&mut self, config: Option<ClientIceConfig>) {
+        self.ice_config = config;
+    }
+
+    /// Renews an active allocation's password with the original absolute monotonic expiry.
+    /// A different username needs a fresh connection. Configuration for retries is changed separately.
+    pub fn update_turn_credentials(
+        &mut self,
+        server: SocketAddr,
+        credentials: TurnCredentials,
+    ) -> Result<(), nethernet::error::ProtocolError> {
+        self.transport
+            .as_mut()
+            .ok_or_else(|| nethernet::error::ProtocolError::Other("not connected".into()))?
+            .update_turn_credentials(server, credentials, Instant::now())
     }
 
     /// How the server's answer is authenticated; `None`, the default, accepts any answer.
@@ -162,6 +178,13 @@ impl NetherClient {
 
     /// Starts negotiating; Connected follows once the data channels open.
     pub fn connect(&mut self, target_network_id: u64) -> std::io::Result<()> {
+        self.transport = None;
+        self.connected = false;
+        self.ready = false;
+        self.connecting_deadline = None;
+        self.remote_addr = None;
+        self.rtt = None;
+        self.received = Received::default();
         self.target = target_network_id;
         self.attempts_left = self.attempts.max(1);
         self.begin_attempt()
@@ -169,24 +192,12 @@ impl NetherClient {
 
     fn begin_attempt(&mut self) -> std::io::Result<()> {
         self.attempts_left = self.attempts_left.saturating_sub(1);
-        let (mut session, description) = Session::new(
-            self.session_local_addr,
-            true,
-            rand::random(),
-            Instant::now(),
-        )
-        .map_err(std::io::Error::other)?;
-        session.set_establish_deadline(self.timeouts.establish());
-        let local_ufrag = description.ice.ufrag.clone();
-
-        let connection_id = rand::random::<u64>();
-        let (connection, signals) = Connection::connect(
-            session,
-            description,
-            connection_id,
-            self.target.to_string(),
-            IceMode::Trickle,
-        );
+        let now = Instant::now();
+        let mut transport =
+            Outbound::new(self.ice_config.as_ref(), self.timeouts.establish(), now)?;
+        let signals = transport
+            .connect(rand::random(), self.target.to_string(), IceMode::Trickle)
+            .map_err(std::io::Error::other)?;
 
         let now = Instant::now();
         for mut signal in signals {
@@ -195,13 +206,12 @@ impl NetherClient {
                     .augment(&signal.data, SystemTime::now())
                     .map_err(std::io::Error::other)?;
             }
-            let _ = self.signaler.handle(LanSignalerInput::Signal(signal, now));
+            self.signaler
+                .handle(LanSignalerInput::Signal(signal, now))
+                .map_err(std::io::Error::other)?;
         }
 
-        if self.connected {
-            self.pool.remove(());
-        }
-        self.pool.add((), connection, local_ufrag);
+        self.transport = Some(transport);
         self.connected = true;
         self.connecting_deadline = Some(now + self.timeouts.negotiation);
         self.answered = false;
@@ -212,9 +222,10 @@ impl NetherClient {
     }
 
     pub fn disconnect(&mut self) {
+        self.received = Received::default();
         self.connecting_deadline = None;
         if self.connected {
-            self.pool.remove(());
+            self.transport = None;
             self.connected = false;
         }
         if self.ready {
@@ -243,16 +254,18 @@ impl NetherClient {
                 "not connected".to_string(),
             ));
         }
-        self.pool.send((), channel, data.into());
-        Ok(())
+        self.transport
+            .as_mut()
+            .ok_or_else(|| nethernet::error::ProtocolError::Other("not connected".into()))?
+            .send(channel, data, Instant::now())
     }
 
     pub fn recv(&mut self) -> Option<Box<[u8]>> {
-        self.received.pop_front()
+        self.received.pop(Channel::Reliable)
     }
 
     pub fn recv_unreliable(&mut self) -> Option<Box<[u8]>> {
-        self.received_unreliable.pop_front()
+        self.received.pop(Channel::Unreliable)
     }
 
     pub fn next_event(&mut self) -> Option<NetherClientEvent> {
@@ -288,10 +301,42 @@ impl NetherClient {
             return;
         }
 
-        let mut events = Vec::new();
-        self.pool.drive(&mut events);
-
-        for ((), event) in events {
+        if self
+            .connecting_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            if !self.answered && self.attempts_left > 0 {
+                self.transport = None;
+                if self.begin_attempt().is_ok() {
+                    return;
+                }
+            }
+            self.fail_connection();
+            return;
+        }
+        if self
+            .transport
+            .as_mut()
+            .is_some_and(|transport| transport.update(now).is_err())
+        {
+            self.fail_connection();
+            return;
+        }
+        while let Some(signal) = self
+            .transport
+            .as_mut()
+            .and_then(Outbound::poll_local_signal)
+        {
+            if self
+                .signaler
+                .handle(LanSignalerInput::Signal(signal, now))
+                .is_err()
+            {
+                self.fail_connection();
+                return;
+            }
+        }
+        while let Some(event) = self.transport.as_mut().and_then(Outbound::poll_event) {
             match event {
                 ConnectionEvent::Ready(addr) if !self.ready => {
                     self.ready = true;
@@ -301,33 +346,41 @@ impl NetherClient {
                 }
                 ConnectionEvent::Ready(_) => {}
                 ConnectionEvent::Rtt(rtt) => self.rtt = Some(rtt),
-                ConnectionEvent::Message(Channel::Reliable, data) => self.received.push_back(data),
-                ConnectionEvent::Message(Channel::Unreliable, data) => {
-                    self.received_unreliable.push_back(data)
+                ConnectionEvent::Message(channel, data) => {
+                    if self.received.push(channel, data).is_err() {
+                        self.fail_connection();
+                        return;
+                    }
                 }
                 ConnectionEvent::Failed => {
-                    self.connecting_deadline = None;
-                    self.connected = false;
-                    self.events.push_back(NetherClientEvent::Disconnected);
+                    self.fail_connection();
+                    return;
                 }
             }
-        }
-
-        if let Some(deadline) = self.connecting_deadline
-            && now >= deadline
-        {
-            if !self.answered && self.attempts_left > 0 && self.begin_attempt().is_ok() {
-                return;
-            }
-            self.connecting_deadline = None;
-            self.pool.remove(());
-            self.connected = false;
-            self.events.push_back(NetherClientEvent::Disconnected);
         }
     }
 
+    /// Retires the single attempt and prevents late delivery or timers after failure.
+    fn fail_connection(&mut self) {
+        self.transport = None;
+        self.connecting_deadline = None;
+        self.connected = false;
+        self.ready = false;
+        self.remote_addr = None;
+        self.rtt = None;
+        self.events.push_back(NetherClientEvent::Disconnected);
+    }
+
     fn handle_signal(&mut self, signal: Signal, now: Instant) {
-        if signal.signal_type == SignalType::Offer || !self.connected {
+        if signal.signal_type == SignalType::Offer
+            || !self.connected
+            || signal.network_id != self.target.to_string()
+            || self.transport.as_mut().and_then(Outbound::connection_id)
+                != Some(signal.connection_id)
+            || self
+                .connecting_deadline
+                .is_some_and(|deadline| now >= deadline)
+        {
             return;
         }
         if signal.signal_type == SignalType::Answer
@@ -343,7 +396,7 @@ impl NetherClient {
                 );
                 let _ = self.signaler.handle(LanSignalerInput::Signal(refusal, now));
                 self.connecting_deadline = None;
-                self.pool.remove(());
+                self.transport = None;
                 self.connected = false;
                 self.events.push_back(NetherClientEvent::Disconnected);
             }
@@ -356,6 +409,17 @@ impl NetherClient {
             self.answered = true;
             self.connecting_deadline = Some(now + self.timeouts.establish());
         }
-        self.pool.signal((), &signal);
+        let kind = signal.signal_type;
+        if self
+            .transport
+            .as_mut()
+            .is_some_and(|transport| transport.signal(signal, now).is_err())
+        {
+            if kind == SignalType::Candidate {
+                tracing::debug!("discarding a rejected remote candidate");
+            } else {
+                self.fail_connection();
+            }
+        }
     }
 }

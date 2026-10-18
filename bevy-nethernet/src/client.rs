@@ -431,3 +431,7 @@ impl NetherClient {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client/retirement_tests.rs"]
+mod retirement_tests;

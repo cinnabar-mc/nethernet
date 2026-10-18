@@ -383,7 +383,7 @@ impl Received {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// A frame-driven client owner created only by actual two-channel readiness.
 /// The discovery resource continues driving this exact transport between application calls.

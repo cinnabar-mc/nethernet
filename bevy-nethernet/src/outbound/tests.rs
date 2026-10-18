@@ -280,3 +280,52 @@ fn absolute_credential_expiry_stops_frame_gathering_and_delivery_bounds_count_by
         Some(&b"x"[..])
     );
 }
+
+/// Fills the existing delivery budget with actual reliable peer data, without draining the frame edge.
+/// The callback sends one payload when supplied and advances the original peer on every call.
+pub(crate) fn overflow_real_delivery(
+    transport: &mut Outbound,
+    mut peer: impl FnMut(Option<&[u8]>),
+) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for index in 0..=MAX_RECEIVED_MESSAGES {
+        let payload = (index as u32).to_be_bytes();
+        peer(Some(&payload));
+        loop {
+            peer(None);
+            if let Err(error) = transport.update(Instant::now()) {
+                assert_eq!(error.to_string(), "client receive limit reached");
+                let accepted = transport
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        ConnectionEvent::Message(Channel::Reliable, data) => Some(data.as_ref()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !accepted.is_empty(),
+                    "the actual peer produced no accepted prefix before overflow"
+                );
+                for (index, payload) in accepted.iter().enumerate() {
+                    assert_eq!(*payload, &(index as u32).to_be_bytes());
+                }
+                return accepted.len();
+            }
+            let accepted = transport
+                .events
+                .iter()
+                .filter(|event| matches!(event, ConnectionEvent::Message(Channel::Reliable, _)))
+                .count();
+            if accepted > index {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual peer delivery stalled before its bounded overflow"
+            );
+            std::thread::yield_now();
+        }
+    }
+    panic!("the real peer did not exhaust the existing bounded delivery owner");
+}

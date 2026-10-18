@@ -90,7 +90,16 @@ fn a_ready_session_never_fails_on_the_deadline() {
     }
 }
 
+/// Returns the real pair with handshake outputs already consumed for existing exchange fixtures.
 fn connected_pair() -> (Session<Established>, Session<Established>, Instant) {
+    let (mut offerer, mut answerer, now) = connected_pair_with_pending_ready();
+    while offerer.poll().is_some() {}
+    while answerer.poll().is_some() {}
+    (offerer, answerer, now)
+}
+
+/// Retains each actual Ready output while the same pair completes its wire handshake.
+fn connected_pair_with_pending_ready() -> (Session<Established>, Session<Established>, Instant) {
     let mut now = Instant::now();
 
     let (mut offerer, offer) = Session::new(addr(40100), true, 1, now).unwrap();
@@ -117,8 +126,8 @@ fn connected_pair() -> (Session<Established>, Session<Established>, Instant) {
         ))
         .unwrap();
 
-    let mut offerer_ready = false;
-    let mut answerer_ready = false;
+    let mut offerer_ready = None;
+    let mut answerer_ready = None;
 
     for _ in 0..5000 {
         let mut progressed = false;
@@ -128,7 +137,7 @@ fn connected_pair() -> (Session<Established>, Session<Established>, Instant) {
             progressed = true;
             match output {
                 SessionOutput::Send(data, to) => offerer_outbox.push((data, to)),
-                SessionOutput::Event(SessionEvent::Ready) => offerer_ready = true,
+                output @ SessionOutput::Event(SessionEvent::Ready) => offerer_ready = Some(output),
                 SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                     panic!("session failed unexpectedly")
                 }
@@ -149,7 +158,7 @@ fn connected_pair() -> (Session<Established>, Session<Established>, Instant) {
             progressed = true;
             match output {
                 SessionOutput::Send(data, to) => answerer_outbox.push((data, to)),
-                SessionOutput::Event(SessionEvent::Ready) => answerer_ready = true,
+                output @ SessionOutput::Event(SessionEvent::Ready) => answerer_ready = Some(output),
                 SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                     panic!("session failed unexpectedly")
                 }
@@ -165,7 +174,7 @@ fn connected_pair() -> (Session<Established>, Session<Established>, Instant) {
                 .unwrap();
         }
 
-        if offerer_ready && answerer_ready {
+        if offerer_ready.is_some() && answerer_ready.is_some() {
             break;
         }
 
@@ -176,13 +185,15 @@ fn connected_pair() -> (Session<Established>, Session<Established>, Instant) {
         }
     }
 
-    assert!(offerer_ready, "offerer never became ready");
-    assert!(answerer_ready, "answerer never became ready");
+    assert!(offerer_ready.is_some(), "offerer never became ready");
+    assert!(answerer_ready.is_some(), "answerer never became ready");
     assert_eq!(offerer.remote_addr(), Some(addr(40101)));
     assert_eq!(answerer.remote_addr(), Some(addr(40100)));
 
     while offerer.poll().is_some() {}
     while answerer.poll().is_some() {}
+    offerer.output.push_back(offerer_ready.unwrap());
+    answerer.output.push_back(answerer_ready.unwrap());
     (
         offerer
             .try_establish()
@@ -803,4 +814,61 @@ fn a_complete_queued_message_survives_a_later_authenticated_closing_packet() {
         SessionOutput::Event(SessionEvent::Failed) | SessionOutput::Wait(..)
     )));
     assert_eq!(receiver.gathering_state(), GatheringState::Closed);
+}
+
+/// Consuming local retirement retains genuine readiness and reliable output that the caller has not polled.
+#[test]
+fn consuming_close_retains_the_actual_ready_and_reliable_output_prefix() {
+    let (mut receiver, mut peer, now) = connected_pair_with_pending_ready();
+    let messages = [b"first accepted".as_slice(), b"second accepted".as_slice()];
+    for message in messages {
+        peer.send(Channel::Reliable, Bytes::copy_from_slice(message), now)
+            .unwrap();
+    }
+    while let Some(output) = peer.poll() {
+        if let SessionOutput::Send(data, to) = output {
+            assert_eq!(to, addr(40100));
+            receiver
+                .handle(SessionInput::Packet(data.into(), addr(40101), now))
+                .unwrap();
+        }
+    }
+    let accepted = receiver
+        .output
+        .iter()
+        .filter_map(|output| match output {
+            SessionOutput::Message(Channel::Reliable, data) => Some(data.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accepted, messages,
+        "the real RTC peer did not produce the accepted prefix"
+    );
+    assert!(matches!(
+        receiver.output.front(),
+        Some(SessionOutput::Event(SessionEvent::Ready))
+    ));
+    let (mut retired, result) = receiver.close(now);
+    result.unwrap();
+    assert!(
+        matches!(
+            retired.poll(),
+            Some(SessionOutput::Event(SessionEvent::Ready))
+        ),
+        "local retirement lost actual pending readiness"
+    );
+    for expected in messages {
+        assert!(
+            matches!(retired.poll(), Some(SessionOutput::Message(Channel::Reliable, data)) if data == expected),
+            "local retirement lost the accepted reliable prefix"
+        );
+    }
+    assert!(
+        !std::iter::from_fn(|| retired.poll()).any(|output| matches!(
+            output,
+            SessionOutput::Message(..) | SessionOutput::Event(SessionEvent::Ready)
+        ))
+    );
+    assert!(retired.poll().is_none());
 }

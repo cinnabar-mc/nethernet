@@ -477,3 +477,35 @@ async fn unique_lifecycle_retirement_preserves_receivers_and_revokes_retained_se
     .await
     .expect("unique lifecycle retirement lost the actual accepted FIFO");
 }
+
+/// The stream reader's unread accepted chunk stays before queued messages when the client is consumed.
+#[tokio::test]
+async fn consuming_client_close_retains_a_partially_read_reliable_message() {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ((sender, _sender_reliable), (receiver, reliable, unreliable)) = connected_pair().await;
+        sender.send(Bytes::from_static(b"abc")).await.unwrap();
+        sender.send(Bytes::from_static(b"later")).await.unwrap();
+        while reliable.rx.len() < 2 {
+            assert!(!receiver.is_closed().await);
+            tokio::task::yield_now().await;
+        }
+        let mut client =
+            crate::transport::NetherClient::from_session(receiver, reliable, unreliable);
+        let mut first = [0; 1];
+        client.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"a");
+        let mut retired = client.close();
+        assert_eq!(
+            retired.reliable.recv().await.unwrap().unwrap(),
+            "bc",
+            "consuming close discarded the stream reader's accepted remainder"
+        );
+        assert_eq!(retired.reliable.recv().await.unwrap().unwrap(), "later");
+        assert!(retired.reliable.recv().await.unwrap().is_none());
+        assert!(retired.reliable.recv().await.unwrap().is_none());
+        drop(sender.close());
+    })
+    .await
+    .expect("real client retirement did not retain the unread accepted stream chunk");
+}

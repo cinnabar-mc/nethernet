@@ -628,3 +628,7 @@ impl NetherHttpClient {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "http_client/retirement_tests.rs"]
+mod retirement_tests;

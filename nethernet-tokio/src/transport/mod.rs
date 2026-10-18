@@ -34,6 +34,7 @@ pub struct ConnectionConfig {
     pub cancel_token: CancellationToken,
 
     /// Client offers made when negotiation times out; 0 counts as 1.
+    /// Caller-driven signaling always uses one attempt; the application owns retries.
     pub attempts: u32,
 
     /// Signs local SDP: ClientIdentity for offers or ServerIdentity for answers.

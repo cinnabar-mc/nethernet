@@ -106,13 +106,17 @@ impl NetherClient {
     }
 
     /// Offers again with a fresh connection id after a timeout, up to attempts times.
+    /// Caller-driven signaling uses one attempt; its application owns retry policy.
     pub async fn connect_with(
         signaling: impl Into<ClientSignaling>,
         remote_network_id: String,
         config: ConnectionConfig,
     ) -> Result<Self> {
         let signaling: ClientSignaling = signaling.into();
-        let attempts = config.attempts.max(1);
+        let attempts = match &signaling {
+            ClientSignaling::Caller(_) => 1,
+            ClientSignaling::Lan(_) | ClientSignaling::Http(_) => config.attempts.max(1),
+        };
 
         for attempt in 1..=attempts {
             let mut connection_id_bytes = [0u8; 8];
@@ -214,7 +218,7 @@ impl NetherClient {
             None => offer.data,
         };
 
-        let mut signals = signaling.signals();
+        let mut signals = signaling.signals().map_err(|error| (None, error))?;
 
         signaling
             .signal(Signal::offer(

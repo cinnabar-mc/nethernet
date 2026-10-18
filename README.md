@@ -126,3 +126,35 @@ application-owned implementation of that interface.
 ## License
 
 This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+
+## Caller-owned signaling services
+
+`nethernet-tokio::CallerSignaling::new(local_id, remote_id, config)` returns a
+transport backend and a `CallerSignalingDriver`. Create one bridge per concurrent
+connection and poll each driver's `recv` alongside your shared service socket.
+The bridge opens no sockets and starts no tasks or runtime. The Tokio client
+continues to own its UDP socket and connected-session task.
+
+For Player Messaging, `local_id` is the advertised NetherNet ID and `remote_id`
+is the peer's messaging UUID. Submit each request's signal text and original
+`deadline()` to the service, with `requires_peer_receipt()` as the delivery policy.
+Complete it with `SignalDelivery::ServiceAccepted` or `PeerReceived` only after
+the corresponding service evidence arrives. Offers require both service acceptance
+and peer receipt by default. If `request.cancelled()` completes, cancel the service
+handle; a partially written request has an ambiguous outcome and must not be resent
+automatically. Caller signaling makes one connection attempt regardless of the
+convenience client's `attempts` setting.
+
+On receipt, call `driver.try_deliver(sender_uuid, signal_text)` using the
+**authenticated envelope sender**, not its advertised NetherNet ID. Acknowledge
+the original service envelope only after admission succeeds. Incoming queue
+capacity is bounded, and outgoing capacity includes requests held by the caller.
+A second active subscription returns an error. Dropping a subscription discards
+its queued old signals and allows a fresh attempt; dropping the driver closes
+that bridge without closing the shared service socket.
+
+Keep account, messaging UUID, advertised network ID, multiplayer token and P-384
+key ownership in the application. Supply its `SdpIdentity` through
+`ConnectionConfig::identity`; the bridge creates no replacement identity key.
+The current transport gathers only host ICE candidates. Service signaling alone
+does not add STUN/TURN gathering or relay connectivity.

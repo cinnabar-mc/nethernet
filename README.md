@@ -143,6 +143,16 @@ Time and lifetime are explicit inputs; expired identities cannot sign offers.
 `SdpIdentity`. Account authentication, credentials and refresh belong to an
 application-owned implementation of that interface.
 
+For an explicitly authorized service route, `TokenTrust::ServerAnswer(provider)`
+accepts a self-signed ES384 server token or delegates an RS256 token to the supplied
+provider. Both paths verify the token's own detached SDP fingerprint signature.
+An invalid provider token never falls back to self-signed trust. Self-signed server
+token timestamps are not player credential validity; the caller's original
+transport deadline still applies. This mode is accepted only by `verify_answer`,
+not offer admission. It does not authorize a route, authenticate a player, remember
+a key or make a trust choice for the application. `Provider` remains strict, and
+`Any` retains its existing unverified-token behavior.
+
 ## License
 
 This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.

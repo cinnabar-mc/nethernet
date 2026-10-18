@@ -1,9 +1,9 @@
 //! HTTP signaling server polled once per frame, with sessions over a shared UDP socket.
-use crate::connection::{ConnectionEvent, SessionPool};
+use crate::connection::{ConnectionEvent, PoolEvent, Readiness, SessionPool};
 use crate::http_stream::{Drain, HttpStream, ServerTls, Shutdown};
 use crate::http_wire;
 use crate::pending::{PendingLimits, admits_offer};
-use crate::server::NetherSessionId;
+use crate::server::{EstablishedSessionId, NetherSessionId};
 use crate::socket::bind_shared_socket;
 use crate::tcp_wire::Inbound;
 use bevy_app::prelude::*;
@@ -59,7 +59,7 @@ pub struct NetherHttpServerSet;
 /// SessionConnected fires once both data channels are open; SessionDisconnected when the session ends.
 #[derive(Message, Clone, Debug)]
 pub enum NetherHttpServerEvent {
-    SessionConnected(NetherSessionId),
+    SessionConnected(EstablishedSessionId),
     SessionDisconnected(NetherSessionId),
 }
 
@@ -84,7 +84,8 @@ impl TcpConn {
 }
 
 struct SessionEntry {
-    ready: bool,
+    ready: Option<EstablishedSessionId>,
+    readiness: Readiness,
     created: Instant,
     remote_addr: Option<SocketAddr>,
     rtt: Option<Duration>,
@@ -203,33 +204,32 @@ impl NetherHttpServer {
             .handle(HttpSignalerInput::SetTokenTrust(trust));
     }
 
-    pub fn sessions(&self) -> impl Iterator<Item = &NetherSessionId> {
+    pub fn sessions(&self) -> impl Iterator<Item = &EstablishedSessionId> {
         self.sessions
             .iter()
-            .filter(|(_, entry)| entry.ready)
-            .map(|(id, _)| id)
+            .filter_map(|(_, entry)| entry.ready.as_ref())
     }
 
-    pub fn player(&self, id: &NetherSessionId) -> Option<Arc<PlayerInfo>> {
-        self.sessions.get(id)?.player.clone()
+    pub fn player(&self, id: &EstablishedSessionId) -> Option<Arc<PlayerInfo>> {
+        self.established_entry(id)?.player.clone()
     }
 
     /// The Host header of the request that opened the session.
-    pub fn host(&self, id: &NetherSessionId) -> Option<&str> {
-        self.sessions.get(id)?.host.as_deref()
+    pub fn host(&self, id: &EstablishedSessionId) -> Option<&str> {
+        self.established_entry(id)?.host.as_deref()
     }
 
-    pub fn rtt(&self, id: &NetherSessionId) -> Option<Duration> {
-        self.sessions.get(id)?.rtt
+    pub fn rtt(&self, id: &EstablishedSessionId) -> Option<Duration> {
+        self.established_entry(id)?.rtt
     }
 
-    pub fn remote_addr(&self, id: &NetherSessionId) -> Option<SocketAddr> {
-        self.sessions.get(id)?.remote_addr
+    pub fn remote_addr(&self, id: &EstablishedSessionId) -> Option<SocketAddr> {
+        self.established_entry(id)?.remote_addr
     }
 
     pub fn send(
         &mut self,
-        id: &NetherSessionId,
+        id: &EstablishedSessionId,
         data: &[u8],
     ) -> Result<(), nethernet::error::ProtocolError> {
         self.send_on(id, Channel::Reliable, data)
@@ -237,7 +237,7 @@ impl NetherHttpServer {
 
     pub fn send_unreliable(
         &mut self,
-        id: &NetherSessionId,
+        id: &EstablishedSessionId,
         data: &[u8],
     ) -> Result<(), nethernet::error::ProtocolError> {
         self.send_on(id, Channel::Unreliable, data)
@@ -245,16 +245,17 @@ impl NetherHttpServer {
 
     fn send_on(
         &mut self,
-        id: &NetherSessionId,
+        id: &EstablishedSessionId,
         channel: Channel,
         data: &[u8],
     ) -> Result<(), nethernet::error::ProtocolError> {
-        if !self.sessions.contains_key(id) {
+        if self.established_entry(id).is_none() {
             return Err(nethernet::error::ProtocolError::Other(
                 "unknown session".to_string(),
             ));
         }
-        self.pool.send(id.clone(), channel, data.into());
+        self.pool
+            .send(id.id.clone(), id.readiness.clone(), channel, data.into());
         Ok(())
     }
 
@@ -266,7 +267,25 @@ impl NetherHttpServer {
         self.received_unreliable.pop_front()
     }
 
-    pub fn disconnect(&mut self, id: &NetherSessionId) {
+    /// Consumes this local established capability, never a replacement's descriptive id.
+    pub fn disconnect(&mut self, id: EstablishedSessionId) {
+        if self.established_entry(&id).is_some() {
+            self.remove_session(&id.id);
+        }
+    }
+
+    /// Matches the exact original Ready entry before metadata or application send access.
+    fn established_entry(&self, id: &EstablishedSessionId) -> Option<&SessionEntry> {
+        let entry = self.sessions.get(&id.id)?;
+        entry
+            .ready
+            .as_ref()
+            .filter(|current| current.same_entry(id))?;
+        Some(entry)
+    }
+
+    /// Keeps pending retirement internal and separate from established send authority.
+    fn remove_session(&mut self, id: &NetherSessionId) {
         if self.sessions.remove(id).is_some() {
             self.pool.remove(id.clone());
             self.events
@@ -305,7 +324,7 @@ impl NetherHttpServer {
         }
         let establish = self.timeouts.establish();
         self.sessions.retain(|_, entry| {
-            entry.ready || now.saturating_duration_since(entry.created) < establish
+            entry.ready.is_some() || now.saturating_duration_since(entry.created) < establish
         });
     }
 
@@ -488,7 +507,10 @@ impl NetherHttpServer {
                 tracing::warn!("answering joins without an identity; vanilla clients refuse these");
             }
         }
-        let pending = self.sessions.iter().filter(|(_, entry)| !entry.ready);
+        let pending = self
+            .sessions
+            .iter()
+            .filter(|(_, entry)| entry.ready.is_none());
         let pending = pending.map(|(id, _)| id.network_id.as_str());
         if !admits_offer(pending, &offer.network_id, self.pending_limits) {
             tracing::debug!(
@@ -536,11 +558,14 @@ impl NetherHttpServer {
                     network_id: offer.network_id,
                     connection_id: offer.connection_id,
                 };
-                self.pool.add(id.clone(), connection, local_ufrag);
+                let Some(readiness) = self.pool.add(id.clone(), connection, local_ufrag) else {
+                    return;
+                };
                 self.sessions.insert(
                     id,
                     SessionEntry {
-                        ready: false,
+                        ready: None,
+                        readiness,
                         created: now,
                         remote_addr: None,
                         rtt: None,
@@ -564,16 +589,28 @@ impl NetherHttpServer {
         self.pool.drive(&mut events);
 
         let mut failed = Vec::new();
-        for (id, event) in events {
+        for PoolEvent {
+            id,
+            event,
+            readiness,
+        } in events
+        {
             let Some(entry) = self.sessions.get_mut(&id) else {
                 continue;
             };
+            if !entry.readiness.matches(&readiness) {
+                continue;
+            }
             match event {
-                ConnectionEvent::Ready(addr) if !entry.ready => {
-                    entry.ready = true;
+                ConnectionEvent::Ready(addr) if entry.ready.is_none() => {
+                    let capability = EstablishedSessionId {
+                        id: id.clone(),
+                        readiness,
+                    };
+                    entry.ready = Some(capability.clone());
                     entry.remote_addr = addr;
                     self.events
-                        .push_back(NetherHttpServerEvent::SessionConnected(id));
+                        .push_back(NetherHttpServerEvent::SessionConnected(capability));
                 }
                 ConnectionEvent::Ready(_) => {}
                 ConnectionEvent::Rtt(rtt) => entry.rtt = Some(rtt),
@@ -588,7 +625,7 @@ impl NetherHttpServer {
         }
 
         for id in failed {
-            self.disconnect(&id);
+            self.remove_session(&id);
         }
     }
 }

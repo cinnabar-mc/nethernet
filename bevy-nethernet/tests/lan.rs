@@ -45,7 +45,11 @@ fn client_connects_to_server_and_exchanges_data() {
         client.is_connected() && server.sessions().next().is_some()
     }));
 
-    client.send(b"hello from client").unwrap();
+    client
+        .established()
+        .unwrap()
+        .send(b"hello from client")
+        .unwrap();
     let session = server.sessions().next().unwrap().clone();
 
     let received = spin(deadline, || {
@@ -141,7 +145,7 @@ fn a_connected_session_reports_its_address_and_round_trip_time() {
         "server has no remote address"
     );
 
-    client.send(b"ping").unwrap();
+    client.established().unwrap().send(b"ping").unwrap();
     assert!(spin(deadline, || {
         server.update();
         client.update();

@@ -2,7 +2,7 @@
 use crate::connection::ConnectionEvent;
 use crate::http_stream::{ClientTls, Drain, HttpStream};
 use crate::http_wire;
-use crate::outbound::{ClientIceConfig, Outbound, Received};
+use crate::outbound::{ClientIceConfig, EstablishedClient, Outbound, Received};
 use crate::tcp_wire::Inbound;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
@@ -223,7 +223,7 @@ pub struct NetherHttpClient {
     local_network_id: String,
     server_url: String,
     join_target: Option<(JoinTarget, SocketAddr)>,
-    ready: bool,
+    established: Option<EstablishedClient>,
     remote_addr: Option<SocketAddr>,
     rtt: Option<Duration>,
     identity: Option<ServerIdentity>,
@@ -249,7 +249,7 @@ impl Default for NetherHttpClient {
             local_network_id: String::new(),
             server_url: String::new(),
             join_target: None,
-            ready: false,
+            established: None,
             remote_addr: None,
             rtt: None,
             identity: None,
@@ -283,8 +283,7 @@ impl NetherHttpClient {
         server: SocketAddr,
         credentials: TurnCredentials,
     ) -> Result<(), ProtocolError> {
-        self.transport
-            .as_mut()
+        self.transport_mut()
             .ok_or_else(|| ProtocolError::Other("not connected".into()))?
             .update_turn_credentials(server, credentials, Instant::now())
     }
@@ -356,7 +355,7 @@ impl NetherHttpClient {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.ready
+        self.established.is_some()
     }
 
     pub fn rtt(&self) -> Option<Duration> {
@@ -371,12 +370,11 @@ impl NetherHttpClient {
     /// Initial HTTP hostname resolution and TLS configuration are synchronous setup; subsequent frame updates perform neither.
     pub fn connect(&mut self, local_network_id: String, server_url: String) -> std::io::Result<()> {
         self.join = None;
-        self.transport = None;
+        self.retire_transport(false);
         self.gathering = None;
         self.connected = false;
         self.connecting_deadline = None;
         self.join_target = None;
-        self.ready = false;
         self.remote_addr = None;
         self.rtt = None;
         self.received = Received::default();
@@ -389,7 +387,7 @@ impl NetherHttpClient {
         self.attempts_left = self.attempts.max(1);
         if let Err(error) = self.begin_join() {
             self.join = None;
-            self.transport = None;
+            self.retire_transport(false);
             self.gathering = None;
             self.connecting_deadline = None;
             return Err(error);
@@ -417,8 +415,7 @@ impl NetherHttpClient {
     /// Encodes and signs the final Full offer only after the pure core completed gathering.
     fn start_gathered_join(&mut self) -> std::io::Result<()> {
         let complete = self
-            .transport
-            .as_mut()
+            .transport_mut()
             .is_some_and(Outbound::gathering_complete);
         if !complete {
             return Ok(());
@@ -427,11 +424,11 @@ impl NetherHttpClient {
             return Ok(());
         };
         let connection_id = rand::random();
+        let server_url = self.server_url.clone();
         let signals = self
-            .transport
-            .as_mut()
+            .transport_mut()
             .expect("transport checked above")
-            .connect(connection_id, self.server_url.clone(), IceMode::Full)
+            .connect(connection_id, server_url, IceMode::Full)
             .map_err(std::io::Error::other)?;
         let offer = signals
             .into_iter()
@@ -464,45 +461,38 @@ impl NetherHttpClient {
     }
 
     pub fn disconnect(&mut self) {
+        let was_ready = self.established.is_some();
         self.received = Received::default();
         self.join_target = None;
         self.join = None;
-        self.transport = None;
+        self.retire_transport(false);
         self.gathering = None;
         self.connected = false;
         self.connecting_deadline = None;
-        if self.ready {
-            self.ready = false;
+        if was_ready {
             self.remote_addr = None;
             self.rtt = None;
             self.events.push_back(NetherHttpClientEvent::Disconnected);
         }
     }
 
-    pub fn send(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
-        self.send_on(Channel::Reliable, data)
-    }
-
-    pub fn send_unreliable(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
-        self.send_on(Channel::Unreliable, data)
-    }
-
-    fn send_on(&mut self, channel: Channel, data: &[u8]) -> Result<(), ProtocolError> {
-        if !self.connected {
-            return Err(ProtocolError::Other("not connected".to_string()));
-        }
-        self.transport
-            .as_mut()
-            .ok_or_else(|| ProtocolError::Other("not connected".into()))?
-            .send(channel, data, Instant::now())
+    /// Borrows the actual transport owner created by Ready; pending discovery has no send capability.
+    pub fn established(&mut self) -> Option<&mut EstablishedClient> {
+        self.established.as_mut()
     }
 
     pub fn recv(&mut self) -> Option<Box<[u8]>> {
-        self.received.pop(Channel::Reliable)
+        match &mut self.established {
+            Some(entry) => entry.recv(),
+            None => self.received.pop(Channel::Reliable),
+        }
     }
 
     pub fn recv_unreliable(&mut self) -> Option<Box<[u8]>> {
-        self.received.pop(Channel::Unreliable)
+        match &mut self.established {
+            Some(entry) => entry.recv_unreliable(),
+            None => self.received.pop(Channel::Unreliable),
+        }
     }
 
     pub fn next_event(&mut self) -> Option<NetherHttpClientEvent> {
@@ -520,7 +510,7 @@ impl NetherHttpClient {
             if !self.connected && self.attempts_left > 0 {
                 self.join = None;
                 self.gathering = None;
-                self.transport = None;
+                self.retire_transport(false);
                 if self.begin_join().is_ok() {
                     return;
                 }
@@ -529,8 +519,7 @@ impl NetherHttpClient {
             return;
         }
         if self
-            .transport
-            .as_mut()
+            .transport_mut()
             .is_some_and(|transport| transport.update(now).is_err())
         {
             self.fail_connection();
@@ -553,8 +542,7 @@ impl NetherHttpClient {
                     let answer = Signal::answer(attempt.connection_id, body, attempt.server_url);
                     if valid
                         && self
-                            .transport
-                            .as_mut()
+                            .transport_mut()
                             .is_some_and(|transport| transport.signal(answer, now).is_ok())
                     {
                         self.connected = true;
@@ -570,10 +558,17 @@ impl NetherHttpClient {
                 }
             }
         }
-        while let Some(event) = self.transport.as_mut().and_then(Outbound::poll_event) {
+        while let Some(event) = self.transport_mut().and_then(Outbound::poll_event) {
             match event {
-                ConnectionEvent::Ready(addr) if !self.ready => {
-                    self.ready = true;
+                ConnectionEvent::Ready(addr) if self.established.is_none() => {
+                    let transport = self
+                        .transport
+                        .take()
+                        .expect("Ready retains its original pending transport");
+                    self.established = Some(EstablishedClient {
+                        transport,
+                        received: std::mem::take(&mut self.received),
+                    });
                     self.remote_addr = addr;
                     self.connecting_deadline = None;
                     self.events.push_back(NetherHttpClientEvent::Connected);
@@ -581,7 +576,11 @@ impl NetherHttpClient {
                 ConnectionEvent::Ready(_) => {}
                 ConnectionEvent::Rtt(rtt) => self.rtt = Some(rtt),
                 ConnectionEvent::Message(channel, data) => {
-                    if self.received.push(channel, data).is_err() {
+                    let received = match &mut self.established {
+                        Some(entry) => &mut entry.received,
+                        None => &mut self.received,
+                    };
+                    if received.push(channel, data).is_err() {
                         self.fail_connection();
                         return;
                     }
@@ -596,13 +595,12 @@ impl NetherHttpClient {
 
     /// Retires HTTP, socket, allocation and delivery ownership together, reporting one terminal transition.
     fn fail_connection(&mut self) {
-        let was_ready = self.ready;
+        let was_ready = self.established.is_some();
         self.join = None;
         self.gathering = None;
-        self.transport = None;
+        self.retire_transport(true);
         self.connected = false;
         self.connecting_deadline = None;
-        self.ready = false;
         self.remote_addr = None;
         self.rtt = None;
         self.events.push_back(if was_ready {
@@ -610,5 +608,23 @@ impl NetherHttpClient {
         } else {
             NetherHttpClientEvent::ConnectFailed
         });
+    }
+    /// Drives the same exclusive socket in either phase; only the ready entry exposes send publicly.
+    fn transport_mut(&mut self) -> Option<&mut Outbound> {
+        match &mut self.established {
+            Some(entry) => Some(&mut entry.transport),
+            None => self.transport.as_mut(),
+        }
+    }
+
+    /// Consumes the actual ready owner, retaining accepted data only for retrospective failure reads.
+    fn retire_transport(&mut self, retain_received: bool) {
+        self.transport = None;
+        if let Some(entry) = self.established.take() {
+            let received = entry.close();
+            if retain_received {
+                self.received = received;
+            }
+        }
     }
 }

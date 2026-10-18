@@ -1,5 +1,6 @@
 //! One NetherNet connection: a session plus offer, answer and candidate signal handling.
 use crate::error::ProtocolError;
+use crate::phase::{Connecting, Established, Live, Phase, Retired};
 use crate::protocol::webrtc::Description;
 use crate::protocol::webrtc::candidate::{format_ice_candidate, parse_ice_candidate};
 use crate::protocol::{Signal, SignalType};
@@ -25,8 +26,17 @@ enum SignalKind {
 }
 
 /// A session bound to one connection id and remote network id; signals for any other pair are ignored.
-pub struct Connection {
-    session: Session,
+/// Application sending requires the owned transition after actual session readiness.
+///
+/// ```compile_fail
+/// use nethernet::{connection::Connection, phase::Connecting, session::Channel};
+/// fn pending(connection: &mut Connection<Connecting>, now: std::time::Instant) {
+///     connection.send(Channel::Reliable, bytes::Bytes::new(), now);
+/// }
+/// ```
+#[must_use = "retain the connection owner through retirement and drain its output"]
+pub struct Connection<S: Phase = Connecting> {
+    session: Session<S>,
     connection_id: u64,
     remote_network_id: String,
     remote_identity: Option<String>,
@@ -35,7 +45,7 @@ pub struct Connection {
     next_candidate_index: usize,
 }
 
-impl Connection {
+impl Connection<Connecting> {
     pub fn connect(
         mut session: Session,
         description: Description,
@@ -155,6 +165,39 @@ impl Connection {
         }
     }
 
+    /// Transfers this exact connection only after both channels became ready.
+    #[allow(
+        clippy::result_large_err,
+        reason = "returns the original pending allocation without boxing"
+    )]
+    pub fn try_establish(self) -> Result<Connection<Established>, Self> {
+        if self.session.became_ready() {
+            Ok(self.rephase())
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl<S: Phase> Connection<S> {
+    /// Moves the existing allocation, correlation and output owner without protocol work.
+    fn rephase<T: Phase>(self) -> Connection<T> {
+        Connection {
+            session: self.session.rephase(),
+            connection_id: self.connection_id,
+            remote_network_id: self.remote_network_id,
+            remote_identity: self.remote_identity,
+            ice_mode: self.ice_mode,
+            local_ufrag: self.local_ufrag,
+            next_candidate_index: self.next_candidate_index,
+        }
+    }
+
+    /// Drains the same original accepted prefix and transport work in every phase.
+    pub fn poll(&mut self) -> Option<SessionOutput> {
+        self.session.poll()
+    }
+
     fn describe(
         session: &Session,
         description: &Description,
@@ -186,7 +229,10 @@ impl Connection {
         signals
     }
 
-    fn handle_signal(&mut self, signal: &Signal, now: Instant) -> Result<(), ProtocolError> {
+    fn handle_signal(&mut self, signal: &Signal, now: Instant) -> Result<(), ProtocolError>
+    where
+        S: Live,
+    {
         if signal.connection_id != self.connection_id || signal.network_id != self.remote_network_id
         {
             return Ok(());
@@ -237,7 +283,10 @@ impl Connection {
     }
 
     /// One candidate gathered after the initial signals. The runtime sends it through the same signaling owner.
-    pub fn poll_local_signal(&mut self) -> Option<Signal> {
+    pub fn poll_local_signal(&mut self) -> Option<Signal>
+    where
+        S: Live,
+    {
         if self.ice_mode != IceMode::Trickle {
             return None;
         }
@@ -252,8 +301,23 @@ impl Connection {
     }
 
     /// Cancels all transport timers and queues best-effort relay deallocation sends.
-    pub fn close(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        self.session.close(now)
+    pub fn close(self, now: Instant) -> (Connection<Retired>, Result<(), ProtocolError>)
+    where
+        S: Live,
+    {
+        let (session, result) = self.session.close(now);
+        (
+            Connection {
+                session,
+                connection_id: self.connection_id,
+                remote_network_id: self.remote_network_id,
+                remote_identity: self.remote_identity,
+                ice_mode: self.ice_mode,
+                local_ufrag: self.local_ufrag,
+                next_candidate_index: self.next_candidate_index,
+            },
+            result,
+        )
     }
 
     /// Rotates one TURN allocation's credential using the caller's clock.
@@ -262,7 +326,10 @@ impl Connection {
         server: SocketAddr,
         credentials: crate::session::TurnCredentials,
         now: Instant,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), ProtocolError>
+    where
+        S: Live,
+    {
         self.session
             .update_turn_credentials(server, credentials, now)
     }
@@ -274,11 +341,21 @@ pub enum ConnectionInput {
     Timeout(Instant),
 
     Signal(Signal, Instant),
-
-    Send(Channel, Bytes, Instant),
 }
 
-impl Sans for Connection {
+impl Connection<Established> {
+    /// Admits a message through this connection's original established session.
+    pub fn send(
+        &mut self,
+        channel: Channel,
+        data: Bytes,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        self.session.send(channel, data, now)
+    }
+}
+
+impl<S: Live> Sans for Connection<S> {
     type Input = ConnectionInput;
     type Output = SessionOutput;
     type Error = ProtocolError;
@@ -290,9 +367,6 @@ impl Sans for Connection {
             }
             ConnectionInput::Timeout(now) => self.session.handle(SessionInput::Timeout(now)),
             ConnectionInput::Signal(signal, now) => self.handle_signal(&signal, now),
-            ConnectionInput::Send(channel, data, now) => {
-                self.session.handle(SessionInput::Send(channel, data, now))
-            }
         }
     }
 

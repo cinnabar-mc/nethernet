@@ -110,11 +110,11 @@ async fn exercise_handoff(case: HandoffCase) {
             mut rtc,
             answer,
         } = pending_peer().await;
-        let session = answered.accepted.session.clone();
+        let closed = answered.accepted.session.close_token();
+        let commands = answered.accepted.session.signal_sender();
         let deadline = answered.deadline;
         let listener = owner.listener.clone();
         if matches!(case, HandoffCase::CandidateBlocked) {
-            let commands = session.signal_sender();
             while commands.capacity() != 0 {
                 let (reply, _) = oneshot::channel();
                 commands.try_send(Command::Rtt(reply)).unwrap();
@@ -131,7 +131,7 @@ async fn exercise_handoff(case: HandoffCase) {
             );
         }
         if matches!(case, HandoffCase::NeverReady) {
-            session.close().await.unwrap();
+            closed.cancel();
         } else {
             rtc.apply_answer(answer);
             while !rtc.both_ready() {
@@ -145,7 +145,7 @@ async fn exercise_handoff(case: HandoffCase) {
             }
             // Actual SCTP acknowledgments prove the prefix entered the real receive owner.
             rtc.close_dtls().await;
-            session.closed().await;
+            closed.cancelled().await;
         }
         match case {
             HandoffCase::ListenerRetired => listener.cancel(),

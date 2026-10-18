@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("✅ Large packet echoed back ({} bytes)", response.len());
 
     tracing::info!("👋 Closing connection...");
-    stream.close().await?;
+    let _retired = stream.close();
     tracing::info!("✅ Connection closed");
 
     Ok(())

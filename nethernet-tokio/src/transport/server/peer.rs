@@ -2,6 +2,7 @@
 use crate::addr::Addr;
 use crate::error::{NetherError, SignalErrorCode};
 use crate::protocol::Signal;
+use crate::session::Ready;
 use crate::session::guard::{GatheringGuard, transport_now};
 use crate::session::outgoing::CandidateSignaling;
 use crate::session::{AcceptedSession, Command, ServerLease, ServerRetirement, Session};
@@ -10,6 +11,7 @@ use crate::transport::{ConnectionConfig, local_bind_addr, pending::PendingSlot};
 use futures::{FutureExt, future::Shared};
 use nethernet::admission::OfferPolicy;
 use nethernet::connection::IceMode;
+use nethernet::phase::Connecting;
 use nethernet::session::Session as SansSession;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -30,9 +32,9 @@ pub(super) struct Peer {
 }
 
 struct Answered {
-    accepted: AcceptedSession,
+    accepted: AcceptedSession<Connecting>,
     // Retains the actor's exact outcome across dispatch and handoff suspension.
-    ready: Shared<oneshot::Receiver<()>>,
+    ready: Shared<oneshot::Receiver<Ready>>,
     deadline: Instant,
     retirement: ServerRetirement,
 }
@@ -137,7 +139,7 @@ impl Peer {
         let commands = accepted.session.signal_sender();
         // Reserve capacity alongside Ready rather than hiding it behind a blocked send.
         let mut pending = None;
-        loop {
+        let established = loop {
             tokio::select! {
                 biased;
                 _ = self.listener.cancelled() => return Err(closed()),
@@ -145,9 +147,9 @@ impl Peer {
                 _ = self.stop.cancelled() => { close.cancel(); return Err(closed()); },
                 _ = tokio::time::sleep_until(deadline.into()) => return Err(timeout()),
                 result = ready.clone() => {
-                    result.map_err(|_| closed())?;
+                    let witness = result.map_err(|_| closed())?;
                     if transport_now() >= deadline { return Err(timeout()); }
-                    break;
+                    break accepted.establish(witness);
                 }
                 _ = close.cancelled() => return Err(closed()),
                 permit = commands.reserve(), if pending.is_some() => {
@@ -158,7 +160,7 @@ impl Peer {
                     pending = Some(signal.ok_or_else(closed)?);
                 }
             }
-        }
+        };
         if self.listener.is_cancelled()
             || self.config.cancel_token.is_cancelled()
             || self.stop.is_cancelled()
@@ -169,7 +171,7 @@ impl Peer {
             return Err(timeout());
         }
         drop(slot);
-        self.incoming.try_send(accepted).map_err(|_| closed())?;
+        self.incoming.try_send(established).map_err(|_| closed())?;
         Ok(Forwarding {
             commands,
             close,
@@ -277,14 +279,15 @@ impl Peer {
             enabled: Some(candidates_enabled.clone()),
             service_closed: self.signaling.service_closed(),
         };
-        let (session, reliable, unreliable, ready) = Session::spawn_for_server_with_signaling(
-            socket,
-            answered.connection,
-            local,
-            remote,
-            lease,
-            candidate_signaling,
-        );
+        let (session, reliable, unreliable, ready) =
+            Session::<Connecting>::spawn_for_server_with_signaling(
+                socket,
+                answered.connection,
+                local,
+                remote,
+                lease,
+                candidate_signaling,
+            );
         let retirement = session.server_retirement();
         // Cache only the actual actor result; dispatch and handoff may each resume after its close.
         let ready = ready.shared();

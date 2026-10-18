@@ -164,7 +164,11 @@ fn a_client_joins_over_https_and_exchanges_data() {
         client.is_connected() && server.sessions().next().is_some()
     }));
 
-    client.send(b"hello over https").unwrap();
+    client
+        .established()
+        .unwrap()
+        .send(b"hello over https")
+        .unwrap();
     assert!(spin(deadline, || {
         server.update();
         client.update();

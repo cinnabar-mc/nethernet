@@ -1,5 +1,5 @@
 //! One outbound UDP transport, advanced by the caller's frame rather than a worker runtime.
-use crate::connection::ConnectionEvent;
+use crate::connection::{ActiveConnection, ConnectionEvent};
 use crate::socket::bind_shared_socket;
 use bevy_platform::cell::SyncCell;
 use nethernet::connection::{Connection, ConnectionInput, IceMode};
@@ -35,7 +35,7 @@ pub struct ClientIceConfig {
 
 enum State {
     Gathering(Session, Description),
-    Connected(Connection),
+    Connected(ActiveConnection),
 }
 
 /// Exclusive ownership avoids sharing a TURN allocation transport tuple between sessions.
@@ -111,7 +111,7 @@ impl Outbound {
             return Err(ProtocolError::Other("offer already created".into()));
         };
         let (connection, signals) = Connection::connect(session, description, id, remote, mode);
-        *self.state.get() = Some(State::Connected(connection));
+        *self.state.get() = Some(State::Connected(ActiveConnection::new(connection)));
         Ok(signals)
     }
 
@@ -277,7 +277,7 @@ impl Outbound {
         }
         let result = match self.state.get() {
             Some(State::Connected(connection)) => {
-                connection.handle(ConnectionInput::Send(channel, data.to_vec().into(), now))
+                connection.send(channel, data.to_vec().into(), now)
             }
             _ => Err(ProtocolError::Other("not connected".into())),
         };
@@ -305,22 +305,31 @@ impl Outbound {
 
     /// Stops all timers, discards application work and attempts finite best-effort relay release.
     fn close(&mut self, now: Instant) {
-        if let Some(mut state) = self.state.get().take() {
-            let _ = match &mut state {
-                State::Gathering(session, _) => session.close(now),
-                State::Connected(connection) => connection.close(now),
-            };
-            for _ in 0..MAX_OUTPUTS_PER_UPDATE {
-                let output = match &mut state {
-                    State::Gathering(session, _) => session.poll(),
-                    State::Connected(connection) => connection.poll(),
-                };
-                match output {
-                    Some(SessionOutput::Send(data, to)) => {
-                        let _ = self.socket.send_to(&data, to);
+        if let Some(state) = self.state.get().take() {
+            match state {
+                State::Gathering(session, _) => {
+                    let (mut retired, _result) = session.close(now);
+                    for _ in 0..MAX_OUTPUTS_PER_UPDATE {
+                        match retired.poll() {
+                            Some(SessionOutput::Send(data, to)) => {
+                                let _ = self.socket.send_to(&data, to);
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
                     }
-                    Some(_) => {}
-                    None => break,
+                }
+                State::Connected(connection) => {
+                    let (mut retired, _result) = connection.close(now);
+                    for _ in 0..MAX_OUTPUTS_PER_UPDATE {
+                        match retired.poll() {
+                            Some(SessionOutput::Send(data, to)) => {
+                                let _ = self.socket.send_to(&data, to);
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
                 }
             }
         }
@@ -375,3 +384,35 @@ impl Received {
 
 #[cfg(test)]
 mod tests;
+
+/// A frame-driven client owner created only by actual two-channel readiness.
+/// The discovery resource continues driving this exact transport between application calls.
+pub struct EstablishedClient {
+    pub(crate) transport: Outbound,
+    pub(crate) received: Received,
+}
+
+impl EstablishedClient {
+    /// Admits reliable data on the actual established core.
+    pub fn send(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
+        self.transport.send(Channel::Reliable, data, Instant::now())
+    }
+    /// Admits one unreliable message on the actual established core.
+    pub fn send_unreliable(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
+        self.transport
+            .send(Channel::Unreliable, data, Instant::now())
+    }
+    /// Drains accepted reliable messages in their original order.
+    pub fn recv(&mut self) -> Option<Box<[u8]>> {
+        self.received.pop(Channel::Reliable)
+    }
+    /// Drains accepted unreliable messages.
+    pub fn recv_unreliable(&mut self) -> Option<Box<[u8]>> {
+        self.received.pop(Channel::Unreliable)
+    }
+    /// Consumes local transport ownership while retaining accepted messages for retrospective draining.
+    pub(crate) fn close(mut self) -> Received {
+        self.transport.close(Instant::now());
+        std::mem::take(&mut self.received)
+    }
+}

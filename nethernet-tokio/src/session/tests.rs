@@ -53,9 +53,9 @@ async fn connected_pair_with_server_signaling(
     a.handle(ConnectionInput::Signal(answers[0].clone(), now))
         .unwrap();
     let (a, a_reliable, _a_unreliable, a_ready) =
-        Session::spawn(sockets[0].clone(), a, Addr::default(), Addr::default());
+        Session::<Connecting>::spawn(sockets[0].clone(), a, Addr::default(), Addr::default());
     let (b, b_reliable, b_unreliable, b_ready) = match (server, signaling) {
-        (Some(lease), Some(signaling)) => Session::spawn_for_server_with_signaling(
+        (Some(lease), Some(signaling)) => Session::<Connecting>::spawn_for_server_with_signaling(
             sockets[1].clone(),
             b,
             Addr::default(),
@@ -63,18 +63,20 @@ async fn connected_pair_with_server_signaling(
             lease,
             signaling,
         ),
-        (Some(lease), None) => Session::spawn_for_server(
+        (Some(lease), None) => Session::<Connecting>::spawn_for_server(
             sockets[1].clone(),
             b,
             Addr::default(),
             Addr::default(),
             lease,
         ),
-        (None, None) => Session::spawn(sockets[1].clone(), b, Addr::default(), Addr::default()),
+        (None, None) => {
+            Session::<Connecting>::spawn(sockets[1].clone(), b, Addr::default(), Addr::default())
+        }
         (None, Some(_)) => unreachable!("server signaling fixture requires its real lease"),
     };
-    a_ready.await.unwrap();
-    b_ready.await.unwrap();
+    let a = a.establish(a_ready.await.unwrap());
+    let b = b.establish(b_ready.await.unwrap());
     ((a, a_reliable), (b, b_reliable, b_unreliable))
 }
 
@@ -93,7 +95,7 @@ async fn a_ready_server_session_can_transfer_its_accepted_fifo_after_transport_c
             assert!(!receiver.is_closed().await);
             tokio::task::yield_now().await;
         }
-        receiver.close().await.unwrap();
+        receiver.sender().close().await.unwrap();
         assert!(
             receiver.accept_from_server(),
             "a ready queued peer must retain its accepted data and terminal"
@@ -105,7 +107,7 @@ async fn a_ready_server_session_can_transfer_its_accepted_fifo_after_transport_c
             0,
             "transferring a closed receiver does not retire its capacity"
         );
-        sender.close().await.unwrap();
+        sender.sender().close().await.unwrap();
     })
     .await
     .expect("queued ready peer lost its accepted FIFO after closure");
@@ -117,7 +119,7 @@ async fn synchronous_close_retires_retained_handles_after_the_accepted_fifo() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let ((sender, _sender_reliable), (receiver, mut reliable, _unreliable)) =
             connected_pair().await;
-        let retained = receiver.clone();
+        let retained = receiver.sender();
         for message in [b"accepted first".as_slice(), b"accepted second".as_slice()] {
             sender.send(Bytes::copy_from_slice(message)).await.unwrap();
         }
@@ -125,8 +127,8 @@ async fn synchronous_close_retires_retained_handles_after_the_accepted_fifo() {
             assert!(!receiver.is_closed().await);
             tokio::task::yield_now().await;
         }
-        receiver.start_close();
-        receiver.start_close();
+        receiver.sender().start_close();
+        receiver.sender().start_close();
         drop(receiver);
         assert!(retained.is_closed().await);
         assert_eq!(reliable.recv().await.unwrap().unwrap(), "accepted first");
@@ -138,7 +140,7 @@ async fn synchronous_close_retires_retained_handles_after_the_accepted_fifo() {
                 .await
                 .is_err()
         );
-        sender.close().await.unwrap();
+        sender.sender().close().await.unwrap();
     })
     .await
     .expect("synchronous retirement lost accepted data or actor shutdown");
@@ -162,8 +164,8 @@ async fn concurrent_sends_wait_outside_the_bounded_real_session_command_queue() 
             "concurrent sends must retain excess payloads at their caller, not in an unbounded actor queue"
         );
         drop(held);
-        sender.close().await.unwrap();
-        receiver.close().await.unwrap();
+        sender.sender().close().await.unwrap();
+        receiver.sender().close().await.unwrap();
     })
     .await
     .expect("actual bounded-command fixture failed to establish");
@@ -206,8 +208,8 @@ async fn a_full_reliable_receiver_keeps_the_session_alive_and_preserves_order() 
                 &(index as u32).to_be_bytes()
             );
         }
-        sender.close().await.unwrap();
-        receiver.close().await.unwrap();
+        sender.sender().close().await.unwrap();
+        receiver.sender().close().await.unwrap();
     })
     .await
     .expect("backpressured session stalled or lost reliable messages");
@@ -237,7 +239,7 @@ async fn a_reliable_receive_overflow_delivers_its_accepted_prefix_before_an_erro
             Err(NetherError::ReceiveCapacity)
         ));
         assert!(reliable.recv().await.unwrap().is_none());
-        sender.close().await.unwrap();
+        sender.sender().close().await.unwrap();
     })
     .await
     .expect("receive overflow failed to retain its accepted prefix and terminal error");
@@ -258,7 +260,7 @@ async fn local_cancel_and_driver_abort_retain_accepted_data_with_distinct_outcom
             if abort {
                 reliable._guard.task.abort();
             } else {
-                receiver.close().await.unwrap();
+                receiver.sender().close().await.unwrap();
             }
             receiver.closed().await;
             assert_eq!(reliable.recv().await.unwrap().unwrap(), payload);
@@ -269,7 +271,7 @@ async fn local_cancel_and_driver_abort_retain_accepted_data_with_distinct_outcom
                 ));
             }
             assert!(reliable.recv().await.unwrap().is_none());
-            sender.close().await.unwrap();
+            sender.sender().close().await.unwrap();
         }
     })
     .await
@@ -288,6 +290,7 @@ async fn an_expired_queued_send_is_refused_before_sctp_admission() {
         // early check in the public method or a surrounding timeout future.
         let (reply, result) = oneshot::channel();
         sender
+            .handle()
             .command_tx
             .send(Command::Send(
                 Channel::Reliable,
@@ -301,6 +304,7 @@ async fn an_expired_queued_send_is_refused_before_sctp_admission() {
         let (reply, result) = oneshot::channel();
         drop(result);
         sender
+            .handle()
             .command_tx
             .send(Command::Send(
                 Channel::Reliable,
@@ -323,8 +327,8 @@ async fn an_expired_queued_send_is_refused_before_sctp_admission() {
             .await
             .unwrap();
         assert_eq!(reliable.recv().await.unwrap().unwrap(), "timely Login");
-        sender.close().await.unwrap();
-        receiver.close().await.unwrap();
+        sender.sender().close().await.unwrap();
+        receiver.sender().close().await.unwrap();
     })
     .await
     .expect("send admission deadline regression stalled");
@@ -346,7 +350,7 @@ async fn accepted_reliable_tail_survives_authenticated_peer_close_before_receive
         ))
         .unwrap();
         let (session, mut reliable, _unreliable, mut ready) =
-            Session::spawn(socket, core, Addr::default(), Addr::default());
+            Session::<Connecting>::spawn(socket, core, Addr::default(), Addr::default());
         let mut established = false;
         while !established || !peer.ready() {
             tokio::select! {
@@ -429,8 +433,47 @@ async fn caller_server_service_closure_preserves_accepted_fifo_before_one_error(
         ));
         assert!(reliable.recv().await.unwrap().is_none());
         assert_eq!(capacity.available_permits(), 0);
-        sender.close().await.unwrap();
+        sender.sender().close().await.unwrap();
     })
     .await
     .expect("actual caller service retirement lost its accepted FIFO");
+}
+
+/// Consuming or dropping the unique owner retires the actual actor while other capabilities retain FIFO.
+#[tokio::test]
+async fn unique_lifecycle_retirement_preserves_receivers_and_revokes_retained_senders() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for consume_close in [false, true] {
+            let ((sender, _sender_reliable), (receiver, mut reliable, _unreliable)) =
+                connected_pair().await;
+            let retained = receiver.sender();
+            for payload in [b"first accepted".as_slice(), b"second accepted".as_slice()] {
+                sender.send(Bytes::copy_from_slice(payload)).await.unwrap();
+            }
+            while reliable.rx.len() < 2 {
+                assert!(!receiver.is_closed().await);
+                tokio::task::yield_now().await;
+            }
+            let retired = if consume_close {
+                Some(receiver.close())
+            } else {
+                drop(receiver);
+                None
+            };
+            assert!(retained.is_closed().await);
+            assert!(
+                retained
+                    .send(Bytes::from_static(b"after local retirement"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(reliable.recv().await.unwrap().unwrap(), "first accepted");
+            assert_eq!(reliable.recv().await.unwrap().unwrap(), "second accepted");
+            assert!(reliable.recv().await.unwrap().is_none());
+            drop(retired);
+            drop(sender.close());
+        }
+    })
+    .await
+    .expect("unique lifecycle retirement lost the actual accepted FIFO");
 }

@@ -21,10 +21,11 @@ pub mod prelude {
     pub use crate::http_server::{
         NetherHttpServer, NetherHttpServerEvent, NetherHttpServerPlugin, NetherHttpServerSet,
     };
-    pub use crate::outbound::ClientIceConfig;
+    pub use crate::outbound::{ClientIceConfig, EstablishedClient};
     pub use crate::pending::PendingLimits;
     pub use crate::server::{
-        NetherServer, NetherServerEvent, NetherServerPlugin, NetherServerSet, NetherSessionId,
+        EstablishedSessionId, NetherServer, NetherServerEvent, NetherServerPlugin, NetherServerSet,
+        NetherSessionId,
     };
     pub use nethernet::prelude::{
         HttpSignalerConfig, LanSignalerConfig, ServerData, ServerIdentity,

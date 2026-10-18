@@ -121,20 +121,24 @@ async fn peer_checks_before_handoff(mode: IceMode, answer_before_check: bool) {
     negotiation
         .await
         .expect("negotiation could not finish after the receipt and answer arrived");
-    let (client, mut client_reliable, _client_unreliable, client_ready) = RuntimeSession::spawn(
-        Arc::new(client_socket),
-        client,
-        Addr::default(),
-        Addr::default(),
-    );
-    let (peer, mut peer_reliable, _peer_unreliable, peer_ready) = RuntimeSession::spawn(
-        Arc::new(peer_socket),
-        peer,
-        Addr::default(),
-        Addr::default(),
-    );
-    tokio::try_join!(client_ready, peer_ready)
+    let (client, mut client_reliable, _client_unreliable, client_ready) =
+        RuntimeSession::<nethernet::phase::Connecting>::spawn(
+            Arc::new(client_socket),
+            client,
+            Addr::default(),
+            Addr::default(),
+        );
+    let (peer, mut peer_reliable, _peer_unreliable, peer_ready) =
+        RuntimeSession::<nethernet::phase::Connecting>::spawn(
+            Arc::new(peer_socket),
+            peer,
+            Addr::default(),
+            Addr::default(),
+        );
+    let (client_ready, peer_ready) = tokio::try_join!(client_ready, peer_ready)
         .expect("early checks prevented actual channel establishment");
+    let client = client.establish(client_ready);
+    let peer = peer.establish(peer_ready);
     client
         .send(Bytes::from_static(b"secured data after early check"))
         .await
@@ -150,8 +154,8 @@ async fn peer_checks_before_handoff(mode: IceMode, answer_before_check: bool) {
         client_reliable.recv().await.unwrap().unwrap(),
         "secured reply after handoff"
     );
-    client.close().await.unwrap();
-    peer.close().await.unwrap();
+    drop(client.close());
+    drop(peer.close());
 }
 
 #[tokio::test]

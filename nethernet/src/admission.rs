@@ -404,7 +404,8 @@ mod tests {
             .expect("original offer expired during gathering");
         assert!(matches!(error, AdmissionError::Untrusted(_)));
         assert_eq!(core.local_candidates().len(), candidates);
-        core.close(now).unwrap();
+        let (_retired, result) = core.close(now);
+        result.unwrap();
     }
 
     /// Prepared answer adoption signs the original DTLS fingerprints and keeps exact offer routing.
@@ -426,7 +427,7 @@ mod tests {
         let prepared = admitted
             .prepare_answer(&mut core, description, now, wall)
             .unwrap();
-        let mut answered = prepared.finish(core, now);
+        let answered = prepared.finish(core, now);
         assert_eq!(answered.signals[0].connection_id, offer.connection_id);
         assert_eq!(answered.signals[0].network_id, offer.network_id);
         assert_eq!(
@@ -437,6 +438,7 @@ mod tests {
             crate::identity::verify_answer(&answered.signals[0].data, Some(&TokenTrust::Any), wall)
                 .is_ok()
         );
-        answered.connection.close(now).unwrap();
+        let (_retired, result) = answered.connection.close(now);
+        result.unwrap();
     }
 }

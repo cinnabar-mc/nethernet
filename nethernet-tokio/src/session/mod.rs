@@ -16,11 +16,14 @@ use futures::future::{BoxFuture, pending};
 use guard::{ConnectionGuard, transport_now};
 use nethernet::connection::{Connection as SansConnection, ConnectionInput};
 use nethernet::identity::PlayerInfo;
+use nethernet::phase::{Connecting, Established, Live, Phase, Retired};
+#[cfg(test)]
 use nethernet::sans::Sans;
 pub use nethernet::session::Channel;
 use nethernet::session::{SessionEvent, SessionOutput};
 use outgoing::{CandidateSignaling, signal_send};
 use receive::{AdmissionError, Producer, Receiver, Terminal};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -47,15 +50,35 @@ impl Drop for TaskGuard {
     }
 }
 
-/// Cloneable transport handle; accepted receivers retain their data after closure.
+/// Cloneable established send/control capability. Global closure is observed at runtime.
+/// Dropping one capability does not revoke another; the unique Session owns local lifecycle.
 #[derive(Clone)]
-pub struct Session {
+pub struct SessionSender {
     local_addr: Addr,
     remote_addr: Addr,
     command_tx: mpsc::Sender<Command>,
     close_token: CancellationToken,
     _guard: Arc<TaskGuard>,
 }
+
+/// Unique transport lifecycle owner. Constructors return it only after actual readiness.
+/// Consuming close retires this owner while existing receivers keep their accepted FIFO.
+///
+/// ```compile_fail
+/// fn closed(session: nethernet_tokio::Session) {
+///     let retired = session.close();
+///     let sender = retired.sender();
+/// }
+/// ```
+#[must_use = "retain the session owner through retirement and drain its accepted output"]
+pub struct Session<S: Phase = Established> {
+    handle: Option<SessionSender>,
+    _phase: PhantomData<S>,
+}
+
+/// Produced only by the existing actor after the core's actual Ready transition.
+#[derive(Clone, Copy)]
+pub(crate) struct Ready;
 
 /// Incoming accepted messages, followed by EOF on orderly close or one explicit receive error.
 pub struct SessionReceiver {
@@ -74,23 +97,13 @@ impl SessionReceiver {
 }
 
 /// A connected session with its reliable and unreliable receivers.
-pub struct AcceptedSession {
-    pub session: Session,
+pub struct AcceptedSession<S: Phase = Established> {
+    pub session: Session<S>,
     pub reliable: SessionReceiver,
     pub unreliable: SessionReceiver,
 }
 
-impl Session {
-    /// Queues a snapshot before the test's send burst; the actual receiver observes it before draining that burst.
-    #[cfg(test)]
-    fn queued_commands(&self) -> oneshot::Receiver<usize> {
-        let (reply, observation) = oneshot::channel();
-        self.command_tx
-            .try_send(Command::QueuedCommands(reply))
-            .expect("fixture's observation precedes its command burst");
-        observation
-    }
-
+impl Session<Connecting> {
     #[cfg(test)]
     pub(crate) fn spawn(
         socket: Arc<UdpSocket>,
@@ -101,7 +114,7 @@ impl Session {
         Self,
         SessionReceiver,
         SessionReceiver,
-        oneshot::Receiver<()>,
+        oneshot::Receiver<Ready>,
     ) {
         Self::spawn_with_signaling(socket, connection, local, remote, None)
     }
@@ -117,7 +130,7 @@ impl Session {
         Self,
         SessionReceiver,
         SessionReceiver,
-        oneshot::Receiver<()>,
+        oneshot::Receiver<Ready>,
     ) {
         Self::spawn_owned(
             socket,
@@ -146,7 +159,7 @@ impl Session {
         Self,
         SessionReceiver,
         SessionReceiver,
-        oneshot::Receiver<()>,
+        oneshot::Receiver<Ready>,
     ) {
         Self::spawn_owned(socket, connection, local, remote, None, Some(lease))
     }
@@ -163,7 +176,7 @@ impl Session {
         Self,
         SessionReceiver,
         SessionReceiver,
-        oneshot::Receiver<()>,
+        oneshot::Receiver<Ready>,
     ) {
         Self::spawn_owned(
             socket,
@@ -187,7 +200,7 @@ impl Session {
         Self,
         SessionReceiver,
         SessionReceiver,
-        oneshot::Receiver<()>,
+        oneshot::Receiver<Ready>,
     ) {
         let (command_tx, command_rx) = mpsc::channel(command::COMMAND_CAPACITY);
         let (packet_tx, packet_rx) = receive::channel(Channel::Reliable);
@@ -214,11 +227,14 @@ impl Session {
         });
 
         let session = Self {
-            local_addr: local,
-            remote_addr: remote,
-            command_tx,
-            close_token,
-            _guard: guard.clone(),
+            handle: Some(SessionSender {
+                local_addr: local,
+                remote_addr: remote,
+                command_tx,
+                close_token,
+                _guard: guard.clone(),
+            }),
+            _phase: PhantomData,
         };
 
         (
@@ -235,34 +251,6 @@ impl Session {
         )
     }
 
-    pub(crate) fn signal_sender(&self) -> mpsc::Sender<Command> {
-        self.command_tx.clone()
-    }
-
-    /// Arbitrates public acceptance against listener retirement without an asynchronous gap.
-    pub(crate) fn accept_from_server(&self) -> bool {
-        self._guard
-            .server
-            .as_ref()
-            .is_some_and(|lease| lease.accept())
-    }
-
-    /// Keeps cancellation of unaccepted sessions owned by the listener, including task abortion.
-    pub(crate) fn server_retirement(&self) -> ServerRetirement {
-        ServerRetirement::new(
-            self._guard
-                .server
-                .as_ref()
-                .expect("only server sessions have a listener owner"),
-            self.close_token.clone(),
-        )
-    }
-
-    /// Allows peer control to stop the actor without retaining its application owners.
-    pub(crate) fn close_token(&self) -> CancellationToken {
-        self.close_token.clone()
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn drive(
         socket: Arc<UdpSocket>,
@@ -270,7 +258,7 @@ impl Session {
         mut commands: mpsc::Receiver<Command>,
         packet_tx: Producer,
         unreliable_tx: Producer,
-        mut ready_tx: Option<oneshot::Sender<()>>,
+        mut ready_tx: Option<oneshot::Sender<Ready>>,
         close_token: CancellationToken,
         signaling: Option<CandidateSignaling>,
         server: Option<Arc<ServerLease>>,
@@ -332,7 +320,7 @@ impl Session {
                                 // An abandoned wait may retract only a command not yet admitted.
                                 Err(NetherError::ConnectionClosed)
                             } else {
-                                connection.handle(ConnectionInput::Send(channel, data, now))
+                                connection.send(channel, data, now)
                                     .map_err(NetherError::from)
                             };
                             let _ = reply.send(result);
@@ -378,7 +366,7 @@ impl Session {
                         SessionOutput::Event(SessionEvent::Ready) => {
                             remote_addr = connection.remote_addr();
                             if let Some(tx) = ready_tx.take() {
-                                let _ = tx.send(());
+                                let _ = tx.send(Ready);
                             }
                         }
                         SessionOutput::Event(SessionEvent::Failed) => {
@@ -424,6 +412,183 @@ impl Session {
         })
     }
 
+    /// Consumes the pending owner only with the exact actor's private readiness result.
+    pub(crate) fn establish(self, _ready: Ready) -> Session<Established> {
+        Session {
+            handle: Some(self.into_handle()),
+            _phase: PhantomData,
+        }
+    }
+}
+
+impl<S: Phase> Session<S> {
+    /// Borrows the retained handle until this owner's single phase transition.
+    fn handle(&self) -> &SessionSender {
+        self.handle
+            .as_ref()
+            .expect("session retains its lifecycle handle")
+    }
+
+    /// Moves the same actor ownership without triggering local cancellation during a transition.
+    fn into_handle(mut self) -> SessionSender {
+        self.handle
+            .take()
+            .expect("session transfers its lifecycle handle once")
+    }
+
+    /// Borrows the original runtime binding metadata.
+    pub async fn local_addr(&self) -> Addr {
+        self.handle().local_addr().await
+    }
+    /// Queries the retained actor for its original selected route.
+    pub async fn remote_addr(&self) -> Addr {
+        self.handle().remote_addr().await
+    }
+    /// Queries the original association measurement without changing lifetime.
+    pub async fn rtt(&self) -> Option<Duration> {
+        self.handle().rtt().await
+    }
+    /// Borrows identity metadata already installed on the same actor.
+    pub async fn player(&self) -> Option<Arc<PlayerInfo>> {
+        self.handle().player().await
+    }
+    /// Borrows the original HTTP signaling metadata when available.
+    pub async fn host(&self) -> Option<String> {
+        self.handle().host().await
+    }
+    /// Observes closure requested by any owner or by the actual driver.
+    pub async fn closed(&self) {
+        self.handle().closed().await
+    }
+    /// Observes shared closure without claiming that a remote peer remains live.
+    pub async fn is_closed(&self) -> bool {
+        self.handle().is_closed().await
+    }
+}
+
+impl<S: Live> Session<S> {
+    /// Queues a snapshot before the test's send burst; the actual receiver observes it before draining that burst.
+    #[cfg(test)]
+    fn queued_commands(&self) -> oneshot::Receiver<usize> {
+        let (reply, observation) = oneshot::channel();
+        self.handle()
+            .command_tx
+            .try_send(Command::QueuedCommands(reply))
+            .expect("fixture's observation precedes its command burst");
+        observation
+    }
+
+    pub(crate) fn signal_sender(&self) -> mpsc::Sender<Command> {
+        self.handle().command_tx.clone()
+    }
+
+    /// Arbitrates public acceptance against listener retirement without an asynchronous gap.
+    pub(crate) fn accept_from_server(&self) -> bool {
+        self.handle()
+            ._guard
+            .server
+            .as_ref()
+            .is_some_and(|lease| lease.accept())
+    }
+
+    /// Keeps cancellation of unaccepted sessions owned by the listener, including task abortion.
+    pub(crate) fn server_retirement(&self) -> ServerRetirement {
+        ServerRetirement::new(
+            self.handle()
+                ._guard
+                .server
+                .as_ref()
+                .expect("only server sessions have a listener owner"),
+            self.handle().close_token.clone(),
+        )
+    }
+
+    /// Allows peer control to stop the actor without retaining its application owners.
+    pub(crate) fn close_token(&self) -> CancellationToken {
+        self.handle().close_token.clone()
+    }
+
+    /// Installs admitted peer metadata before the public ready handoff.
+    pub(crate) async fn set_player(&self, player: Arc<PlayerInfo>) {
+        self.handle().set_player(player).await;
+    }
+    /// Installs the original accepted HTTP host before handoff.
+    pub(crate) async fn set_host(&self, host: String) {
+        self.handle().set_host(host).await;
+    }
+
+    /// Consumes local lifecycle ownership and requests finite teardown on the existing actor.
+    /// Other established senders observe global closure at runtime; receivers retain accepted data.
+    pub fn close(self) -> Session<Retired> {
+        let handle = self.into_handle();
+        handle.start_close();
+        Session {
+            handle: Some(handle),
+            _phase: PhantomData,
+        }
+    }
+}
+
+impl Session<Established> {
+    /// Shares only an established send/control capability, never another lifecycle owner.
+    pub fn sender(&self) -> SessionSender {
+        self.handle().clone()
+    }
+    /// Sends through the established capability while retaining unique lifecycle ownership.
+    pub async fn send(&self, data: Bytes) -> Result<()> {
+        self.handle().send(data).await
+    }
+    /// Retains the caller's original admission deadline on the same established actor.
+    pub async fn send_before(&self, data: Bytes, deadline: Instant) -> Result<()> {
+        self.handle().send_before(data, deadline).await
+    }
+    /// Admits one unreliable message through the established actor.
+    pub async fn send_unreliable(&self, data: Bytes) -> Result<()> {
+        self.handle().send_unreliable(data).await
+    }
+    /// Rotates the original live allocation without extending its credential expiry.
+    pub async fn update_turn_credentials(
+        &self,
+        server: std::net::SocketAddr,
+        credentials: nethernet::session::TurnCredentials,
+    ) -> Result<()> {
+        self.handle()
+            .update_turn_credentials(server, credentials)
+            .await
+    }
+}
+
+impl<S: Phase> Drop for Session<S> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.start_close();
+        }
+    }
+}
+
+impl AcceptedSession<Connecting> {
+    /// Transfers the exact pending actor and receivers using its retained Ready result.
+    pub(crate) fn establish(self, ready: Ready) -> AcceptedSession<Established> {
+        AcceptedSession {
+            session: self.session.establish(ready),
+            reliable: self.reliable,
+            unreliable: self.unreliable,
+        }
+    }
+}
+
+impl<S: Live> AcceptedSession<S> {
+    /// Retires the unique sender owner while preserving both original receive queues.
+    pub fn close(self) -> AcceptedSession<Retired> {
+        AcceptedSession {
+            session: self.session.close(),
+            reliable: self.reliable,
+            unreliable: self.unreliable,
+        }
+    }
+}
+
+impl SessionSender {
     pub async fn send(&self, data: Bytes) -> Result<()> {
         self.send_on(Channel::Reliable, data, None).await
     }

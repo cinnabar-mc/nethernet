@@ -1,6 +1,7 @@
 //! Signed-out client identity and the key that binds its SDP offers.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -21,7 +22,7 @@ use super::{Assertion, Identity, Idp, SdpIdentity, fingerprint_payload, sdp_fing
 /// Its token attests only to the public key and validity timestamps. Account
 /// credentials and refresh belong to an application-owned [`SdpIdentity`].
 pub struct SelfSignedIdentity {
-    signing: SigningKey,
+    signing: Arc<SigningKey>,
     token: String,
     claims: Claims,
 }
@@ -37,6 +38,16 @@ impl SelfSignedIdentity {
     ///
     /// Token validity comes from the caller; an unrepresentable time is rejected.
     pub fn new(now: SystemTime, lifetime: Duration) -> Result<Self> {
+        Self::from_key(SigningKey::generate(), now, lifetime)
+    }
+
+    /// Uses the same caller-owned proof key as the later application Login.
+    /// Sharing the Arc does not copy private key material or change token validity.
+    pub fn from_key(
+        signing: impl Into<Arc<SigningKey>>,
+        now: SystemTime,
+        lifetime: Duration,
+    ) -> Result<Self> {
         let expires = now.checked_add(lifetime).ok_or_else(|| {
             IdentityError::Malformed("client token lifetime is too large".to_owned())
         })?;
@@ -47,7 +58,7 @@ impl SelfSignedIdentity {
                     IdentityError::Malformed("client token time precedes the epoch".to_owned())
                 })
         };
-        let signing = SigningKey::generate();
+        let signing = signing.into();
         let der = signing
             .verifying_key()
             .to_public_key_der()
@@ -108,7 +119,10 @@ mod tests {
     #[test]
     fn signed_out_offer_binds_a_der_token_key_to_the_signed_fingerprints() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let identity = SelfSignedIdentity::new(now, Duration::from_secs(3600)).unwrap();
+        let key = Arc::new(SigningKey::generate());
+        let identity =
+            SelfSignedIdentity::from_key(key.clone(), now, Duration::from_secs(3600)).unwrap();
+        assert!(std::ptr::eq(identity.signing_key(), key.as_ref()));
         let augmented = identity.augment(SDP, now).unwrap();
         let parsed = Identity::from_sdp(&augmented).unwrap();
         let token = Jws::parse(&parsed.assertion.token).unwrap();

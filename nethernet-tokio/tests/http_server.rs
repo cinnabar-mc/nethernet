@@ -114,8 +114,8 @@ async fn queued_and_live_accepted_sessions_hold_the_server_capacity() {
             accepted.reliable.recv().await.unwrap().unwrap(),
             "original accepted peer"
         );
-        accepted.session.close().await.unwrap();
-        first.close().await.unwrap();
+        accepted.session.sender().close().await.unwrap();
+        first.sender().close().await.unwrap();
         listener.close().await.unwrap();
     })
     .await
@@ -137,8 +137,8 @@ async fn closing_the_listener_preserves_an_already_accepted_session() {
             accepted.reliable.recv().await.unwrap().unwrap(),
             "accepted before listener close"
         );
-        accepted.session.close().await.unwrap();
-        client.close().await.unwrap();
+        accepted.session.sender().close().await.unwrap();
+        client.sender().close().await.unwrap();
     })
     .await
     .expect("listener close ended or stalled an already accepted session");
@@ -154,8 +154,8 @@ async fn closed_accepted_receivers_retain_capacity_until_their_owners_retire() {
         let (url, mut listener) = serve_with_connection(server_config(), connection).await;
         let client = connect_once(&url, "retained-peer").await.unwrap();
         let accepted = listener.accept().await.unwrap();
-        accepted.session.close().await.unwrap();
-        client.close().await.unwrap();
+        accepted.session.sender().close().await.unwrap();
+        client.sender().close().await.unwrap();
         drop(accepted.session);
         let refused = connect_once(&url, "refused-peer").await;
         assert!(
@@ -184,8 +184,8 @@ async fn closed_accepted_receivers_retain_capacity_until_their_owners_retire() {
             accepted.reliable.recv().await.unwrap().unwrap(),
             "replacement peer"
         );
-        accepted.session.close().await.unwrap();
-        replacement.close().await.unwrap();
+        accepted.session.sender().close().await.unwrap();
+        replacement.sender().close().await.unwrap();
         listener.close().await.unwrap();
     })
     .await
@@ -228,7 +228,7 @@ async fn offer_is_negotiated_over_the_endpoint() {
         .unwrap();
     assert_eq!(echoed.as_deref(), Some(&b"hello"[..]));
 
-    stream.close().await.unwrap();
+    stream.sender().close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

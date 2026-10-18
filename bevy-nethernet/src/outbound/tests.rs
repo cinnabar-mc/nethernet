@@ -107,7 +107,7 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
         let (connection, answers) =
             Connection::accept(session, description, &offer, remote, candidates, mode, now)
                 .unwrap();
-        *answerer.state.get() = Some(State::Connected(connection));
+        *answerer.state.get() = Some(State::Connected(ActiveConnection::new(connection)));
         for signal in answers {
             client.signal(signal, now).unwrap();
         }

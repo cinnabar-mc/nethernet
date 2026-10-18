@@ -15,15 +15,33 @@ const RETIRED: u8 = 2;
 pub(crate) struct ServerLease {
     _slot: OwnedSemaphorePermit,
     state: AtomicU8,
+    route: Option<crate::signaling::caller::server::CallerRoute>,
 }
 
 impl ServerLease {
     /// Retains the original pre-allocation admission until every session/receiver owner retires.
+    #[cfg(test)]
     pub(crate) fn new(slot: OwnedSemaphorePermit) -> Arc<Self> {
+        Self::with_route(slot, None)
+    }
+
+    /// Retains the authenticated caller route through the same concrete capacity lifetime.
+    pub(crate) fn with_route(
+        slot: OwnedSemaphorePermit,
+        route: Option<crate::signaling::caller::server::CallerRoute>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             _slot: slot,
             state: AtomicU8::new(PENDING),
+            route,
         })
+    }
+
+    /// The actual actor ended; retained receivers may still own its data and reservation.
+    pub(crate) fn retire_route(&self) {
+        if let Some(route) = &self.route {
+            route.retire();
+        }
     }
 
     /// Records the synchronous public accept boundary, without an intervening cancellation await.

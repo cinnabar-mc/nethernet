@@ -1,5 +1,6 @@
 //! Client and server connections over a signaling backend.
 pub mod client;
+mod gather;
 mod pending;
 pub mod server;
 
@@ -33,6 +34,15 @@ pub struct ClientIceConfig {
     pub bind_addr: Option<SocketAddr>,
 }
 
+/// Accepting ICE configuration. The caller resolves services and selects the local socket family.
+#[derive(Clone)]
+pub struct ServerIceConfig {
+    /// The same bounded STUN/TURN policy and original absolute credentials used by client sessions.
+    pub ice: nethernet::session::IceConfig,
+    /// Concrete local interface/port, including explicit IPv6 for IPv6 service transport.
+    pub bind_addr: SocketAddr,
+}
+
 /// Settings shared by NetherClient::connect_with and NetherServer::bind_with.
 #[derive(Clone)]
 pub struct ConnectionConfig {
@@ -46,8 +56,11 @@ pub struct ConnectionConfig {
     /// Caller-driven signaling always uses one attempt; the application owns retries.
     pub attempts: u32,
 
-    /// Optional STUN/TURN paths for outbound client sessions; servers continue to use their own admission path.
+    /// Optional STUN/TURN paths for outbound client sessions.
     pub client_ice: Option<ClientIceConfig>,
+
+    /// Optional configured accepting paths; None preserves host-only HTTP/LAN behavior.
+    pub server_ice: Option<ServerIceConfig>,
 
     /// Signs local SDP: ClientIdentity for offers or ServerIdentity for answers.
     pub identity: Option<Arc<dyn SdpIdentity>>,
@@ -83,6 +96,7 @@ impl Default for ConnectionConfig {
             cancel_token: CancellationToken::new(),
             attempts: 3,
             client_ice: None,
+            server_ice: None,
             identity: None,
             allow_unsigned_answers: false,
             token_trust: None,
@@ -101,6 +115,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("timeouts", &self.timeouts)
             .field("attempts", &self.attempts)
             .field("client_ice", &self.client_ice.is_some())
+            .field("server_ice", &self.server_ice.is_some())
             .field("identity", &self.identity.is_some())
             .field("allow_unsigned_answers", &self.allow_unsigned_answers)
             .field("token_trust", &self.token_trust.is_some())

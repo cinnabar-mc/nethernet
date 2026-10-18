@@ -96,29 +96,63 @@ impl Connection {
             now,
         ))?;
 
-        let signals = Self::describe(
-            &session,
-            &description,
+        let signals = Self::answer_signals(&session, &description, offer, ice_mode);
+        let candidates = Self::take_described_candidates(&mut session);
+        Ok((
+            Self::accepted(
+                session,
+                description,
+                offer,
+                remote_identity,
+                ice_mode,
+                candidates,
+            ),
+            signals,
+        ))
+    }
+
+    /// Encodes the prepared session's current candidates without transferring its allocation owner.
+    pub(crate) fn answer_signals(
+        session: &Session,
+        description: &Description,
+        offer: &Signal,
+        ice_mode: IceMode,
+    ) -> Vec<Signal> {
+        Self::describe(
+            session,
+            description,
             ice_mode,
             offer.connection_id,
             offer.network_id.clone(),
             SignalKind::Answer,
-        );
-        let next_candidate_index = session.local_candidates().len();
-        while session.poll_local_candidate().is_some() {}
+        )
+    }
 
-        Ok((
-            Self {
-                session,
-                connection_id: offer.connection_id,
-                remote_network_id: offer.network_id.clone(),
-                remote_identity,
-                ice_mode,
-                local_ufrag: description.ice.ufrag,
-                next_candidate_index,
-            },
-            signals,
-        ))
+    /// Marks only the current description's candidates as sent, leaving later gathered ones for trickle.
+    pub(crate) fn take_described_candidates(session: &mut Session) -> usize {
+        let count = session.local_candidates().len();
+        while session.poll_local_candidate().is_some() {}
+        count
+    }
+
+    /// Adopts an already applied remote description after all fallible answer preparation succeeds.
+    pub(crate) fn accepted(
+        session: Session,
+        description: Description,
+        offer: &Signal,
+        remote_identity: Option<String>,
+        ice_mode: IceMode,
+        next_candidate_index: usize,
+    ) -> Self {
+        Self {
+            session,
+            connection_id: offer.connection_id,
+            remote_network_id: offer.network_id.clone(),
+            remote_identity,
+            ice_mode,
+            local_ufrag: description.ice.ufrag,
+            next_candidate_index,
+        }
     }
 
     fn describe(

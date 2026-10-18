@@ -6,7 +6,7 @@ use crate::addr::Addr;
 use crate::error::{NetherError, Result};
 use crate::session::AcceptedSession;
 use crate::signaling::ServerSignaling;
-use crate::transport::ConnectionConfig;
+use crate::transport::{ConnectionConfig, ServerIceConfig};
 use futures::Stream;
 use nethernet::identity::TokenTrust;
 use std::pin::Pin;
@@ -15,6 +15,8 @@ use std::task::{Context, Poll};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+type SharedIce = Arc<RwLock<Option<ServerIceConfig>>>;
 
 type SharedTrust = Arc<RwLock<Option<TokenTrust>>>;
 
@@ -25,6 +27,7 @@ pub struct NetherServer {
     local_addr: Addr,
     signaling: ServerSignaling,
     token_trust: SharedTrust,
+    ice: SharedIce,
     cancel_token: CancellationToken,
     signal_handler_task: Option<JoinHandle<()>>,
 }
@@ -47,6 +50,11 @@ impl NetherServer {
         {
             return Err(NetherError::IdentityRequired);
         }
+        if matches!(&signaling, ServerSignaling::Caller(_)) && config.token_trust.is_none() {
+            return Err(NetherError::InvalidState(
+                "caller server requires explicit offer trust".into(),
+            ));
+        }
         let establish = config.timeouts.start.checked_add(config.timeouts.channel);
         let now = crate::session::guard::transport_now();
         if config.max_sessions > Semaphore::MAX_PERMITS
@@ -64,12 +72,16 @@ impl NetherServer {
         let (incoming_tx, incoming_rx) = mpsc::channel(config.max_sessions.max(1));
         let cancel_token = CancellationToken::new();
         let token_trust = Arc::new(RwLock::new(config.token_trust.clone()));
+        let ice = Arc::new(RwLock::new(config.server_ice.clone()));
+        let signals = signaling.signals()?;
         let signal_handler_task = listener::start(
             signaling.clone(),
             incoming_tx,
             cancel_token.clone(),
             config,
             token_trust.clone(),
+            ice.clone(),
+            signals,
         );
 
         Ok(Self {
@@ -77,6 +89,7 @@ impl NetherServer {
             local_addr,
             signaling,
             token_trust,
+            ice,
             cancel_token,
             signal_handler_task: Some(signal_handler_task),
         })
@@ -126,12 +139,20 @@ impl NetherServer {
         &self.local_addr
     }
 
-    /// Replaces how later offers are authenticated; `None` skips validation.
+    /// Replaces STUN/TURN configuration for later offers without extending existing credentials.
+    /// Pure session construction validates bounds, family and absolute expiry at each admission.
+    /// Live sessions use Session::update_turn_credentials for their existing allocation.
+    pub fn set_server_ice(&self, ice: Option<ServerIceConfig>) {
+        *self.ice.write().unwrap_or_else(PoisonError::into_inner) = ice;
+    }
+
+    /// Replaces how later offers are authenticated. `None` disables caller-bridge offer admission;
+    /// LAN skips validation and HTTP replaces its signaler policy.
     /// Over HTTP signaling the signaler authenticates offers, so its trust is replaced instead.
     pub fn set_token_trust(&self, trust: Option<TokenTrust>) {
         match &self.signaling {
             ServerSignaling::Http(signaling) => signaling.set_token_trust(trust),
-            ServerSignaling::Lan(_) => {
+            ServerSignaling::Caller(_) | ServerSignaling::Lan(_) => {
                 *self
                     .token_trust
                     .write()

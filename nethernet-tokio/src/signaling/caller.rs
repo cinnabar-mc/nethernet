@@ -6,6 +6,8 @@
 //! not a peer's separately advertised NetherNet ID. ICE gathering and relay paths remain owned by the configured transport session;
 //! this bridge only carries its signals.
 
+pub mod server;
+
 use crate::error::Result;
 use crate::protocol::{Signal, SignalType};
 use futures::Stream;
@@ -139,6 +141,7 @@ pub struct SignalRequest {
     deadline: Instant,
     completion: oneshot::Sender<std::result::Result<(), CallerSignalingError>>,
     closed: CancellationToken,
+    route_closed: Option<CancellationToken>,
     _slot: OwnedSemaphorePermit,
 }
 
@@ -153,19 +156,8 @@ impl CallerSignaling {
         remote_id: String,
         config: CallerSignalingConfig,
     ) -> std::result::Result<(Self, CallerSignalingDriver), CallerSignalingError> {
+        validate_config(&local_id, Some(&remote_id), &config)?;
         let capacity = config.capacity.get();
-        let max_bytes = config.max_signal_bytes.get();
-        if capacity > Semaphore::MAX_PERMITS
-            || capacity.checked_mul(max_bytes).is_none()
-            || config.send_timeout.is_zero()
-            || Instant::now().checked_add(config.send_timeout).is_none()
-            || local_id.is_empty()
-            || remote_id.is_empty()
-            || local_id.len() > max_bytes
-            || remote_id.len() > max_bytes
-        {
-            return Err(CallerSignalingError::Configuration);
-        }
         let (outgoing, requests) = mpsc::channel(capacity);
         let (incoming, receiver) = mpsc::channel(capacity);
         let inbox = Arc::new(Mutex::new(Inbox {
@@ -215,39 +207,16 @@ impl CallerSignaling {
                 return Err(CallerSignalingError::RouteMismatch.into());
             }
         }
-        let deadline = tokio::time::Instant::now()
-            .into_std()
-            .checked_add(self.config.send_timeout)
-            .ok_or(CallerSignalingError::Configuration)?;
-        let send = async {
-            let slot = self
-                .slots
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| CallerSignalingError::Closed)?;
-            let (completion, result) = oneshot::channel();
-            self.outgoing
-                .send(SignalRequest {
-                    require_receipt: signal.signal_type == SignalType::Offer
-                        && self.config.require_offer_receipt,
-                    signal,
-                    deadline,
-                    completion,
-                    closed: self.closed.clone(),
-                    _slot: slot,
-                })
-                .await
-                .map_err(|_| CallerSignalingError::Closed)?;
-            result.await.map_err(|_| CallerSignalingError::Closed)?
-        };
-        tokio::select! {
-            biased;
-            _ = self.closed.cancelled() => Err(CallerSignalingError::Closed.into()),
-            result = tokio::time::timeout_at(deadline.into(), send) => {
-                result.map_err(|_| CallerSignalingError::TimedOut)?.map_err(Into::into)
-            }
-        }
+        send_request(
+            &self.outgoing,
+            &self.slots,
+            &self.closed,
+            signal,
+            self.config.send_timeout,
+            self.config.require_offer_receipt,
+            None,
+        )
+        .await
     }
 
     /// Borrows the sole incoming stream; dropping it allows a later negotiation attempt.
@@ -302,6 +271,72 @@ fn wire_size(signal: &Signal) -> Option<usize> {
         .checked_add(digits)?
         .checked_add(2)?
         .checked_add(signal.data.len())
+}
+
+/// Validates the common byte/queue/deadline bounds before allocating either concrete bridge.
+fn validate_config(
+    local: &str,
+    remote: Option<&str>,
+    config: &CallerSignalingConfig,
+) -> std::result::Result<(), CallerSignalingError> {
+    let capacity = config.capacity.get();
+    let max_bytes = config.max_signal_bytes.get();
+    if capacity > Semaphore::MAX_PERMITS
+        || capacity.checked_mul(max_bytes).is_none()
+        || config.send_timeout.is_zero()
+        || Instant::now().checked_add(config.send_timeout).is_none()
+        || local.is_empty()
+        || local.len() > max_bytes
+        || remote.is_some_and(|remote| remote.is_empty() || remote.len() > max_bytes)
+    {
+        return Err(CallerSignalingError::Configuration);
+    }
+    Ok(())
+}
+
+/// Uses one shared request owner for client and accepting bridges, including held requests.
+async fn send_request(
+    outgoing: &mpsc::Sender<SignalRequest>,
+    slots: &Arc<Semaphore>,
+    closed: &CancellationToken,
+    signal: Signal,
+    within: Duration,
+    require_offer_receipt: bool,
+    route_closed: Option<CancellationToken>,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now()
+        .into_std()
+        .checked_add(within)
+        .ok_or(CallerSignalingError::Configuration)?;
+    let send = async {
+        let slot = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| CallerSignalingError::Closed)?;
+        let (completion, result) = oneshot::channel();
+        outgoing
+            .send(SignalRequest {
+                require_receipt: signal.signal_type == SignalType::Offer && require_offer_receipt,
+                signal,
+                deadline,
+                completion,
+                closed: closed.clone(),
+                route_closed: route_closed.clone(),
+                _slot: slot,
+            })
+            .await
+            .map_err(|_| CallerSignalingError::Closed)?;
+        result.await.map_err(|_| CallerSignalingError::Closed)?
+    };
+    tokio::select! {
+        biased;
+        _ = closed.cancelled() => Err(CallerSignalingError::Closed.into()),
+        _ = async { match &route_closed { Some(route) => route.cancelled().await, None => std::future::pending().await } } => Err(CallerSignalingError::RouteMismatch.into()),
+        result = tokio::time::timeout_at(deadline.into(), send) => {
+            result.map_err(|_| CallerSignalingError::TimedOut)?.map_err(Into::into)
+        }
+    }
 }
 
 impl CallerSignalingDriver {
@@ -473,6 +508,10 @@ impl SignalRequest {
     /// Returns whether the bridge closed, the transport abandoned this request or its deadline elapsed.
     pub fn is_cancelled(&self) -> bool {
         self.closed.is_cancelled()
+            || self
+                .route_closed
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
             || self.completion.is_closed()
             || tokio::time::Instant::now().into_std() >= self.deadline
     }
@@ -482,6 +521,7 @@ impl SignalRequest {
     pub async fn cancelled(&mut self) {
         tokio::select! {
             _ = self.closed.cancelled() => {},
+            _ = async { match &self.route_closed { Some(route) => route.cancelled().await, None => std::future::pending().await } } => {},
             _ = self.completion.closed() => {},
             _ = tokio::time::sleep_until(self.deadline.into()) => {},
         }
@@ -493,7 +533,12 @@ impl SignalRequest {
     /// The deadline applies when completion is reported here, independent of when
     /// the transport next polls its wait. Reports at or after it fail as TimedOut.
     pub fn finish(self, result: std::result::Result<SignalDelivery, CallerSignalingError>) {
-        let result = if self.closed.is_cancelled() {
+        let result = if self.closed.is_cancelled()
+            || self
+                .route_closed
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
             Err(CallerSignalingError::Closed)
         } else if tokio::time::Instant::now().into_std() >= self.deadline {
             Err(CallerSignalingError::TimedOut)

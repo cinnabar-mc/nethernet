@@ -6,7 +6,7 @@ use crate::identity::{PlayerInfo, SdpIdentity, TokenTrust, validate_sdp};
 use crate::protocol::Signal;
 use crate::protocol::webrtc::Description;
 use crate::sans::Sans;
-use crate::session::Session;
+use crate::session::{Session, SessionInput};
 use crate::util::candidate;
 use rtc::ice::candidate::Candidate;
 use std::net::SocketAddr;
@@ -157,31 +157,104 @@ impl Admitted<'_> {
     ) -> Result<Answered, AdmissionError> {
         let (mut session, description) =
             Session::new(local_addr, false, session_id, now).map_err(AdmissionError::Session)?;
+        let wall = self.wall;
+        let prepared = self.prepare(&mut session, description, now, wall, false)?;
+        Ok(prepared.finish(session, now))
+    }
+
+    /// Prepares an answer while the caller retains its configured/gathered session allocation.
+    /// Rechecks offer trust and signs at the supplied current wall time after asynchronous gathering.
+    /// On error the caller still owns the session and must close/drain its allocation outputs.
+    /// Description must be the original description returned with this same session.
+    pub fn prepare_answer(
+        self,
+        session: &mut Session,
+        description: Description,
+        now: Instant,
+        wall: SystemTime,
+    ) -> Result<PreparedAnswer, AdmissionError> {
+        self.prepare(session, description, now, wall, true)
+    }
+
+    /// Shares remote-description, fingerprint/signing and establishment preparation for either edge.
+    fn prepare(
+        mut self,
+        session: &mut Session,
+        description: Description,
+        now: Instant,
+        wall: SystemTime,
+        recheck: bool,
+    ) -> Result<PreparedAnswer, AdmissionError> {
+        if recheck && let Some(trust) = self.policy.token_trust {
+            let claims =
+                validate_sdp(&self.offer.data, trust, wall).map_err(AdmissionError::Untrusted)?;
+            self.player = Some(PlayerInfo::new(
+                claims,
+                self.offer.network_id.clone(),
+                self.signaled_from,
+            ));
+        }
         if let Some(within) = self.policy.establish_deadline {
             session.set_establish_deadline(within);
         }
-        let local_ufrag = description.ice.ufrag.clone();
-        let (mut connection, mut signals) = Connection::accept(
-            session,
-            description,
-            &self.offer,
-            self.remote_description,
-            self.remote_candidates,
-            self.policy.ice_mode,
-            now,
-        )
-        .map_err(AdmissionError::Answer)?;
-
+        let remote_identity = self.remote_description.identity.clone();
+        session
+            .handle(SessionInput::RemoteDescription(
+                self.remote_description,
+                self.remote_candidates,
+                now,
+            ))
+            .map_err(AdmissionError::Answer)?;
+        let mut signals =
+            Connection::answer_signals(session, &description, &self.offer, self.policy.ice_mode);
         if let (Some(identity), Some(answer)) = (self.policy.identity, signals.first_mut()) {
             answer.data = identity
-                .augment(&answer.data, self.wall)
+                .augment(&answer.data, wall)
                 .map_err(AdmissionError::Signing)?;
         }
+        let candidates = Connection::take_described_candidates(session);
+        Ok(PreparedAnswer {
+            candidates,
+            description,
+            remote_identity,
+            offer: self.offer,
+            signaled_from: self.signaled_from,
+            ice_mode: self.policy.ice_mode,
+            infer: self.policy.infer_peer_candidates,
+            signals,
+            player: self.player,
+        })
+    }
+}
 
+/// Fallible answer preparation completed while the caller still owns its original session.
+/// Transfer that same session synchronously with finish; no I/O, clock read or new key occurs here.
+pub struct PreparedAnswer {
+    candidates: usize,
+    description: Description,
+    remote_identity: Option<String>,
+    offer: Signal,
+    signaled_from: Option<SocketAddr>,
+    ice_mode: IceMode,
+    infer: bool,
+    signals: Vec<Signal>,
+    player: Option<PlayerInfo>,
+}
+
+impl PreparedAnswer {
+    /// Adopts the exact prepared session once, without another fallible ownership or cancellation gap.
+    pub fn finish(self, session: Session, now: Instant) -> Answered {
+        let local_ufrag = self.description.ice.ufrag.clone();
+        let mut connection = Connection::accepted(
+            session,
+            self.description,
+            &self.offer,
+            self.remote_identity,
+            self.ice_mode,
+            self.candidates,
+        );
         let mut inferred = Vec::new();
-        if self.policy.infer_peer_candidates
-            && !candidate::has_routable_host_candidate(&self.offer.data)
-        {
+        if self.infer && !candidate::has_routable_host_candidate(&self.offer.data) {
             for line in candidate::inferred_peer_candidates(&self.offer.data, self.signaled_from) {
                 let signal = Signal::candidate(
                     self.offer.connection_id,
@@ -196,14 +269,13 @@ impl Admitted<'_> {
                 }
             }
         }
-
-        Ok(Answered {
+        Answered {
             connection,
-            signals,
+            signals: self.signals,
             player: self.player,
             local_ufrag,
             inferred,
-        })
+        }
     }
 }
 
@@ -308,5 +380,62 @@ mod tests {
             .answer(loopback(40303), 2, Instant::now())
             .unwrap();
         assert!(answered.inferred.is_empty());
+    }
+
+    /// Post-gather admission uses the caller's current wall time while preserving its session on refusal.
+    #[test]
+    fn prepared_answer_rechecks_offer_expiry_before_transferring_the_session() {
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let identity =
+            ServerIdentity::generate_with_expiry("fixture", wall, Some(Duration::from_secs(1)))
+                .unwrap();
+        let mut offer = loopback_offer();
+        offer.data = identity.augment(&offer.data, wall).unwrap();
+        let trust = TokenTrust::Any;
+        let policy = OfferPolicy::new(IceMode::Full).with_token_trust(&trust);
+        let admitted = policy.admit(&offer, None, wall).unwrap();
+        let now = Instant::now();
+        let (mut core, description) = Session::new(loopback(40309), false, 9, now).unwrap();
+        let candidates = core.local_candidates().len();
+        let error = admitted
+            .prepare_answer(&mut core, description, now, wall + Duration::from_secs(2))
+            .err()
+            .expect("original offer expired during gathering");
+        assert!(matches!(error, AdmissionError::Untrusted(_)));
+        assert_eq!(core.local_candidates().len(), candidates);
+        core.close(now).unwrap();
+    }
+
+    /// Prepared answer adoption signs the original DTLS fingerprints and keeps exact offer routing.
+    #[test]
+    fn prepared_answer_adopts_the_original_description_and_connection_tuple() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let identity = test_identity();
+        let offer = loopback_offer();
+        let admitted = OfferPolicy::new(IceMode::Full)
+            .with_identity(&identity)
+            .admit(&offer, None, wall)
+            .unwrap();
+        let (mut core, description) =
+            Session::new_with_ice(loopback(40310), false, 10, Default::default(), now).unwrap();
+        let fingerprints =
+            crate::identity::sdp_fingerprints(&description.encode_full(core.local_candidates()))
+                .unwrap();
+        let prepared = admitted
+            .prepare_answer(&mut core, description, now, wall)
+            .unwrap();
+        let mut answered = prepared.finish(core, now);
+        assert_eq!(answered.signals[0].connection_id, offer.connection_id);
+        assert_eq!(answered.signals[0].network_id, offer.network_id);
+        assert_eq!(
+            crate::identity::sdp_fingerprints(&answered.signals[0].data).unwrap(),
+            fingerprints
+        );
+        assert!(
+            crate::identity::verify_answer(&answered.signals[0].data, Some(&TokenTrust::Any), wall)
+                .is_ok()
+        );
+        answered.connection.close(now).unwrap();
     }
 }

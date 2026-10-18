@@ -2,13 +2,15 @@
 use crate::addr::Addr;
 use crate::error::{NetherError, SignalErrorCode};
 use crate::protocol::Signal;
-use crate::session::guard::transport_now;
+use crate::session::guard::{GatheringGuard, transport_now};
+use crate::session::outgoing::CandidateSignaling;
 use crate::session::{AcceptedSession, Command, ServerLease, ServerRetirement, Session};
 use crate::signaling::ServerSignaling;
 use crate::transport::{ConnectionConfig, local_bind_addr, pending::PendingSlot};
 use futures::{FutureExt, future::Shared};
 use nethernet::admission::OfferPolicy;
 use nethernet::connection::IceMode;
+use nethernet::session::Session as SansSession;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::net::UdpSocket;
@@ -178,6 +180,14 @@ impl Peer {
 
     /// Reads metadata and dispatches the answer without extending the core's established deadline.
     async fn answer(&self, offer: Signal, lease: Arc<ServerLease>) -> OfferResult<Answered> {
+        if matches!(&self.signaling, ServerSignaling::Caller(_))
+            && self.config.token_trust.is_none()
+        {
+            return Err((
+                Some(SignalErrorCode::NotLoggedIn),
+                NetherError::InvalidState("caller server requires explicit offer trust".into()),
+            ));
+        }
         let remote = Addr::new(offer.network_id.clone(), offer.connection_id);
         let remote_address = self.signaling.remote_address(&remote).await;
         let signaled_player = self.signaling.player(&remote).await;
@@ -203,23 +213,78 @@ impl Peer {
             .admit(&offer, remote_address, SystemTime::now())
             .map_err(|error| (Some(error.code()), error.into()))?;
         let socket = Arc::new(
-            UdpSocket::bind(local_bind_addr())
-                .await
-                .map_err(socket_error)?,
+            UdpSocket::bind(
+                self.config
+                    .server_ice
+                    .as_ref()
+                    .map_or_else(local_bind_addr, |ice| ice.bind_addr),
+            )
+            .await
+            .map_err(socket_error)?,
         );
         let bound = socket.local_addr().map_err(socket_error)?;
         let now = transport_now();
         let deadline = now.checked_add(establish).ok_or_else(timeout)?;
-        let answered = admitted
-            .answer(bound, rand::random(), now)
-            .map_err(|error| (Some(error.code()), error.into()))?;
+        let answered = if let Some(ice) = &self.config.server_ice {
+            let (mut core, description) =
+                SansSession::new_with_ice(bound, false, rand::random(), ice.ice.clone(), now)
+                    .map_err(|error| {
+                        (
+                            Some(SignalErrorCode::FailedToCreatePeerConnection),
+                            error.into(),
+                        )
+                    })?;
+            core.set_establish_deadline(establish);
+            let mut gathering =
+                GatheringGuard::new(core, socket.clone()).with_server_capacity(lease.clone());
+            if ice_mode == IceMode::Full {
+                super::super::gather::gather(
+                    &socket,
+                    gathering.core.as_mut().expect("gathering owns session"),
+                    self.negotiation_deadline.min(deadline).into(),
+                )
+                .await
+                .map_err(|error| (Some(SignalErrorCode::Ice), error))?;
+            }
+            let now = transport_now();
+            let prepared = admitted
+                .prepare_answer(
+                    gathering.core.as_mut().expect("gathering owns session"),
+                    description,
+                    now,
+                    SystemTime::now(),
+                )
+                .map_err(|error| (Some(error.code()), error.into()))?;
+            let core = gathering
+                .core
+                .take()
+                .expect("prepared session is transferred once");
+            prepared.finish(core, now)
+        } else {
+            admitted
+                .answer(bound, rand::random(), now)
+                .map_err(|error| (Some(error.code()), error.into()))?
+        };
         let player = answered.player.map(Arc::new).or(signaled_player);
         for line in &answered.inferred {
             tracing::debug!("Inferred candidate for the peer: {}", line);
         }
         let local = Addr::new(self.signaling.network_id(), offer.connection_id);
-        let (session, reliable, unreliable, ready) =
-            Session::spawn_for_server(socket, answered.connection, local, remote, lease);
+        let candidates_enabled = CancellationToken::new();
+        let candidate_signaling = CandidateSignaling {
+            adapter: self.signaling.clone().into(),
+            within: self.config.timeouts.negotiation,
+            enabled: Some(candidates_enabled.clone()),
+            service_closed: self.signaling.service_closed(),
+        };
+        let (session, reliable, unreliable, ready) = Session::spawn_for_server_with_signaling(
+            socket,
+            answered.connection,
+            local,
+            remote,
+            lease,
+            candidate_signaling,
+        );
         let retirement = session.server_retirement();
         // Cache only the actual actor result; dispatch and handoff may each resume after its close.
         let ready = ready.shared();
@@ -253,6 +318,8 @@ impl Peer {
         if transport_now() >= deadline {
             return Err(timeout());
         }
+        // Initial answer and its snapshot candidates are now dispatched in their original order.
+        candidates_enabled.cancel();
         Ok(Answered {
             accepted: AcceptedSession {
                 session,

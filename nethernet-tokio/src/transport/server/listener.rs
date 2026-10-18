@@ -1,5 +1,5 @@
 //! The listener owns every pending peer and routes only bounded late signals.
-use super::{SharedTrust, peer};
+use super::{SharedIce, SharedTrust, peer};
 use crate::error::SignalErrorCode;
 use crate::protocol::{Signal, SignalType};
 use crate::session::guard::transport_now;
@@ -28,6 +28,8 @@ pub(super) fn start(
     listener: CancellationToken,
     config: ConnectionConfig,
     trust: SharedTrust,
+    ice: SharedIce,
+    mut signals: std::pin::Pin<Box<dyn futures::Stream<Item = Signal> + Send>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let _retired = listener.clone().drop_guard();
@@ -35,7 +37,6 @@ pub(super) fn start(
         let pending_offers = PendingOffers::default();
         let mut routes: HashMap<ConnectionKey, Route> = HashMap::new();
         let mut peers = JoinSet::new();
-        let mut signals = signaling.signals();
         // Refusals have one retained send; overload cannot spawn an unbounded rejection task set.
         let mut refusal: Option<BoxFuture<'static, ()>> = None;
 
@@ -66,6 +67,7 @@ pub(super) fn start(
                                 // Repeated offers must never replace an existing peer's route.
                                 continue;
                             }
+                            let Ok(route) = signaling.claim_route(&signal) else { continue; };
                             let admission = slots.clone().try_acquire_owned().ok().and_then(|slot| {
                                 pending_offers.try_admit(
                                     &signal.network_id,
@@ -75,13 +77,11 @@ pub(super) fn start(
                             });
                             let Some((slot, pending)) = admission else {
                                 if refusal.is_none() {
-                                    refusal = Some(Box::pin(peer::refuse(
-                                        signaling.clone(),
-                                        signal,
-                                        SignalErrorCode::IncomingConnectionIgnored,
-                                        config.timeouts.negotiation,
-                                        listener.clone(),
-                                    )));
+                                    let (signaling, listener, within) = (signaling.clone(), listener.clone(), config.timeouts.negotiation);
+                                    refusal = Some(Box::pin(async move {
+                                        let _route = route;
+                                        peer::refuse(signaling, signal, SignalErrorCode::IncomingConnectionIgnored, within, listener).await;
+                                    }));
                                 }
                                 continue;
                             };
@@ -90,6 +90,7 @@ pub(super) fn start(
                             };
                             let mut peer_config = config.clone();
                             peer_config.token_trust = trust.read().unwrap_or_else(PoisonError::into_inner).clone();
+                            peer_config.server_ice = ice.read().unwrap_or_else(PoisonError::into_inner).clone();
                             let (signal_tx, signal_rx) = mpsc::channel(COMMAND_CAPACITY);
                             let stop = CancellationToken::new();
                             routes.insert(key.clone(), Route { signals: signal_tx, stop: stop.clone() });
@@ -103,7 +104,7 @@ pub(super) fn start(
                                 negotiation_deadline,
                             };
                             peers.spawn(async move {
-                                peer.run(signal, pending, ServerLease::new(slot)).await;
+                                peer.run(signal, pending, ServerLease::with_route(slot, route)).await;
                                 key
                             });
                         }

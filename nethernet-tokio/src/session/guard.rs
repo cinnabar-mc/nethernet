@@ -16,6 +16,7 @@ pub(crate) fn transport_now() -> Instant {
 pub(crate) struct GatheringGuard {
     pub core: Option<Session>,
     socket: Arc<UdpSocket>,
+    server_capacity: Option<Arc<ServerLease>>,
 }
 
 impl GatheringGuard {
@@ -23,7 +24,13 @@ impl GatheringGuard {
         Self {
             core: Some(core),
             socket,
+            server_capacity: None,
         }
+    }
+    /// Holds the accepting reservation through canceled gather and allocation destruction.
+    pub(crate) fn with_server_capacity(mut self, capacity: Arc<ServerLease>) -> Self {
+        self.server_capacity = Some(capacity);
+        self
     }
 }
 
@@ -90,6 +97,9 @@ impl ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        if let Some(capacity) = &self.server_capacity {
+            capacity.retire_route();
+        }
         if let Some(core) = &mut self.core {
             let _ = core.close(transport_now());
             while let Some(output) = core.poll() {

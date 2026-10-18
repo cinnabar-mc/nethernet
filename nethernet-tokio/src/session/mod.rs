@@ -19,7 +19,7 @@ use nethernet::identity::PlayerInfo;
 use nethernet::sans::Sans;
 pub use nethernet::session::Channel;
 use nethernet::session::{SessionEvent, SessionOutput};
-use outgoing::signal_send;
+use outgoing::{CandidateSignaling, signal_send};
 use receive::{AdmissionError, Producer, Receiver, Terminal};
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -118,10 +118,23 @@ impl Session {
         SessionReceiver,
         oneshot::Receiver<()>,
     ) {
-        Self::spawn_owned(socket, connection, local, remote, signaling, None)
+        Self::spawn_owned(
+            socket,
+            connection,
+            local,
+            remote,
+            signaling.map(|(adapter, within)| CandidateSignaling {
+                adapter: adapter.into(),
+                within,
+                enabled: None,
+                service_closed: None,
+            }),
+            None,
+        )
     }
 
     /// Moves the original server reservation into the same session/receiver lifetime.
+    #[cfg(test)]
     pub(crate) fn spawn_for_server(
         socket: Arc<UdpSocket>,
         connection: SansConnection,
@@ -137,13 +150,37 @@ impl Session {
         Self::spawn_owned(socket, connection, local, remote, None, Some(lease))
     }
 
+    /// Drives configured accepting ICE, gating late candidates behind original answer dispatch.
+    pub(crate) fn spawn_for_server_with_signaling(
+        socket: Arc<UdpSocket>,
+        connection: SansConnection,
+        local: Addr,
+        remote: Addr,
+        lease: Arc<ServerLease>,
+        signaling: CandidateSignaling,
+    ) -> (
+        Self,
+        SessionReceiver,
+        SessionReceiver,
+        oneshot::Receiver<()>,
+    ) {
+        Self::spawn_owned(
+            socket,
+            connection,
+            local,
+            remote,
+            Some(signaling),
+            Some(lease),
+        )
+    }
+
     /// Constructs one existing actor without a cancellation gap before installing its owned guard.
     fn spawn_owned(
         socket: Arc<UdpSocket>,
         connection: SansConnection,
         local: Addr,
         remote: Addr,
-        signaling: Option<(ClientSignaling, Duration)>,
+        signaling: Option<CandidateSignaling>,
         server: Option<Arc<ServerLease>>,
     ) -> (
         Self,
@@ -234,7 +271,7 @@ impl Session {
         unreliable_tx: Producer,
         mut ready_tx: Option<oneshot::Sender<()>>,
         close_token: CancellationToken,
-        signaling: Option<(ClientSignaling, Duration)>,
+        signaling: Option<CandidateSignaling>,
         server: Option<Arc<ServerLease>>,
     ) -> JoinHandle<()> {
         let mut guard = ConnectionGuard::new(connection, socket).with_server_capacity(server);
@@ -250,11 +287,16 @@ impl Session {
             let mut player: Option<Arc<PlayerInfo>> = None;
             let mut host: Option<String> = None;
 
+            let mut candidates_enabled = signaling
+                .as_ref()
+                .is_none_or(|signaling| signaling.enabled.is_none());
             let terminal = 'drive: loop {
                 tokio::select! {
                     biased;
 
                     _ = close_token.cancelled() => break Terminal::Eof,
+                    _ = async { match signaling.as_ref().and_then(|signaling| signaling.service_closed.as_ref()) { Some(closed) => closed.cancelled().await, None => pending().await } } => break Terminal::Transport,
+                    _ = async { match signaling.as_ref().and_then(|signaling| signaling.enabled.as_ref()) { Some(enabled) => enabled.cancelled().await, None => pending().await } }, if !candidates_enabled => { candidates_enabled = true; },
                     _ = tokio::time::sleep_until(wake.into()) => {
                         let now = transport_now();
                         if connection.handle(ConnectionInput::Timeout(now)).is_err() { break Terminal::Transport; }
@@ -362,10 +404,15 @@ impl Session {
                 }
 
                 if outgoing.is_none()
-                    && let Some((signaling, within)) = &signaling
+                    && candidates_enabled
+                    && let Some(signaling) = &signaling
                     && let Some(signal) = connection.poll_local_signal()
                 {
-                    outgoing = Some(signal_send(signaling.clone(), signal, *within));
+                    outgoing = Some(signal_send(
+                        signaling.adapter.clone(),
+                        signal,
+                        signaling.within,
+                    ));
                 }
 
                 rtt = connection.rtt();

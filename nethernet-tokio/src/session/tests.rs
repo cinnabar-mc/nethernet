@@ -17,6 +17,17 @@ async fn connected_pair_with_server_lease(
     (Session, SessionReceiver),
     (Session, SessionReceiver, SessionReceiver),
 ) {
+    connected_pair_with_server_signaling(server, None).await
+}
+
+/// Keeps the same actual UDP pair when service lifetime belongs to the caller-owned server bridge.
+async fn connected_pair_with_server_signaling(
+    server: Option<Arc<ServerLease>>,
+    signaling: Option<CandidateSignaling>,
+) -> (
+    (Session, SessionReceiver),
+    (Session, SessionReceiver, SessionReceiver),
+) {
     let sockets = [
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
@@ -43,15 +54,24 @@ async fn connected_pair_with_server_lease(
         .unwrap();
     let (a, a_reliable, _a_unreliable, a_ready) =
         Session::spawn(sockets[0].clone(), a, Addr::default(), Addr::default());
-    let (b, b_reliable, b_unreliable, b_ready) = match server {
-        Some(lease) => Session::spawn_for_server(
+    let (b, b_reliable, b_unreliable, b_ready) = match (server, signaling) {
+        (Some(lease), Some(signaling)) => Session::spawn_for_server_with_signaling(
+            sockets[1].clone(),
+            b,
+            Addr::default(),
+            Addr::default(),
+            lease,
+            signaling,
+        ),
+        (Some(lease), None) => Session::spawn_for_server(
             sockets[1].clone(),
             b,
             Addr::default(),
             Addr::default(),
             lease,
         ),
-        None => Session::spawn(sockets[1].clone(), b, Addr::default(), Addr::default()),
+        (None, None) => Session::spawn(sockets[1].clone(), b, Addr::default(), Addr::default()),
+        (None, Some(_)) => unreachable!("server signaling fixture requires its real lease"),
     };
     a_ready.await.unwrap();
     b_ready.await.unwrap();
@@ -332,4 +352,52 @@ async fn accepted_reliable_tail_survives_authenticated_peer_close_before_receive
     })
     .await
     .expect("finite secured-driver closing-delivery regression stalled");
+}
+
+/// The actual caller service closure is an error only after the actor's already accepted reliable FIFO.
+#[tokio::test]
+async fn caller_server_service_closure_preserves_accepted_fifo_before_one_error() {
+    use crate::signaling::caller::server::CallerServerSignaling;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = ServerLease::new(capacity.clone().try_acquire_owned().unwrap());
+        let (bridge, mut driver) =
+            CallerServerSignaling::new("server".into(), Default::default()).unwrap();
+        let signaling = CandidateSignaling {
+            service_closed: Some(bridge.closed()),
+            enabled: None,
+            within: Duration::from_secs(1),
+            adapter: crate::signaling::ServerSignaling::from(bridge).into(),
+        };
+        let ((sender, _), (receiver, mut reliable, _unreliable)) =
+            connected_pair_with_server_signaling(Some(lease), Some(signaling)).await;
+        assert!(receiver.accept_from_server());
+        for index in 0_u32..3 {
+            sender
+                .send(Bytes::copy_from_slice(&index.to_be_bytes()))
+                .await
+                .unwrap();
+        }
+        while reliable.rx.len() != 3 {
+            assert!(!receiver.is_closed().await);
+            tokio::task::yield_now().await;
+        }
+        driver.close();
+        receiver.closed().await;
+        for index in 0_u32..3 {
+            assert_eq!(
+                reliable.recv().await.unwrap().unwrap().as_ref(),
+                &index.to_be_bytes()
+            );
+        }
+        assert!(matches!(
+            reliable.recv().await,
+            Err(NetherError::ConnectionClosed)
+        ));
+        assert!(reliable.recv().await.unwrap().is_none());
+        assert_eq!(capacity.available_permits(), 0);
+        sender.close().await.unwrap();
+    })
+    .await
+    .expect("actual caller service retirement lost its accepted FIFO");
 }

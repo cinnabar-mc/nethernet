@@ -106,7 +106,7 @@ with `ConnectionConfig::allow_unsigned_answers`; an identity that is set still s
 optional over LAN discovery. In `bevy-nethernet`, `NetherHttpServer::set_identity` is required
 the same way and joins are answered with 503 until it is called, unless
 `NetherHttpServer::allow_unsigned_answers(true)` opts out. Offers over
-HTTP are validated against `HttpSignalerConfig::token_trust` alone, and `ConnectionConfig::token_trust` applies only to offers over LAN discovery. It
+HTTP are validated against `HttpSignalerConfig::token_trust` alone, and `ConnectionConfig::token_trust` applies to LAN and caller-bridge offers. It
 defaults to accepting any self-signed token while still binding it to the certificate the
 peer presents. `nethernet_tokio::util::jwks::Jwks::minecraft` fetches the keys needed to
 require a token issued by the Minecraft authorization service instead.
@@ -118,7 +118,7 @@ server sessions together. A reservation is retained through actual driver
 retirement and every session or receiver handle; closing a connection while
 keeping its receivers does not free it. The existing `max_pending` and
 `max_pending_per_network_id` separately limit negotiations. Excess offers are
-refused with `IncomingConnectionIgnored`; setting `max_sessions` to zero refuses
+refused with `IncomingConnectionIgnored` (HTTP responds with 403); setting `max_sessions` to zero refuses
 all offers.
 Refusal delivery retains at most one best-effort send; further excess offers may
 expire while that signaling operation is stalled.
@@ -189,6 +189,26 @@ key ownership in the application. Supply its `SdpIdentity` through
 Service signaling alone does not supply STUN/TURN credentials or select a relay
 policy; those inputs remain with the application.
 
+`CallerServerSignaling::new(local_id, config)` returns a bounded accepting
+backend and `CallerServerSignalingDriver` for unsolicited offers from multiple
+authenticated senders on one caller-owned service connection. Bind it with
+`NetherServer::bind_with`. Supply the existing answer `identity` and an explicit
+`token_trust` for offers; the bridge chooses neither. `set_token_trust(None)`
+disables later caller-bridge offer admission. Existing HTTP and LAN policies
+remain unchanged. `ServerSignaling::signals()` is fallible so a duplicate caller
+listener fails synchronously before spawning transport work.
+
+Use the same `SignalRequest`, original deadlines and delivery evidence as client
+bridges. Incoming `try_deliver` commits immediately; `prepare_delivery_before`
+retains a cancel-safe capacity wait and checks the original deadline at actual
+queue commitment. Only then acknowledge its authenticated service envelope.
+Sender and connection ID jointly identify a route. Unpolled offer waits reserve
+bounded route capacity and release it on drop; duplicates and unknown candidates
+cannot create or replace a route. `max_routes` and `max_routes_per_sender` include
+negotiating, accepted and retained closed receiver lifetimes. Closing the
+listener preserves already accepted peers, while dropping the service driver
+ends their transport and preserves accepted data before one receive error.
+
 Configured UDP ICE sessions can gather server-reflexive and TURN relay candidates.
 The pure `nethernet::session::IceConfig` owns resolved endpoints, credential
 expiry, gathering deadlines and candidate policy. `Session::new` remains
@@ -214,6 +234,24 @@ let config = nethernet_tokio::ConnectionConfig {
     ..Default::default()
 };
 ```
+
+The accepting adapter uses `ConnectionConfig::server_ice` with
+`ServerIceConfig { ice, bind_addr }`. Its bind address is explicit, including the
+outer UDP family; the same pure configuration, bounded endpoints and absolute
+TURN credential expiry apply. Full mode gathers before encoding/signing its
+answer. Trickle mode continues gathering during initial answer delivery, but
+late candidate sends wait until the answer and its initial candidates have
+actually completed in order. `NetherServer::set_server_ice` replaces configuration
+for later offers; it never extends an existing credential's expiry. Use
+`Session::update_turn_credentials` to renew a live allocation.
+
+A pure caller that gathers its own accepting session can use
+`Admitted::prepare_answer(&mut session, description, now, wall)`, then transfer
+that exact session synchronously with `PreparedAnswer::finish`. Preparation
+rechecks offer validity at the supplied current wall time and signs the original
+DTLS fingerprints. The caller retains its allocation on any preparation error
+and must close/drain it. This API creates no service account, credential source,
+HTTP client, socket or runtime.
 
 The application acquires and renews service credentials. DNS runs only in the
 adapter; the core receives numeric endpoints. Full mode gathers before signing

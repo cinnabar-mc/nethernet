@@ -226,7 +226,7 @@ impl NetherClient {
         };
         let mut gathering = GatheringGuard::new(session, socket.clone());
         if ice_mode == IceMode::Full {
-            negotiation::gather(
+            super::gather::gather(
                 &socket,
                 gathering
                     .core

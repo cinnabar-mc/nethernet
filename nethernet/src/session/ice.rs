@@ -146,10 +146,17 @@ impl IceLayer {
             .map_err(|_| IceError::Server.into())
     }
 
-    /// Adds only bounded numeric UDP candidates; mDNS resolution stays at the caller's edge.
+    /// Ignores unsupported transports and admits bounded numeric UDP candidates.
+    /// mDNS resolution stays at the caller's edge.
     pub fn add_remote_candidate(&mut self, candidate: Candidate) -> Result<(), ProtocolError> {
         if self.gathering == GatheringState::Closed {
             return Err(IceError::Closed.into());
+        }
+        if !matches!(
+            candidate.network_type(),
+            NetworkType::Udp4 | NetworkType::Udp6
+        ) {
+            return Ok(());
         }
         if self
             .agent
@@ -162,10 +169,7 @@ impl IceLayer {
         if self.agent.get_remote_candidates().len() >= config::MAX_REMOTE_CANDIDATES {
             return Err(IceError::CandidateLimit.into());
         }
-        if !matches!(
-            candidate.network_type(),
-            NetworkType::Udp4 | NetworkType::Udp6
-        ) || candidate.component() != 1
+        if candidate.component() != 1
             || candidate.address().parse::<std::net::IpAddr>().is_err()
             || candidate.addr().port() == 0
             || candidate.addr().ip().is_unspecified()

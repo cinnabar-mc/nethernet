@@ -1,6 +1,6 @@
 //! Original finite TURN peer for transport tests; only RTC codecs perform STUN/TURN framing.
 use rtc::stun::attributes::*;
-use rtc::stun::error_code::{CODE_STALE_NONCE, CODE_UNAUTHORIZED};
+use rtc::stun::error_code::{CODE_FORBIDDEN, CODE_STALE_NONCE, CODE_UNAUTHORIZED};
 use rtc::stun::fingerprint::FINGERPRINT;
 use rtc::stun::integrity::MessageIntegrity;
 use rtc::stun::message::*;
@@ -31,6 +31,8 @@ pub struct TurnPeer {
     pub addr: SocketAddr,
     pub packets: VecDeque<(SocketAddr, Vec<u8>)>,
     pub drop_permissions: bool,
+    pub refuse_permissions_for: Option<IpAddr>,
+    pub permission_refusals: usize,
     pub indications: usize,
     pub channel_data: usize,
     pub refreshes: usize,
@@ -47,6 +49,8 @@ impl TurnPeer {
             addr,
             packets: VecDeque::new(),
             drop_permissions: false,
+            refuse_permissions_for: None,
+            permission_refusals: 0,
             indications: 0,
             channel_data: 0,
             refreshes: 0,
@@ -163,6 +167,31 @@ impl TurnPeer {
                 );
             }
             METHOD_CREATE_PERMISSION => {
+                let mut peer = PeerAddress::default();
+                peer.get_from(&request).unwrap();
+                if self.refuse_permissions_for == Some(peer.ip) {
+                    self.permission_refusals += 1;
+                    let response = encode(vec![
+                        Box::new(request.transaction_id),
+                        Box::new(MessageType::new(
+                            METHOD_CREATE_PERMISSION,
+                            CLASS_ERROR_RESPONSE,
+                        )),
+                        Box::new(CODE_FORBIDDEN),
+                        Box::new(
+                            MessageIntegrity::new_long_term_integrity_with_provider(
+                                USER.to_owned(),
+                                REALM.to_owned(),
+                                PASSWORD.to_owned(),
+                                provider.crypto(),
+                            )
+                            .unwrap(),
+                        ),
+                        Box::new(FINGERPRINT),
+                    ]);
+                    self.packets.push_back((from, response));
+                    return;
+                }
                 if self.stale_permissions_once {
                     self.stale_permissions_once = false;
                     self.stale_permission_responses += 1;

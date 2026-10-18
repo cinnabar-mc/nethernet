@@ -5,11 +5,11 @@ use nethernet::identity::PlayerInfo;
 use nethernet::protocol::Signal;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 pub(crate) enum Command {
-    Send(Channel, Bytes, oneshot::Sender<Result<()>>),
+    Send(Channel, Bytes, Option<Instant>, oneshot::Sender<Result<()>>),
     Signal(Signal),
     TurnCredentials(
         SocketAddr,

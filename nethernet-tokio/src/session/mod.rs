@@ -21,7 +21,7 @@ use outgoing::signal_send;
 use receive::{AdmissionError, Producer, Receiver, Terminal};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -204,7 +204,7 @@ impl Session {
                         Err(e) => tracing::debug!("recv error: {e}"),
                     },
                     command = commands.recv() => match command {
-                        Some(Command::Send(channel, data, reply)) => {
+                        Some(Command::Send(channel, data, _deadline, reply)) => {
                             let result = connection
                                 .handle(ConnectionInput::Send(channel, data, transport_now()))
                                 .map_err(NetherError::from);
@@ -293,7 +293,15 @@ impl Session {
     }
 
     pub async fn send(&self, data: Bytes) -> Result<()> {
-        self.send_on(Channel::Reliable, data).await
+        self.send_on(Channel::Reliable, data, None).await
+    }
+
+    /// Admits one reliable message before the original absolute deadline.
+    /// The driver checks the deadline immediately before SCTP admission; a
+    /// successful admission may finish transmitting afterwards. Dropping the
+    /// wait does not retract an already admitted message.
+    pub async fn send_before(&self, data: Bytes, deadline: Instant) -> Result<()> {
+        self.send_on(Channel::Reliable, data, Some(deadline)).await
     }
 
     /// Replaces one TURN server's credential without opening a service client or changing its allocation.
@@ -311,13 +319,18 @@ impl Session {
 
     /// The message must fit one segment (guide section 6.1).
     pub async fn send_unreliable(&self, data: Bytes) -> Result<()> {
-        self.send_on(Channel::Unreliable, data).await
+        self.send_on(Channel::Unreliable, data, None).await
     }
 
-    async fn send_on(&self, channel: Channel, data: Bytes) -> Result<()> {
+    async fn send_on(
+        &self,
+        channel: Channel,
+        data: Bytes,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
-            .send(Command::Send(channel, data, reply_tx))
+            .send(Command::Send(channel, data, deadline, reply_tx))
             .map_err(|_| NetherError::ConnectionClosed)?;
         reply_rx.await.map_err(|_| NetherError::ConnectionClosed)?
     }

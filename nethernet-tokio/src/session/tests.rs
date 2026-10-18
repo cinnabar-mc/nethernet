@@ -150,6 +150,45 @@ async fn local_cancel_and_driver_abort_retain_accepted_data_with_distinct_outcom
 mod peer;
 
 #[tokio::test]
+async fn an_expired_queued_send_is_refused_before_sctp_admission() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ((sender, _sender_reliable), (receiver, mut reliable, _unreliable)) =
+            connected_pair().await;
+        let deadline = tokio::time::Instant::now().into_std();
+        // Queue directly so the deadline belongs to the driver boundary, not an
+        // early check in the public method or a surrounding timeout future.
+        let (reply, result) = oneshot::channel();
+        sender
+            .command_tx
+            .send(Command::Send(
+                Channel::Reliable,
+                Bytes::from_static(b"expired Login"),
+                Some(deadline),
+                reply,
+            ))
+            .unwrap();
+        assert!(matches!(result.await.unwrap(), Err(NetherError::Timeout)));
+        sender
+            .send(Bytes::from_static(b"ordinary send"))
+            .await
+            .unwrap();
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "ordinary send");
+        sender
+            .send_before(
+                Bytes::from_static(b"timely Login"),
+                tokio::time::Instant::now().into_std() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "timely Login");
+        sender.close().await.unwrap();
+        receiver.close().await.unwrap();
+    })
+    .await
+    .expect("send admission deadline regression stalled");
+}
+
+#[tokio::test]
 async fn accepted_reliable_tail_survives_authenticated_peer_close_before_receiver_eof() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

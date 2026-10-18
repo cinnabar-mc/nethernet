@@ -1,6 +1,6 @@
 //! Original finite TURN peer for transport tests; only RTC codecs perform STUN/TURN framing.
 use rtc::stun::attributes::*;
-use rtc::stun::error_code::CODE_UNAUTHORIZED;
+use rtc::stun::error_code::{CODE_STALE_NONCE, CODE_UNAUTHORIZED};
 use rtc::stun::fingerprint::FINGERPRINT;
 use rtc::stun::integrity::MessageIntegrity;
 use rtc::stun::message::*;
@@ -17,9 +17,12 @@ use std::time::Duration;
 pub const USER: &str = "original-test-user";
 pub const PASSWORD: &str = "original-test-password";
 const REALM: &str = "original-test.invalid";
+const INITIAL_NONCE: &str = "original-test-nonce";
+const RENEWED_NONCE: &str = "original-test-renewed-nonce";
 
 struct Allocation {
     relay: SocketAddr,
+    nonce: String,
     permissions: HashSet<IpAddr>,
     channels: HashMap<u16, SocketAddr>,
 }
@@ -31,6 +34,9 @@ pub struct TurnPeer {
     pub indications: usize,
     pub channel_data: usize,
     pub refreshes: usize,
+    pub stale_permissions_once: bool,
+    pub stale_permission_responses: usize,
+    pub renewed_nonce_permissions: usize,
     allocations: HashMap<SocketAddr, Allocation>,
 }
 
@@ -44,6 +50,9 @@ impl TurnPeer {
             indications: 0,
             channel_data: 0,
             refreshes: 0,
+            stale_permissions_once: false,
+            stale_permission_responses: 0,
+            renewed_nonce_permissions: 0,
             allocations: HashMap::new(),
         }
     }
@@ -97,7 +106,7 @@ impl TurnPeer {
                 Box::new(MessageType::new(METHOD_ALLOCATE, CLASS_ERROR_RESPONSE)),
                 Box::new(CODE_UNAUTHORIZED),
                 Box::new(Realm::new(ATTR_REALM, REALM.to_string())),
-                Box::new(Nonce::new(ATTR_NONCE, "original-test-nonce".to_string())),
+                Box::new(Nonce::new(ATTR_NONCE, INITIAL_NONCE.to_string())),
                 Box::new(FINGERPRINT),
             ]);
             self.packets.push_back((from, response));
@@ -114,6 +123,13 @@ impl TurnPeer {
         )
         .unwrap();
         MessageIntegrity::check(&mut request, &key, provider.crypto()).unwrap();
+        let nonce = Nonce::get_from_as(&request, ATTR_NONCE).unwrap();
+        if let Some(allocation) = self.allocations.get(&from)
+            && nonce.text != allocation.nonce
+        {
+            self.stale_nonce(from, &request);
+            return;
+        }
         match request.typ.method {
             METHOD_ALLOCATE => {
                 // RTC's default allocation request asks for IPv4 even over an IPv6 server transport.
@@ -124,6 +140,7 @@ impl TurnPeer {
                     from,
                     Allocation {
                         relay,
+                        nonce: INITIAL_NONCE.to_owned(),
                         permissions: HashSet::new(),
                         channels: HashMap::new(),
                     },
@@ -146,6 +163,16 @@ impl TurnPeer {
                 );
             }
             METHOD_CREATE_PERMISSION => {
+                if self.stale_permissions_once {
+                    self.stale_permissions_once = false;
+                    self.stale_permission_responses += 1;
+                    self.allocations.get_mut(&from).unwrap().nonce = RENEWED_NONCE.to_owned();
+                    self.stale_nonce(from, &request);
+                    return;
+                }
+                if nonce.text == RENEWED_NONCE {
+                    self.renewed_nonce_permissions += 1;
+                }
                 if self.drop_permissions {
                     return;
                 }
@@ -188,6 +215,20 @@ impl TurnPeer {
             }
             _ => panic!("unexpected TURN method"),
         }
+    }
+
+    /// Returns an unsigned scoped nonce challenge, preserving the server's allocation.
+    fn stale_nonce(&mut self, to: SocketAddr, request: &Message) {
+        let nonce = self.allocations[&to].nonce.clone();
+        let response = encode(vec![
+            Box::new(request.transaction_id),
+            Box::new(MessageType::new(request.typ.method, CLASS_ERROR_RESPONSE)),
+            Box::new(CODE_STALE_NONCE),
+            Box::new(Nonce::new(ATTR_NONCE, nonce)),
+            Box::new(Realm::new(ATTR_REALM, REALM.to_owned())),
+            Box::new(FINGERPRINT),
+        ]);
+        self.packets.push_back((to, response));
     }
 
     /// Sends a response, authenticating with the same original test credential as the request.

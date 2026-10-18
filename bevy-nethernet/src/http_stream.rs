@@ -23,6 +23,7 @@ pub(crate) enum Shutdown {
 
 pub(crate) struct HttpStream {
     wire: Wire,
+    connecting: bool,
     pub(crate) inbound: Vec<u8>,
     outbound: Vec<u8>,
     written: usize,
@@ -32,6 +33,7 @@ impl HttpStream {
     pub(crate) fn new(wire: Wire) -> Self {
         Self {
             wire,
+            connecting: false,
             inbound: Vec::new(),
             outbound: Vec::new(),
             written: 0,
@@ -47,12 +49,18 @@ impl HttpStream {
     }
 
     pub(crate) fn fill(&mut self) -> Result<Inbound, WireError> {
+        if !self.connect_ready()? {
+            return Ok(Inbound::Idle);
+        }
         self.wire.read(&mut self.inbound)
     }
 
     pub(crate) fn drain(&mut self) -> Result<Drain, WireError> {
         if self.outbound.is_empty() {
             return Ok(Drain::Empty);
+        }
+        if !self.connect_ready()? {
+            return Ok(Drain::Blocked);
         }
         match self.wire.write(&self.outbound[self.written..]) {
             Ok(0) => Err(WireError::WriteZero),
@@ -72,7 +80,21 @@ impl HttpStream {
     }
 
     pub(crate) fn flush(&mut self) -> Result<(), WireError> {
+        if !self.connect_ready()? {
+            return Ok(());
+        }
         self.wire.flush()
+    }
+
+    /// Retains queued bytes until the client socket finishes its nonblocking connect.
+    fn connect_ready(&mut self) -> std::io::Result<bool> {
+        if self.connecting {
+            if !self.wire.poll_connect()? {
+                return Ok(false);
+            }
+            self.connecting = false;
+        }
+        Ok(true)
     }
 
     pub(crate) fn close(&mut self) -> Shutdown {
@@ -175,7 +197,9 @@ impl ClientTls {
             true => self.secure_wire(host, addr)?,
             false => Wire::plain(HttpStream::connect_socket(addr)?),
         };
-        Ok(HttpStream::new(wire))
+        let mut stream = HttpStream::new(wire);
+        stream.connecting = true;
+        Ok(stream)
     }
 
     #[cfg(feature = "tls")]
@@ -221,6 +245,19 @@ mod tests {
         local.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
         (HttpStream::new(Wire::plain(local)), peer)
+    }
+
+    #[test]
+    fn pending_connect_keeps_the_request_queued() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(SocketProtocol::TCP)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut stream = HttpStream::new(Wire::plain(socket.into()));
+        stream.connecting = true;
+        stream.queue(b"GET / HTTP/1.1\r\n\r\n");
+
+        assert_eq!(stream.drain().unwrap(), Drain::Blocked);
+        assert_eq!(stream.fill().unwrap(), Inbound::Idle);
+        assert!(stream.has_outbound());
     }
 
     #[test]

@@ -83,24 +83,30 @@ async fn queued_and_live_accepted_sessions_hold_the_server_capacity() {
         };
         let (url, mut listener) = serve_with_connection(server_config(), connection).await;
         let first = connect_once(&url, "peer-one").await.unwrap();
+        let refused = connect_once(&url, "peer-two").await;
         assert!(
             matches!(
-                connect_once(&url, "peer-two").await,
+                &refused,
                 Err(NetherError::Signaled(
                     SignalErrorCode::IncomingConnectionIgnored
                 ))
             ),
-            "a connected session queued for accept must retain the server capacity"
+            "a connected session queued for accept must retain the server capacity: connected={}, error={:?}",
+            refused.is_ok(),
+            refused.as_ref().err()
         );
         let mut accepted = listener.accept().await.unwrap();
+        let refused = connect_once(&url, "peer-three").await;
         assert!(
             matches!(
-                connect_once(&url, "peer-three").await,
+                &refused,
                 Err(NetherError::Signaled(
                     SignalErrorCode::IncomingConnectionIgnored
                 ))
             ),
-            "transferring a live session to its consumer must not release server capacity"
+            "transferring a live session to its consumer must not release server capacity: connected={}, error={:?}",
+            refused.is_ok(),
+            refused.as_ref().err()
         );
         first
             .send(Bytes::from_static(b"original accepted peer"))
@@ -153,14 +159,17 @@ async fn closed_accepted_receivers_retain_capacity_until_their_owners_retire() {
         accepted.session.close().await.unwrap();
         client.close().await.unwrap();
         drop(accepted.session);
+        let refused = connect_once(&url, "refused-peer").await;
         assert!(
             matches!(
-                connect_once(&url, "refused-peer").await,
+                &refused,
                 Err(NetherError::Signaled(
                     SignalErrorCode::IncomingConnectionIgnored
                 ))
             ),
-            "closed receivers must keep their original session reservation"
+            "closed receivers must keep their original session reservation: connected={}, error={:?}",
+            refused.is_ok(),
+            refused.as_ref().err()
         );
         drop(accepted.reliable);
         drop(accepted.unreliable);

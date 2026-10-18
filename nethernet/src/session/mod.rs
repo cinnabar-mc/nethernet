@@ -312,6 +312,9 @@ impl<S: Phase> Session<S> {
     where
         S: Live,
     {
+        if self.ice.gathering_state() == GatheringState::Closed {
+            return (self.rephase(), Ok(()));
+        }
         let mut accepted = std::mem::take(&mut self.output);
         accepted.retain(|output| {
             matches!(

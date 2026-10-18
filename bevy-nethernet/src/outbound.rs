@@ -229,6 +229,29 @@ impl Outbound {
         Some(event)
     }
 
+    /// Restores a message rejected by application promotion to its just-freed original delivery slot.
+    pub(crate) fn retain_rejected_message(&mut self, channel: Channel, data: Box<[u8]>) {
+        assert!(
+            self.events.len() < MAX_RECEIVED_MESSAGES,
+            "promotion released one transport slot"
+        );
+        assert!(
+            data.len() <= MAX_RECEIVED_BYTES.saturating_sub(self.buffered_bytes),
+            "promotion released this message's transport byte budget"
+        );
+        self.buffered_bytes += data.len();
+        self.events
+            .push_front(ConnectionEvent::Message(channel, data));
+    }
+
+    /// Moves the original bounded delivery allocation out before finite transport retirement.
+    pub(crate) fn retire(mut self) -> VecDeque<ConnectionEvent> {
+        let events = std::mem::take(&mut self.events);
+        self.buffered_bytes = 0;
+        self.close(Instant::now());
+        events
+    }
+
     /// Returns late candidates once, for carriers supporting trickle signaling.
     pub(crate) fn poll_local_signal(&mut self) -> Option<Signal> {
         match self.state.get() {
@@ -353,15 +376,18 @@ pub(crate) struct Received {
     reliable: VecDeque<Box<[u8]>>,
     unreliable: VecDeque<Box<[u8]>>,
     bytes: usize,
+    // The original independently bounded transport allocation, moved here once after failure.
+    retired_transport: Option<VecDeque<ConnectionEvent>>,
 }
 
 impl Received {
-    /// Admits one complete message; overflow terminates the connection rather than losing reliable data silently.
-    pub(crate) fn push(&mut self, channel: Channel, data: Box<[u8]>) -> Result<(), ProtocolError> {
-        if self.reliable.len() + self.unreliable.len() >= MAX_RECEIVED_MESSAGES
+    /// Admits one complete message or returns its original ownership on overflow or retirement.
+    pub(crate) fn push(&mut self, channel: Channel, data: Box<[u8]>) -> Result<(), Box<[u8]>> {
+        if self.retired_transport.is_some()
+            || self.reliable.len() + self.unreliable.len() >= MAX_RECEIVED_MESSAGES
             || data.len() > MAX_RECEIVED_BYTES.saturating_sub(self.bytes)
         {
-            return Err(ProtocolError::Other("client receive limit reached".into()));
+            return Err(data);
         }
         self.bytes += data.len();
         match channel {
@@ -371,14 +397,34 @@ impl Received {
         Ok(())
     }
 
-    /// Transfers one message to the application and releases its byte budget.
+    /// Takes the original transport tail without concatenating or extending either admission budget.
+    pub(crate) fn retain_transport(&mut self, mut events: VecDeque<ConnectionEvent>) {
+        assert!(
+            self.retired_transport.is_none(),
+            "a retired receiver takes its original transport tail once"
+        );
+        events.retain(|event| matches!(event, ConnectionEvent::Message(..)));
+        self.retired_transport = Some(events);
+    }
+
+    /// Transfers primary messages first, followed by the same channel's retained transport tail.
     pub(crate) fn pop(&mut self, channel: Channel) -> Option<Box<[u8]>> {
-        let data = match channel {
+        let primary = match channel {
             Channel::Reliable => self.reliable.pop_front(),
             Channel::Unreliable => self.unreliable.pop_front(),
-        }?;
-        self.bytes -= data.len();
-        Some(data)
+        };
+        if let Some(data) = primary {
+            self.bytes -= data.len();
+            return Some(data);
+        }
+        let tail = self.retired_transport.as_mut()?;
+        let index = tail.iter().position(
+            |event| matches!(event, ConnectionEvent::Message(found, _) if *found == channel),
+        )?;
+        match tail.remove(index) {
+            Some(ConnectionEvent::Message(_, data)) => Some(data),
+            _ => unreachable!("the retained position identifies an accepted message"),
+        }
     }
 }
 
@@ -411,8 +457,9 @@ impl EstablishedClient {
         self.received.pop(Channel::Unreliable)
     }
     /// Consumes local transport ownership while retaining accepted messages for retrospective draining.
-    pub(crate) fn close(mut self) -> Received {
-        self.transport.close(Instant::now());
-        std::mem::take(&mut self.received)
+    pub(crate) fn close(self) -> Received {
+        let mut received = self.received;
+        received.retain_transport(self.transport.retire());
+        received
     }
 }

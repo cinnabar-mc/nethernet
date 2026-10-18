@@ -44,8 +44,9 @@ original owner is returned unchanged. Application `send` exists only on
 `Established`; control inputs cannot bypass that boundary.
 
 Core `close(self, now)` consumes a live owner and returns `(Retired, teardown_result)`.
-Drain the retired owner's best-effort deallocation output even when teardown
-reports an error. It cannot accept input, credentials or new application sends.
+Drain the retired owner's already accepted messages and best-effort deallocation
+output even when teardown reports an error. It cannot accept input, credentials
+or new application sends.
 Remote failure still arrives at runtime and preserves the existing accepted
 message/terminal order; readiness does not promise that a remote peer stays live.
 
@@ -312,7 +313,10 @@ existing shared-socket worker and command/event queues; this does not multiplex
 multiple relay allocations onto a shared TURN tuple. Outbound work reads at most
 64 datagrams and drains at most 1024 core outputs per update. Transport delivery
 and application delivery each retain at most 1024 messages and 16 MiB; exceeding a
-receive budget closes the client explicitly. Sends apply core expiry immediately
+receive budget closes the client explicitly. On transport failure, both existing
+delivery stages retain their accepted messages for retrospective reads; neither
+stage admits new data after retirement. Explicit disconnect or a new connection
+discards the old receive owner. Sends apply core expiry immediately
 and return `WouldBlock` before admitting more work when the drain budget is full.
 Cancellation drops the socket owner after finite best-effort relay release.
 Initial HTTP hostname resolution/platform TLS setup are synchronous explicit

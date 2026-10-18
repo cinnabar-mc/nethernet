@@ -108,7 +108,7 @@ impl Stream for SessionStream {
 pub struct NetherClient {
     session: Session,
     unreliable: SessionReceiver,
-    reader: StreamReader<SessionStream, Bytes>,
+    reader: Option<StreamReader<SessionStream, Bytes>>,
     send_future: Option<ReusableBoxFuture<'static, Result<()>>>,
     shutdown_future: Option<ReusableBoxFuture<'static, Result<()>>>,
 }
@@ -335,7 +335,7 @@ impl NetherClient {
         Self {
             session,
             unreliable,
-            reader: StreamReader::new(SessionStream { receiver: reliable }),
+            reader: Some(StreamReader::new(SessionStream { receiver: reliable })),
             send_future: None,
             shutdown_future: None,
         }
@@ -353,9 +353,23 @@ impl NetherClient {
         self.unreliable.recv().await
     }
 
-    /// Next reliable message; None once the connection closes.
+    /// Next reliable message; a partially read stream chunk is returned before later messages.
+    /// Returns None after the accepted prefix and ordinary terminal have been consumed.
     pub async fn recv(&mut self) -> Result<Option<Bytes>> {
-        self.reader.get_mut().receiver.recv().await
+        let (mut stream, chunk) = self
+            .reader
+            .take()
+            .expect("the client retains its reliable reader")
+            .into_inner_with_chunk();
+        stream.receiver = stream.receiver.retain_reader_chunk(chunk);
+        self.reader = Some(StreamReader::new(stream));
+        self.reader
+            .as_mut()
+            .expect("the reader is restored before receiving")
+            .get_mut()
+            .receiver
+            .recv()
+            .await
     }
 
     /// Consumes the live client and retains its original accepted receivers for draining.
@@ -375,11 +389,15 @@ impl NetherClient {
         self.session.rtt().await
     }
 
-    /// Splits into the session and its two receivers.
+    /// Splits into the session and original receivers, retaining any unread stream chunk first.
     pub fn into_accepted(self) -> AcceptedSession {
+        let (stream, chunk) = self
+            .reader
+            .expect("the client retains its reliable reader")
+            .into_inner_with_chunk();
         AcceptedSession {
             session: self.session,
-            reliable: self.reader.into_inner().receiver,
+            reliable: stream.receiver.retain_reader_chunk(chunk),
             unreliable: self.unreliable,
         }
     }
@@ -396,7 +414,12 @@ impl AsyncRead for NetherClient {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(cx, buf)
+        Pin::new(
+            self.reader
+                .as_mut()
+                .expect("the client retains its reliable reader"),
+        )
+        .poll_read(cx, buf)
     }
 }
 

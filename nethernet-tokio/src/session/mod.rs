@@ -83,6 +83,8 @@ pub(crate) struct Ready;
 /// Incoming accepted messages, followed by EOF on orderly close or one explicit receive error.
 pub struct SessionReceiver {
     rx: Receiver,
+    // The one already-admitted chunk previously retained by the client's stream reader.
+    reader_chunk: Option<Bytes>,
     _guard: Arc<TaskGuard>,
 }
 
@@ -92,7 +94,22 @@ impl SessionReceiver {
     }
 
     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>>> {
+        if let Some(chunk) = self.reader_chunk.take() {
+            return Poll::Ready(Ok(Some(chunk)));
+        }
         self.rx.poll_recv(cx)
+    }
+
+    /// Moves the existing stream-reader chunk back before its original receive FIFO.
+    pub(crate) fn retain_reader_chunk(mut self, chunk: Option<Bytes>) -> Self {
+        if let Some(chunk) = chunk {
+            assert!(
+                self.reader_chunk.is_none(),
+                "the stream reader owns only one pending chunk"
+            );
+            self.reader_chunk = Some(chunk);
+        }
+        self
     }
 }
 
@@ -241,10 +258,12 @@ impl Session<Connecting> {
             session,
             SessionReceiver {
                 rx: packet_rx,
+                reader_chunk: None,
                 _guard: guard.clone(),
             },
             SessionReceiver {
                 rx: unreliable_rx,
+                reader_chunk: None,
                 _guard: guard,
             },
             ready_rx,

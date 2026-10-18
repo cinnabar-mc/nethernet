@@ -312,7 +312,16 @@ impl<S: Phase> Session<S> {
     where
         S: Live,
     {
+        let mut accepted = std::mem::take(&mut self.output);
+        accepted.retain(|output| {
+            matches!(
+                output,
+                SessionOutput::Message(..) | SessionOutput::Event(..)
+            )
+        });
         let result = self.close_transport(now);
+        accepted.append(&mut self.output);
+        self.output = accepted;
         (self.rephase(), result)
     }
 

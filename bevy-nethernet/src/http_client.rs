@@ -580,7 +580,10 @@ impl NetherHttpClient {
                         Some(entry) => &mut entry.received,
                         None => &mut self.received,
                     };
-                    if received.push(channel, data).is_err() {
+                    if let Err(data) = received.push(channel, data) {
+                        self.transport_mut()
+                            .expect("the original transport retains rejected promotion")
+                            .retain_rejected_message(channel, data);
                         self.fail_connection();
                         return;
                     }
@@ -619,12 +622,15 @@ impl NetherHttpClient {
 
     /// Consumes the actual ready owner, retaining accepted data only for retrospective failure reads.
     fn retire_transport(&mut self, retain_received: bool) {
-        self.transport = None;
+        let pending = self.transport.take();
         if let Some(entry) = self.established.take() {
             let received = entry.close();
             if retain_received {
                 self.received = received;
             }
+        }
+        if retain_received && let Some(transport) = pending {
+            self.received.retain_transport(transport.retire());
         }
     }
 }

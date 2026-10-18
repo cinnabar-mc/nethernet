@@ -7,6 +7,16 @@ async fn connected_pair() -> (
     (Session, SessionReceiver),
     (Session, SessionReceiver, SessionReceiver),
 ) {
+    connected_pair_with_server_lease(None).await
+}
+
+/// Uses the same real pair when its answerer also owns a retained listener reservation.
+async fn connected_pair_with_server_lease(
+    server: Option<Arc<ServerLease>>,
+) -> (
+    (Session, SessionReceiver),
+    (Session, SessionReceiver, SessionReceiver),
+) {
     let sockets = [
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
@@ -33,11 +43,52 @@ async fn connected_pair() -> (
         .unwrap();
     let (a, a_reliable, _a_unreliable, a_ready) =
         Session::spawn(sockets[0].clone(), a, Addr::default(), Addr::default());
-    let (b, b_reliable, b_unreliable, b_ready) =
-        Session::spawn(sockets[1].clone(), b, Addr::default(), Addr::default());
+    let (b, b_reliable, b_unreliable, b_ready) = match server {
+        Some(lease) => Session::spawn_for_server(
+            sockets[1].clone(),
+            b,
+            Addr::default(),
+            Addr::default(),
+            lease,
+        ),
+        None => Session::spawn(sockets[1].clone(), b, Addr::default(), Addr::default()),
+    };
     a_ready.await.unwrap();
     b_ready.await.unwrap();
     ((a, a_reliable), (b, b_reliable, b_unreliable))
+}
+
+#[tokio::test]
+async fn a_ready_server_session_can_transfer_its_accepted_fifo_after_transport_close() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = ServerLease::new(capacity.clone().try_acquire_owned().unwrap());
+        let ((sender, _sender_reliable), (receiver, mut reliable, _unreliable)) =
+            connected_pair_with_server_lease(Some(lease)).await;
+        sender
+            .send(Bytes::from_static(b"queued ready peer"))
+            .await
+            .unwrap();
+        while reliable.rx.len() == 0 {
+            assert!(!receiver.is_closed().await);
+            tokio::task::yield_now().await;
+        }
+        receiver.close().await.unwrap();
+        assert!(
+            receiver.accept_from_server(),
+            "a ready queued peer must retain its accepted data and terminal"
+        );
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "queued ready peer");
+        assert!(reliable.recv().await.unwrap().is_none());
+        assert_eq!(
+            capacity.available_permits(),
+            0,
+            "transferring a closed receiver does not retire its capacity"
+        );
+        sender.close().await.unwrap();
+    })
+    .await
+    .expect("queued ready peer lost its accepted FIFO after closure");
 }
 
 #[tokio::test]
@@ -190,6 +241,7 @@ async fn an_expired_queued_send_is_refused_before_sctp_admission() {
                 Some(deadline),
                 reply,
             ))
+            .await
             .unwrap();
         assert!(matches!(result.await.unwrap(), Err(NetherError::Timeout)));
         let (reply, result) = oneshot::channel();
@@ -202,6 +254,7 @@ async fn an_expired_queued_send_is_refused_before_sctp_admission() {
                 Some(deadline + Duration::from_secs(5)),
                 reply,
             ))
+            .await
             .unwrap();
         sender
             .send(Bytes::from_static(b"ordinary send"))

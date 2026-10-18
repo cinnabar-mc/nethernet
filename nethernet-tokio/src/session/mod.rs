@@ -3,8 +3,10 @@ pub(crate) mod command;
 pub(crate) mod guard;
 pub(crate) mod outgoing;
 mod receive;
+mod server;
 
 pub(crate) use command::Command;
+pub(crate) use server::{ServerLease, ServerRetirement};
 
 use crate::addr::Addr;
 use crate::error::{NetherError, Result};
@@ -35,6 +37,7 @@ const PACKET_CHANNEL_CAPACITY: usize =
 struct TaskGuard {
     close_token: CancellationToken,
     task: JoinHandle<()>,
+    server: Option<Arc<ServerLease>>,
 }
 
 impl Drop for TaskGuard {
@@ -44,12 +47,12 @@ impl Drop for TaskGuard {
     }
 }
 
-/// Cloneable handle; closing it or dropping every command handle retires the transport.
+/// Cloneable transport handle; accepted receivers retain their data after closure.
 #[derive(Clone)]
 pub struct Session {
     local_addr: Addr,
     remote_addr: Addr,
-    command_tx: mpsc::UnboundedSender<Command>,
+    command_tx: mpsc::Sender<Command>,
     close_token: CancellationToken,
     _guard: Arc<TaskGuard>,
 }
@@ -81,7 +84,7 @@ impl Session {
     /// Observes actual actor admission in owning tests without advancing the driver.
     #[cfg(test)]
     fn queued_commands(&self) -> usize {
-        self.command_tx.len()
+        self.command_tx.max_capacity() - self.command_tx.capacity()
     }
 
     pub(crate) fn spawn(
@@ -111,7 +114,40 @@ impl Session {
         SessionReceiver,
         oneshot::Receiver<()>,
     ) {
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        Self::spawn_owned(socket, connection, local, remote, signaling, None)
+    }
+
+    /// Moves the original server reservation into the same session/receiver lifetime.
+    pub(crate) fn spawn_for_server(
+        socket: Arc<UdpSocket>,
+        connection: SansConnection,
+        local: Addr,
+        remote: Addr,
+        lease: Arc<ServerLease>,
+    ) -> (
+        Self,
+        SessionReceiver,
+        SessionReceiver,
+        oneshot::Receiver<()>,
+    ) {
+        Self::spawn_owned(socket, connection, local, remote, None, Some(lease))
+    }
+
+    /// Constructs one existing actor without a cancellation gap before installing its owned guard.
+    fn spawn_owned(
+        socket: Arc<UdpSocket>,
+        connection: SansConnection,
+        local: Addr,
+        remote: Addr,
+        signaling: Option<(ClientSignaling, Duration)>,
+        server: Option<Arc<ServerLease>>,
+    ) -> (
+        Self,
+        SessionReceiver,
+        SessionReceiver,
+        oneshot::Receiver<()>,
+    ) {
+        let (command_tx, command_rx) = mpsc::channel(command::COMMAND_CAPACITY);
         let (packet_tx, packet_rx) = receive::channel(Channel::Reliable);
         let (unreliable_tx, unreliable_rx) = receive::channel(Channel::Unreliable);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -126,11 +162,13 @@ impl Session {
             Some(ready_tx),
             close_token.clone(),
             signaling,
+            server.clone(),
         );
 
         let guard = Arc::new(TaskGuard {
             close_token: close_token.clone(),
             task,
+            server,
         });
 
         let session = Self {
@@ -155,26 +193,51 @@ impl Session {
         )
     }
 
-    pub(crate) fn signal_sender(&self) -> mpsc::UnboundedSender<Command> {
+    pub(crate) fn signal_sender(&self) -> mpsc::Sender<Command> {
         self.command_tx.clone()
+    }
+
+    /// Arbitrates public acceptance against listener retirement without an asynchronous gap.
+    pub(crate) fn accept_from_server(&self) -> bool {
+        self._guard
+            .server
+            .as_ref()
+            .is_some_and(|lease| lease.accept())
+    }
+
+    /// Keeps cancellation of unaccepted sessions owned by the listener, including task abortion.
+    pub(crate) fn server_retirement(&self) -> ServerRetirement {
+        ServerRetirement::new(
+            self._guard
+                .server
+                .as_ref()
+                .expect("only server sessions have a listener owner"),
+            self.close_token.clone(),
+        )
+    }
+
+    /// Allows peer control to stop the actor without retaining its application owners.
+    pub(crate) fn close_token(&self) -> CancellationToken {
+        self.close_token.clone()
     }
 
     #[allow(clippy::too_many_arguments)]
     fn drive(
         socket: Arc<UdpSocket>,
         connection: SansConnection,
-        mut commands: mpsc::UnboundedReceiver<Command>,
+        mut commands: mpsc::Receiver<Command>,
         packet_tx: Producer,
         unreliable_tx: Producer,
         mut ready_tx: Option<oneshot::Sender<()>>,
         close_token: CancellationToken,
         signaling: Option<(ClientSignaling, Duration)>,
+        server: Option<Arc<ServerLease>>,
     ) -> JoinHandle<()> {
-        let mut guard = ConnectionGuard::new(connection, socket.clone());
+        let mut guard = ConnectionGuard::new(connection, socket).with_server_capacity(server);
         let driver_closed = close_token.clone().drop_guard();
         tokio::spawn(async move {
             let _driver_closed = driver_closed;
-            let connection = guard.core();
+            let (connection, socket) = guard.parts();
             let mut buf = vec![0u8; 65536];
             let mut wake = transport_now();
             let mut outgoing: Option<BoxFuture<'static, Result<()>>> = None;
@@ -324,9 +387,11 @@ impl Session {
         credentials: nethernet::session::TurnCredentials,
     ) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(Command::TurnCredentials(server, credentials, reply_tx))
-            .map_err(|_| NetherError::ConnectionClosed)?;
+        self.enqueue(
+            Command::TurnCredentials(server, credentials, reply_tx),
+            None,
+        )
+        .await?;
         reply_rx.await.map_err(|_| NetherError::ConnectionClosed)?
     }
 
@@ -341,11 +406,40 @@ impl Session {
         data: Bytes,
         deadline: Option<Instant>,
     ) -> Result<()> {
+        if deadline.is_some_and(|deadline| transport_now() >= deadline) {
+            return Err(NetherError::Timeout);
+        }
+        let max_size = match channel {
+            Channel::Reliable => {
+                nethernet::protocol::constants::MAX_MESSAGE_SIZE * usize::from(u8::MAX)
+            }
+            Channel::Unreliable => {
+                nethernet::protocol::constants::MAX_MESSAGE_SIZE.saturating_sub(1)
+            }
+        };
+        if data.len() > max_size {
+            return Err(nethernet::error::ProtocolError::MessageSizeExceeded(data.len()).into());
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(Command::Send(channel, data, deadline, reply_tx))
-            .map_err(|_| NetherError::ConnectionClosed)?;
+        self.enqueue(Command::Send(channel, data, deadline, reply_tx), deadline)
+            .await?;
         reply_rx.await.map_err(|_| NetherError::ConnectionClosed)?
+    }
+
+    /// Waits outside the bounded actor queue; cancellation cannot leave an unadmitted command behind.
+    async fn enqueue(&self, command: Command, deadline: Option<Instant>) -> Result<()> {
+        let expired = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = self.close_token.cancelled() => Err(NetherError::ConnectionClosed),
+            _ = expired => Err(NetherError::Timeout),
+            result = self.command_tx.send(command) => result.map_err(|_| NetherError::ConnectionClosed),
+        }
     }
 
     /// Starts closing and returns without waiting for teardown.
@@ -360,7 +454,7 @@ impl Session {
 
     pub async fn remote_addr(&self) -> Addr {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let socket_addr = match self.command_tx.send(Command::RemoteAddr(reply_tx)) {
+        let socket_addr = match self.enqueue(Command::RemoteAddr(reply_tx), None).await {
             Ok(()) => reply_rx.await.ok().flatten(),
             Err(_) => None,
         };
@@ -373,7 +467,7 @@ impl Session {
     /// None until a round trip time has been measured.
     pub async fn rtt(&self) -> Option<Duration> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.command_tx.send(Command::Rtt(reply_tx)).is_err() {
+        if self.enqueue(Command::Rtt(reply_tx), None).await.is_err() {
             return None;
         }
         reply_rx.await.ok().flatten()
@@ -381,12 +475,12 @@ impl Session {
 
     /// Records the validated identity of the peer; the HTTP server sets it after admission.
     pub async fn set_player(&self, player: Arc<PlayerInfo>) {
-        let _ = self.command_tx.send(Command::SetPlayer(player));
+        let _ = self.enqueue(Command::SetPlayer(player), None).await;
     }
 
     pub async fn player(&self) -> Option<Arc<PlayerInfo>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.command_tx.send(Command::Player(reply_tx)).is_err() {
+        if self.enqueue(Command::Player(reply_tx), None).await.is_err() {
             return None;
         }
         reply_rx.await.ok().flatten()
@@ -394,12 +488,12 @@ impl Session {
 
     /// Records the Host header of the offer request, HTTP signaling only.
     pub async fn set_host(&self, host: String) {
-        let _ = self.command_tx.send(Command::SetHost(host));
+        let _ = self.enqueue(Command::SetHost(host), None).await;
     }
 
     pub async fn host(&self) -> Option<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.command_tx.send(Command::Host(reply_tx)).is_err() {
+        if self.enqueue(Command::Host(reply_tx), None).await.is_err() {
             return None;
         }
         reply_rx.await.ok().flatten()

@@ -52,7 +52,8 @@ fn spawn_late_signal_forwarder<St>(
     mut signals: St,
     connection_id: u64,
     remote_network_id: String,
-    command_tx: tokio::sync::mpsc::UnboundedSender<Command>,
+    command_tx: tokio::sync::mpsc::Sender<Command>,
+    closed: tokio_util::sync::CancellationToken,
     signaling: ClientSignaling,
 ) where
     St: Stream<Item = Signal> + Send + Unpin + 'static,
@@ -61,6 +62,8 @@ fn spawn_late_signal_forwarder<St>(
         let _signaling = signaling;
         loop {
             let signal = tokio::select! {
+                biased;
+                _ = closed.cancelled() => break,
                 _ = command_tx.closed() => break,
                 signal = signals.next() => match signal {
                     Some(signal) => signal,
@@ -73,8 +76,12 @@ fn spawn_late_signal_forwarder<St>(
             if signal.signal_type != SignalType::Candidate {
                 continue;
             }
-            if command_tx.send(Command::Signal(signal)).is_err() {
-                break;
+            tokio::select! {
+                biased;
+                _ = closed.cancelled() => break,
+                result = command_tx.send(Command::Signal(signal)) => {
+                    if result.is_err() { break; }
+                }
             }
         }
     });
@@ -298,6 +305,7 @@ impl NetherClient {
             connection_id,
             remote_network_id.to_string(),
             session.signal_sender(),
+            session.close_token(),
             signaling.clone(),
         );
 
@@ -590,6 +598,7 @@ mod tests {
                     offer.connection_id,
                     offer.network_id,
                     session.signal_sender(),
+                    session.close_token(),
                     server.clone().into(),
                 );
                 ready.await.unwrap();

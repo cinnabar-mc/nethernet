@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// Bounds retained actor commands independently of application-owned pending send futures.
-pub(super) const COMMAND_CAPACITY: usize = 16;
+pub(crate) const COMMAND_CAPACITY: usize = 16;
 
 pub(crate) enum Command {
     Send(Channel, Bytes, Option<Instant>, oneshot::Sender<Result<()>>),

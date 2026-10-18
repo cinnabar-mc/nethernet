@@ -140,6 +140,56 @@ async fn closing_the_listener_preserves_an_already_accepted_session() {
     .expect("listener close ended or stalled an already accepted session");
 }
 
+#[tokio::test]
+async fn closed_accepted_receivers_retain_capacity_until_their_owners_retire() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let connection = ConnectionConfig {
+            max_sessions: 1,
+            ..server_connection_config()
+        };
+        let (url, mut listener) = serve_with_connection(server_config(), connection).await;
+        let client = connect_once(&url, "retained-peer").await.unwrap();
+        let accepted = listener.accept().await.unwrap();
+        accepted.session.close().await.unwrap();
+        client.close().await.unwrap();
+        drop(accepted.session);
+        assert!(
+            matches!(
+                connect_once(&url, "refused-peer").await,
+                Err(NetherError::Signaled(
+                    SignalErrorCode::IncomingConnectionIgnored
+                ))
+            ),
+            "closed receivers must keep their original session reservation"
+        );
+        drop(accepted.reliable);
+        drop(accepted.unreliable);
+        let replacement = loop {
+            match connect_once(&url, "replacement-peer").await {
+                // Actual actor destruction may still be queued; wait through its public refusal.
+                Err(NetherError::Signaled(SignalErrorCode::IncomingConnectionIgnored)) => {
+                    tokio::task::yield_now().await;
+                }
+                result => break result.unwrap(),
+            }
+        };
+        let mut accepted = listener.accept().await.unwrap();
+        replacement
+            .send(Bytes::from_static(b"replacement peer"))
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.reliable.recv().await.unwrap().unwrap(),
+            "replacement peer"
+        );
+        accepted.session.close().await.unwrap();
+        replacement.close().await.unwrap();
+        listener.close().await.unwrap();
+    })
+    .await
+    .expect("actual session retirement failed to release bounded server capacity");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn offer_is_negotiated_over_the_endpoint() {
     let (url, mut listener) = serve(server_config()).await;

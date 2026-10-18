@@ -39,7 +39,7 @@ pub struct ConnectionConfig {
     /// Deadlines for the stages of negotiation.
     pub timeouts: Timeouts,
 
-    /// Aborts client negotiation when cancelled.
+    /// Aborts client negotiation and unaccepted server sessions when cancelled.
     pub cancel_token: CancellationToken,
 
     /// Client offers made when negotiation times out; 0 counts as 1.
@@ -72,6 +72,7 @@ pub struct ConnectionConfig {
     pub max_pending_per_network_id: usize,
 
     /// Total negotiating, queued accepted and live server sessions retained until retirement.
+    /// A closed receiver still retaining accepted data holds its reservation; zero refuses all offers.
     pub max_sessions: usize,
 }
 
@@ -110,6 +111,7 @@ impl fmt::Debug for ConnectionConfig {
                 "max_pending_per_network_id",
                 &self.max_pending_per_network_id,
             )
+            .field("max_sessions", &self.max_sessions)
             .finish()
     }
 }

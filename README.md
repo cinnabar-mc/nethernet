@@ -111,6 +111,24 @@ defaults to accepting any self-signed token while still binding it to the certif
 peer presents. `nethernet_tokio::util::jwks::Jwks::minecraft` fetches the keys needed to
 require a token issued by the Minecraft authorization service instead.
 
+### Server ownership
+
+`ConnectionConfig::max_sessions` bounds negotiating, queued and accepted Tokio
+server sessions together. A reservation is retained through actual driver
+retirement and every session or receiver handle; closing a connection while
+keeping its receivers does not free it. The existing `max_pending` and
+`max_pending_per_network_id` separately limit negotiations. Excess offers are
+refused with `IncomingConnectionIgnored`; setting `max_sessions` to zero refuses
+all offers.
+
+The listener owns its pending negotiations and bounded late-candidate queues.
+Closing or dropping it cancels unaccepted peers through metadata, answer delivery
+and channel establishment. Sessions already returned by `accept()` or `Stream`
+continue independently and preserve their accepted receive FIFO. Candidate
+overflow retires only the affected peer. Session commands apply backpressure at
+their caller; `send_before` retains its original admission deadline while waiting
+for capacity.
+
 ### Client identities
 
 `ConnectionConfig::identity` accepts an `Arc<dyn SdpIdentity>`. Use

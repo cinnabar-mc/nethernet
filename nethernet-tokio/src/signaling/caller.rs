@@ -377,7 +377,7 @@ impl CallerSignalingDriver {
         &self,
         sender: &str,
         wire: &str,
-        _deadline: Option<Instant>,
+        deadline: Option<Instant>,
     ) -> std::result::Result<
         impl std::future::Future<Output = std::result::Result<(), CallerSignalingError>> + Send + use<>,
         CallerSignalingError,
@@ -396,11 +396,14 @@ impl CallerSignalingDriver {
                 _ = closed.cancelled() => return Err(CallerSignalingError::Closed),
                 permit = incoming.reserve_owned() => permit.map_err(|_| CallerSignalingError::Closed)?,
             };
+            let inbox = inbox.lock().unwrap_or_else(|error| error.into_inner());
             if closed.is_cancelled() {
                 return Err(CallerSignalingError::Closed);
             }
-            let inbox = inbox.lock().unwrap_or_else(|error| error.into_inner());
             check_subscription(&inbox, &signal)?;
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now().into_std() >= deadline) {
+                return Err(CallerSignalingError::TimedOut);
+            }
             permit.send(signal);
             Ok(())
         })

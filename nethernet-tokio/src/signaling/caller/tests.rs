@@ -115,6 +115,15 @@ async fn incoming_admission_rechecks_original_deadline_after_capacity_wait() {
         .unwrap();
     timely.await.unwrap();
     assert_eq!(incoming.next().await.unwrap().data, "timely");
+    let at_deadline = driver
+        .prepare_delivery_before(
+            PEER,
+            "CANDIDATEADD 9 exactly-expired",
+            tokio::time::Instant::now().into_std(),
+        )
+        .unwrap();
+    assert_eq!(at_deadline.await, Err(CallerSignalingError::TimedOut));
+    assert!(incoming.next().now_or_never().is_none());
 }
 
 /// Creates a small bridge so every queue limit can be exercised without I/O.

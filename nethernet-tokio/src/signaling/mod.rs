@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
+pub mod caller;
 pub mod http;
 pub mod lan;
 
@@ -121,11 +122,25 @@ impl ServerSignaling {
     }
 }
 
-/// Signaling a client connects through: LAN discovery or HTTP.
+/// Client signaling through LAN discovery, HTTP or a caller-owned service bridge.
 #[derive(Clone)]
 pub enum ClientSignaling {
+    /// A bounded bridge to an application-owned signaling service.
+    Caller(Arc<caller::CallerSignaling>),
     Lan(Arc<LanSignaling>),
     Http(Arc<HttpSignaling>),
+}
+
+impl From<caller::CallerSignaling> for ClientSignaling {
+    fn from(signaling: caller::CallerSignaling) -> Self {
+        Self::Caller(Arc::new(signaling))
+    }
+}
+
+impl From<Arc<caller::CallerSignaling>> for ClientSignaling {
+    fn from(signaling: Arc<caller::CallerSignaling>) -> Self {
+        Self::Caller(signaling)
+    }
 }
 
 impl From<LanSignaling> for ClientSignaling {
@@ -155,20 +170,24 @@ impl From<Arc<HttpSignaling>> for ClientSignaling {
 impl ClientSignaling {
     pub async fn signal(&self, signal: Signal) -> Result<()> {
         match self {
+            Self::Caller(s) => s.signal(signal).await,
             Self::Lan(s) => s.signal(signal).await,
             Self::Http(s) => s.signal(signal).await,
         }
     }
 
-    pub fn signals(&self) -> Pin<Box<dyn Stream<Item = Signal> + Send>> {
+    /// Subscribes to incoming signals; caller bridges reject concurrent subscriptions.
+    pub fn signals(&self) -> Result<Pin<Box<dyn Stream<Item = Signal> + Send>>> {
         match self {
-            Self::Lan(s) => s.signals(),
-            Self::Http(s) => s.signals(),
+            Self::Caller(s) => s.signals(),
+            Self::Lan(s) => Ok(s.signals()),
+            Self::Http(s) => Ok(s.signals()),
         }
     }
 
     pub fn network_id(&self) -> String {
         match self {
+            Self::Caller(s) => s.network_id(),
             Self::Lan(s) => s.network_id(),
             Self::Http(s) => s.network_id(),
         }
@@ -176,6 +195,7 @@ impl ClientSignaling {
 
     pub fn disable_trickle_ice(&self) -> bool {
         match self {
+            Self::Caller(s) => s.disable_trickle_ice(),
             Self::Lan(s) => s.disable_trickle_ice(),
             Self::Http(s) => s.disable_trickle_ice(),
         }

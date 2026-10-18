@@ -1,4 +1,4 @@
-//! Tokio transport for NetherNet: LAN and HTTP signaling, with client and server connections.
+//! Tokio transport for NetherNet with LAN, HTTP and caller-driven client signaling.
 pub mod addr;
 pub mod builders;
 pub mod credentials;
@@ -14,11 +14,15 @@ pub use builders::*;
 pub use credentials::{Credentials, IceServer};
 pub use error::{NetherError, Result};
 pub use nethernet::identity::{
-    PlayerInfo, SdpIdentity, SelfSignedIdentity, ServerIdentity, TokenTrust,
+    PlayerInfo, SdpIdentity, SelfSignedIdentity, ServerIdentity, TokenIdentity, TokenTrust,
 };
 pub use protocol::packet::discovery::{MessagePacket, RequestPacket, ResponsePacket, ServerData};
 pub use protocol::{Message, MessageSegment, Signal, SignalType};
 pub use session::{AcceptedSession, Session, SessionReceiver};
+pub use signaling::caller::{
+    CallerSignaling, CallerSignalingConfig, CallerSignalingDriver, CallerSignalingError,
+    SignalDelivery, SignalRequest,
+};
 pub use signaling::http::{HttpServerConfig, HttpSignaling, HttpSignalingServer};
 pub use signaling::lan::{LanConfig, LanSignaling};
 pub use signaling::{ClientSignaling, ServerSignaling};

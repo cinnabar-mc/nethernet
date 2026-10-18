@@ -10,6 +10,10 @@ pub use nethernet::error::SignalErrorCode;
 
 #[derive(Debug, Error)]
 pub enum NetherError {
+    /// A caller-driven signaling bridge failed without retaining service diagnostics.
+    #[error("caller signaling error: {0}")]
+    CallerSignaling(#[from] crate::signaling::caller::CallerSignalingError),
+
     #[error("ICE error: {0}")]
     Ice(String),
 

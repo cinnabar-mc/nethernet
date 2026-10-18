@@ -1,24 +1,22 @@
 //! HTTP signaling client polled once per frame, with status queries and joins.
-use crate::connection::{ConnectionEvent, SessionPool};
+use crate::connection::ConnectionEvent;
 use crate::http_stream::{ClientTls, Drain, HttpStream};
 use crate::http_wire;
-use crate::socket::bind_shared_socket;
+use crate::outbound::{ClientIceConfig, Outbound, Received};
 use crate::tcp_wire::Inbound;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use bevy_platform::cell::SyncCell;
-use nethernet::connection::{Connection, ConnectionInput, IceMode, Timeouts};
+use nethernet::connection::{IceMode, Timeouts};
 use nethernet::error::ProtocolError;
 use nethernet::identity::{TokenTrust, verify_answer};
 use nethernet::prelude::ServerData;
 use nethernet::prelude::ServerIdentity;
 use nethernet::protocol::Signal;
-use nethernet::sans::Sans;
-use nethernet::session::{Channel, Session};
+use nethernet::session::{Channel, TurnCredentials};
 use nethernet::signaling::http::join::{self, StatusResponseError};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(feature = "tls")]
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -194,10 +192,13 @@ fn drive_join(state: JoinState) -> JoinStep {
 
 struct Join {
     state: JoinState,
-    connection: SyncCell<Connection>,
-    local_ufrag: String,
-    session_socket: UdpSocket,
     server_url: String,
+    connection_id: u64,
+}
+
+struct Gathering {
+    target: JoinTarget,
+    addr: SocketAddr,
 }
 
 struct Query {
@@ -211,7 +212,9 @@ const DEFAULT_ATTEMPTS: u32 = 3;
 pub struct NetherHttpClient {
     join: Option<Join>,
     query: Option<Query>,
-    pool: Option<SessionPool<()>>,
+    transport: Option<Outbound>,
+    gathering: Option<Gathering>,
+    ice_config: Option<ClientIceConfig>,
     connected: bool,
     connecting_deadline: Option<Instant>,
     timeouts: Timeouts,
@@ -219,6 +222,7 @@ pub struct NetherHttpClient {
     attempts_left: u32,
     local_network_id: String,
     server_url: String,
+    join_target: Option<(JoinTarget, SocketAddr)>,
     ready: bool,
     remote_addr: Option<SocketAddr>,
     rtt: Option<Duration>,
@@ -226,8 +230,7 @@ pub struct NetherHttpClient {
     server_trust: Option<TokenTrust>,
     tls: ClientTls,
     events: VecDeque<NetherHttpClientEvent>,
-    received: VecDeque<Box<[u8]>>,
-    received_unreliable: VecDeque<Box<[u8]>>,
+    received: Received,
 }
 
 impl Default for NetherHttpClient {
@@ -235,7 +238,9 @@ impl Default for NetherHttpClient {
         Self {
             join: None,
             query: None,
-            pool: None,
+            transport: None,
+            gathering: None,
+            ice_config: None,
             connected: false,
             connecting_deadline: None,
             timeouts: Timeouts::default(),
@@ -243,6 +248,7 @@ impl Default for NetherHttpClient {
             attempts_left: 0,
             local_network_id: String::new(),
             server_url: String::new(),
+            join_target: None,
             ready: false,
             remote_addr: None,
             rtt: None,
@@ -250,8 +256,7 @@ impl Default for NetherHttpClient {
             server_trust: None,
             tls: ClientTls::default(),
             events: VecDeque::new(),
-            received: VecDeque::new(),
-            received_unreliable: VecDeque::new(),
+            received: Received::default(),
         }
     }
 }
@@ -263,6 +268,25 @@ impl NetherHttpClient {
 
     pub fn set_identity(&mut self, identity: ServerIdentity) {
         self.identity = Some(identity);
+    }
+
+    /// Configures numeric UDP STUN/TURN gathering for subsequent attempts. `None` keeps host-only operation.
+    /// HTTP carries Full ICE: all gathering completes before the offer is encoded and signed.
+    pub fn set_ice_config(&mut self, config: Option<ClientIceConfig>) {
+        self.ice_config = config;
+    }
+
+    /// Renews an active allocation's password with its original absolute monotonic expiry.
+    /// A different username requires a fresh connection. Configuration for retries is changed separately.
+    pub fn update_turn_credentials(
+        &mut self,
+        server: SocketAddr,
+        credentials: TurnCredentials,
+    ) -> Result<(), ProtocolError> {
+        self.transport
+            .as_mut()
+            .ok_or_else(|| ProtocolError::Other("not connected".into()))?
+            .update_turn_credentials(server, credentials, Instant::now())
     }
 
     /// How the server's answer is authenticated; `None`, the default, accepts any answer.
@@ -278,6 +302,7 @@ impl NetherHttpClient {
     /// Sends GET /v1/join; the result arrives as ServerData or QueryFailed.
     pub fn query_server_data(&mut self, url: &str) -> std::io::Result<()> {
         let (target, addr) = Self::resolve(url)?;
+        self.tls.prepare(target.secure)?;
         let stream = self.open_stream(&target, addr)?;
         let request = http_wire::RequestWriter::get(&target.authority, join::STATUS_PATH)
             .map_err(std::io::Error::other)?;
@@ -343,52 +368,81 @@ impl NetherHttpClient {
     }
 
     /// The id names this client in the join path; the URL is http(s) and its port defaults to 80 or 443.
+    /// Initial HTTP hostname resolution and TLS configuration are synchronous setup; subsequent frame updates perform neither.
     pub fn connect(&mut self, local_network_id: String, server_url: String) -> std::io::Result<()> {
         self.join = None;
-        self.pool = None;
+        self.transport = None;
+        self.gathering = None;
         self.connected = false;
+        self.connecting_deadline = None;
+        self.join_target = None;
         self.ready = false;
         self.remote_addr = None;
         self.rtt = None;
+        self.received = Received::default();
 
         self.local_network_id = local_network_id;
         self.server_url = server_url;
+        let (target, addr) = Self::resolve(&self.server_url)?;
+        self.tls.prepare(target.secure)?;
+        self.join_target = Some((target, addr));
         self.attempts_left = self.attempts.max(1);
-        self.begin_join()
+        if let Err(error) = self.begin_join() {
+            self.join = None;
+            self.transport = None;
+            self.gathering = None;
+            self.connecting_deadline = None;
+            return Err(error);
+        }
+        Ok(())
     }
 
+    /// Starts finite gathering. Numeric ICE endpoints never invoke DNS in the frame update.
     fn begin_join(&mut self) -> std::io::Result<()> {
         self.attempts_left = self.attempts_left.saturating_sub(1);
-        let server_url = self.server_url.clone();
-        let (target, addr) = Self::resolve(&server_url)?;
+        let (target, addr) = self.join_target.clone().ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidInput, "join target is not configured")
+        })?;
+        let now = Instant::now();
+        self.transport = Some(Outbound::new(
+            self.ice_config.as_ref(),
+            self.timeouts.establish(),
+            now,
+        )?);
+        self.gathering = Some(Gathering { target, addr });
+        self.connecting_deadline = Some(now + self.timeouts.negotiation);
+        self.start_gathered_join()
+    }
 
-        let (session_socket, local_addr) = bind_shared_socket()?;
-        let (mut session, description) =
-            Session::new(local_addr, true, rand::random(), Instant::now())
-                .map_err(std::io::Error::other)?;
-        session.set_establish_deadline(self.timeouts.establish());
-        let local_ufrag = description.ice.ufrag.clone();
-
-        let connection_id = rand::random::<u64>();
-        let (connection, signals) = Connection::connect(
-            session,
-            description,
-            connection_id,
-            server_url.clone(),
-            IceMode::Full,
-        );
+    /// Encodes and signs the final Full offer only after the pure core completed gathering.
+    fn start_gathered_join(&mut self) -> std::io::Result<()> {
+        let complete = self
+            .transport
+            .as_mut()
+            .is_some_and(Outbound::gathering_complete);
+        if !complete {
+            return Ok(());
+        }
+        let Some(Gathering { target, addr }) = self.gathering.take() else {
+            return Ok(());
+        };
+        let connection_id = rand::random();
+        let signals = self
+            .transport
+            .as_mut()
+            .expect("transport checked above")
+            .connect(connection_id, self.server_url.clone(), IceMode::Full)
+            .map_err(std::io::Error::other)?;
         let offer = signals
             .into_iter()
             .next()
-            .expect("Connection::connect always returns an offer first");
-
+            .expect("Connection::connect returns an offer first");
         let offer_data = match &self.identity {
             Some(identity) => identity
                 .augment(&offer.data, SystemTime::now())
                 .map_err(std::io::Error::other)?,
             None => offer.data,
         };
-
         let request = http_wire::RequestWriter::post(
             &target.authority,
             &join::join_path(&self.local_network_id),
@@ -396,17 +450,12 @@ impl NetherHttpClient {
             &offer_data,
         )
         .map_err(std::io::Error::other)?;
-
         let stream = self.open_stream(&target, addr)?;
-
         self.join = Some(Join {
             state: JoinState::sending(stream, &request),
-            connection: SyncCell::new(connection),
-            local_ufrag,
-            session_socket,
-            server_url,
+            server_url: self.server_url.clone(),
+            connection_id,
         });
-        self.connecting_deadline = Some(Instant::now() + self.timeouts.negotiation);
         Ok(())
     }
 
@@ -415,8 +464,11 @@ impl NetherHttpClient {
     }
 
     pub fn disconnect(&mut self) {
+        self.received = Received::default();
+        self.join_target = None;
         self.join = None;
-        self.pool = None;
+        self.transport = None;
+        self.gathering = None;
         self.connected = false;
         self.connecting_deadline = None;
         if self.ready {
@@ -439,134 +491,124 @@ impl NetherHttpClient {
         if !self.connected {
             return Err(ProtocolError::Other("not connected".to_string()));
         }
-        self.pool.as_mut().unwrap().send((), channel, data.into());
-        Ok(())
+        self.transport
+            .as_mut()
+            .ok_or_else(|| ProtocolError::Other("not connected".into()))?
+            .send(channel, data, Instant::now())
     }
 
     pub fn recv(&mut self) -> Option<Box<[u8]>> {
-        self.received.pop_front()
+        self.received.pop(Channel::Reliable)
     }
 
     pub fn recv_unreliable(&mut self) -> Option<Box<[u8]>> {
-        self.received_unreliable.pop_front()
+        self.received.pop(Channel::Unreliable)
     }
 
     pub fn next_event(&mut self) -> Option<NetherHttpClientEvent> {
         self.events.pop_front()
     }
 
+    /// Advances nonblocking HTTP/UDP work once per frame. Call regularly to meet core deadlines.
     pub fn update(&mut self) {
         let now = Instant::now();
         self.update_query(now);
-
-        if let Some(mut join) = self.join.take() {
-            match drive_join(join.state) {
-                JoinStep::Pending(state) => {
-                    join.state = state;
-                    self.join = Some(join);
-                }
-                JoinStep::Done(code, body) => match join::validate_join_response(code, &body)
-                    .map_err(|e| e.to_string())
-                    .and_then(|()| {
-                        verify_answer(&body, self.server_trust.as_ref(), SystemTime::now())
-                            .map_err(|e| format!("the answer's identity is invalid: {e}"))
-                    }) {
-                    Ok(_) => {
-                        let Join {
-                            connection,
-                            local_ufrag,
-                            session_socket,
-                            server_url,
-                            ..
-                        } = join;
-                        let mut connection = SyncCell::to_inner(connection);
-                        let answer = Signal::answer(connection.connection_id(), body, server_url);
-
-                        if connection
-                            .handle(ConnectionInput::Signal(answer, now))
-                            .is_ok()
-                        {
-                            let mut pool = SessionPool::new(session_socket);
-                            pool.add((), connection, local_ufrag);
-                            self.pool = Some(pool);
-                            self.connected = true;
-                            self.connecting_deadline = Some(now + self.timeouts.establish());
-                        } else {
-                            self.connecting_deadline = None;
-                            self.events.push_back(NetherHttpClientEvent::ConnectFailed);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("join failed: {e}");
-                        self.connecting_deadline = None;
-                        self.events.push_back(NetherHttpClientEvent::ConnectFailed);
-                    }
-                },
-                JoinStep::Failed => {
-                    self.connecting_deadline = None;
-                    self.events.push_back(NetherHttpClientEvent::ConnectFailed);
-                }
-            }
-        }
-
-        if let Some(pool) = self.pool.as_mut() {
-            let mut events = Vec::new();
-            pool.drive(&mut events);
-
-            for ((), event) in events {
-                match event {
-                    ConnectionEvent::Ready(addr) if !self.ready => {
-                        self.ready = true;
-                        self.remote_addr = addr;
-                        self.connecting_deadline = None;
-                        self.events.push_back(NetherHttpClientEvent::Connected);
-                    }
-                    ConnectionEvent::Ready(_) => {}
-                    ConnectionEvent::Rtt(rtt) => self.rtt = Some(rtt),
-                    ConnectionEvent::Message(Channel::Reliable, data) => {
-                        self.received.push_back(data)
-                    }
-                    ConnectionEvent::Message(Channel::Unreliable, data) => {
-                        self.received_unreliable.push_back(data)
-                    }
-                    ConnectionEvent::Failed => {
-                        let was_ready = self.ready;
-                        self.join = None;
-                        self.pool = None;
-                        self.connected = false;
-                        self.connecting_deadline = None;
-                        self.ready = false;
-                        self.remote_addr = None;
-                        self.rtt = None;
-                        self.events.push_back(if was_ready {
-                            NetherHttpClientEvent::Disconnected
-                        } else {
-                            NetherHttpClientEvent::ConnectFailed
-                        });
-                    }
-                }
-            }
-        }
-
-        if let Some(deadline) = self.connecting_deadline
-            && now >= deadline
+        if self
+            .connecting_deadline
+            .is_some_and(|deadline| now >= deadline)
         {
-            if self.pool.is_none() && self.attempts_left > 0 && self.begin_join().is_ok() {
-                return;
+            if !self.connected && self.attempts_left > 0 {
+                self.join = None;
+                self.gathering = None;
+                self.transport = None;
+                if self.begin_join().is_ok() {
+                    return;
+                }
             }
-            let was_ready = self.ready;
-            self.join = None;
-            self.pool = None;
-            self.connected = false;
-            self.connecting_deadline = None;
-            self.ready = false;
-            self.remote_addr = None;
-            self.rtt = None;
-            self.events.push_back(if was_ready {
-                NetherHttpClientEvent::Disconnected
-            } else {
-                NetherHttpClientEvent::ConnectFailed
-            });
+            self.fail_connection();
+            return;
         }
+        if self
+            .transport
+            .as_mut()
+            .is_some_and(|transport| transport.update(now).is_err())
+        {
+            self.fail_connection();
+            return;
+        }
+        if self.start_gathered_join().is_err() {
+            self.fail_connection();
+            return;
+        }
+        if let Some(mut attempt) = self.join.take() {
+            match drive_join(attempt.state) {
+                JoinStep::Pending(state) => {
+                    attempt.state = state;
+                    self.join = Some(attempt);
+                }
+                JoinStep::Done(code, body) => {
+                    let valid = join::validate_join_response(code, &body).is_ok()
+                        && verify_answer(&body, self.server_trust.as_ref(), SystemTime::now())
+                            .is_ok();
+                    let answer = Signal::answer(attempt.connection_id, body, attempt.server_url);
+                    if valid
+                        && self
+                            .transport
+                            .as_mut()
+                            .is_some_and(|transport| transport.signal(answer, now).is_ok())
+                    {
+                        self.connected = true;
+                        self.connecting_deadline = Some(now + self.timeouts.establish());
+                    } else {
+                        self.fail_connection();
+                        return;
+                    }
+                }
+                JoinStep::Failed => {
+                    self.fail_connection();
+                    return;
+                }
+            }
+        }
+        while let Some(event) = self.transport.as_mut().and_then(Outbound::poll_event) {
+            match event {
+                ConnectionEvent::Ready(addr) if !self.ready => {
+                    self.ready = true;
+                    self.remote_addr = addr;
+                    self.connecting_deadline = None;
+                    self.events.push_back(NetherHttpClientEvent::Connected);
+                }
+                ConnectionEvent::Ready(_) => {}
+                ConnectionEvent::Rtt(rtt) => self.rtt = Some(rtt),
+                ConnectionEvent::Message(channel, data) => {
+                    if self.received.push(channel, data).is_err() {
+                        self.fail_connection();
+                        return;
+                    }
+                }
+                ConnectionEvent::Failed => {
+                    self.fail_connection();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Retires HTTP, socket, allocation and delivery ownership together, reporting one terminal transition.
+    fn fail_connection(&mut self) {
+        let was_ready = self.ready;
+        self.join = None;
+        self.gathering = None;
+        self.transport = None;
+        self.connected = false;
+        self.connecting_deadline = None;
+        self.ready = false;
+        self.remote_addr = None;
+        self.rtt = None;
+        self.events.push_back(if was_ready {
+            NetherHttpClientEvent::Disconnected
+        } else {
+            NetherHttpClientEvent::ConnectFailed
+        });
     }
 }

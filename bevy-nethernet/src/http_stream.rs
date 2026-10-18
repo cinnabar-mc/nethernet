@@ -187,6 +187,24 @@ impl ClientTls {
         }
     }
 
+    /// Prepares platform trust during explicit setup, before delayed gathering moves the dial into a frame.
+    pub(crate) fn prepare(&mut self, secure: bool) -> std::io::Result<()> {
+        if !secure {
+            return Ok(());
+        }
+        #[cfg(feature = "tls")]
+        {
+            if self.config.is_none() {
+                self.config = Some(Self::platform_config().map_err(JoinError::from)?);
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            Err(JoinError::TlsUnavailable.into())
+        }
+    }
+
     pub(crate) fn dial(
         &self,
         secure: bool,

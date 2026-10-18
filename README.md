@@ -156,7 +156,8 @@ that bridge without closing the shared service socket.
 Keep account, messaging UUID, advertised network ID, multiplayer token and P-384
 key ownership in the application. Supply its `SdpIdentity` through
 `ConnectionConfig::identity`; the bridge creates no replacement identity key.
-Service signaling alone does not configure STUN/TURN gathering or relay connectivity.
+Service signaling alone does not supply STUN/TURN credentials or select a relay
+policy; those inputs remain with the application.
 
 Configured UDP ICE sessions can gather server-reflexive and TURN relay candidates.
 The pure `nethernet::session::IceConfig` owns resolved endpoints, credential
@@ -193,9 +194,29 @@ negotiation or dropping the driver stops its state and attempts relay release.
 
 This path supports UDP STUN and TURN with IPv4 relay allocations over IPv4 or
 IPv6 outer UDP. Explicit IPv6 relay allocation and TURN TCP/TLS remain incomplete.
-Bevy may drive the same configured core with its own sockets and clock; configured
-ICE construction and late outgoing candidate wiring in that adapter remain
-incomplete and do not require a Tokio dependency.
+The Bevy LAN and HTTP clients accept `set_ice_config(Some(ClientIceConfig {
+    bind_addr: local_interface,
+    ice: IceConfig { servers, ..Default::default() },
+}))` using types from `bevy_nethernet::prelude` and `nethernet::session`.
+`local_interface` is a concrete numeric local address with an optional ephemeral
+port; all server endpoints must have the same family. HTTP joins gather Full
+candidates before encoding/signing the offer. LAN carries Trickle candidates,
+including those gathered after its initial offer. Active clients expose
+`update_turn_credentials` for password renewal under the original expiry.
+
+Outbound Bevy clients poll their nonblocking UDP socket and pure connection on
+`update`, without a socket thread or Tokio dependency. Call updates regularly;
+pausing frames also pauses transport progress. Each client owns an exclusive UDP
+socket, including its TURN allocation tuples. The server adapter retains its
+existing shared-socket worker and command/event queues; this does not multiplex
+multiple relay allocations onto a shared TURN tuple. Outbound work reads at most
+64 datagrams and drains at most 1024 core outputs per update. Transport delivery
+and application delivery each retain at most 1024 messages and 16 MiB; exceeding a
+receive budget closes the client explicitly. Sends apply core expiry immediately
+and return `WouldBlock` before admitting more work when the drain budget is full.
+Cancellation drops the socket owner after finite best-effort relay release.
+Initial HTTP hostname resolution/platform TLS setup are synchronous explicit
+setup; frame retries reuse their prepared target and trust configuration.
 
 The Tokio driver admits reliable messages into one FIFO shared with the application
 receiver. Its packet budget is twice the default receiver capacity; its byte budget

@@ -38,7 +38,7 @@ impl Default for CallerSignalingConfig {
             capacity: NonZeroUsize::new(16).expect("nonzero capacity"),
             max_signal_bytes: NonZeroUsize::new(nethernet::signaling::http::join::MAX_ANSWER_SIZE)
                 .expect("nonzero signal limit"),
-            send_timeout: Duration::from_secs(15),
+            send_timeout: nethernet::connection::Timeouts::default().negotiation,
             ice_mode: IceMode::Trickle,
             require_offer_receipt: true,
         }
@@ -138,6 +138,7 @@ pub struct SignalRequest {
     require_receipt: bool,
     deadline: Instant,
     completion: oneshot::Sender<std::result::Result<(), CallerSignalingError>>,
+    closed: CancellationToken,
     _slot: OwnedSemaphorePermit,
 }
 
@@ -195,6 +196,7 @@ impl CallerSignaling {
 
     /// Sends a signal once, waiting for the caller's explicit completion evidence.
     /// Dropping the future cancels its wait; the driver can observe this via the request.
+    /// The first offer binds an active subscription to its connection ID.
     pub async fn signal(&self, signal: Signal) -> Result<()> {
         if signal.network_id != self.remote_id {
             return Err(CallerSignalingError::RouteMismatch.into());
@@ -232,6 +234,7 @@ impl CallerSignaling {
                     signal,
                     deadline,
                     completion,
+                    closed: self.closed.clone(),
                     _slot: slot,
                 })
                 .await
@@ -378,15 +381,18 @@ impl SignalRequest {
         self.deadline
     }
 
-    /// Returns whether the transport abandoned this request or its deadline elapsed.
+    /// Returns whether the bridge closed, the transport abandoned this request or its deadline elapsed.
     pub fn is_cancelled(&self) -> bool {
-        self.completion.is_closed() || tokio::time::Instant::now().into_std() >= self.deadline
+        self.closed.is_cancelled()
+            || self.completion.is_closed()
+            || tokio::time::Instant::now().into_std() >= self.deadline
     }
 
-    /// Waits until the transport abandons this request or its original deadline elapses.
+    /// Waits until the bridge closes, the transport abandons this request or its deadline elapses.
     /// This does not itself cancel the application's correlated service operation.
     pub async fn cancelled(&mut self) {
         tokio::select! {
+            _ = self.closed.cancelled() => {},
             _ = self.completion.closed() => {},
             _ = tokio::time::sleep_until(self.deadline.into()) => {},
         }
@@ -395,14 +401,22 @@ impl SignalRequest {
     /// Completes one correlated request; receipt evidence must include service acceptance.
     /// A late completion after cancellation is harmless. Service failures must be
     /// mapped to a redacted bridge error while details stay with the service owner.
+    /// The deadline applies when completion is reported here, independent of when
+    /// the transport next polls its wait. Reports at or after it fail as TimedOut.
     pub fn finish(self, result: std::result::Result<SignalDelivery, CallerSignalingError>) {
-        let result = result.and_then(|delivery| {
-            if self.require_receipt && delivery != SignalDelivery::PeerReceived {
-                Err(CallerSignalingError::ReceiptRequired)
-            } else {
-                Ok(())
-            }
-        });
+        let result = if self.closed.is_cancelled() {
+            Err(CallerSignalingError::Closed)
+        } else if tokio::time::Instant::now().into_std() >= self.deadline {
+            Err(CallerSignalingError::TimedOut)
+        } else {
+            result.and_then(|delivery| {
+                if self.require_receipt && delivery != SignalDelivery::PeerReceived {
+                    Err(CallerSignalingError::ReceiptRequired)
+                } else {
+                    Ok(())
+                }
+            })
+        };
         let _ = self.completion.send(result);
     }
 }

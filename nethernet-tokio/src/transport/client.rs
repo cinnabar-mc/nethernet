@@ -140,13 +140,16 @@ impl NetherClient {
             };
 
             if let Some(code) = code {
-                let _ = signaling
-                    .signal(Signal::error(
-                        connection_id,
-                        code,
-                        remote_network_id.clone(),
-                    ))
-                    .await;
+                let notification = signaling.signal(Signal::error(
+                    connection_id,
+                    code,
+                    remote_network_id.clone(),
+                ));
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {},
+                    _ = tokio::time::timeout(config.timeouts.negotiation, notification) => {},
+                }
             }
 
             if !matches!(error, NetherError::Timeout) || attempt == attempts {

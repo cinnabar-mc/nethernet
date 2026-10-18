@@ -147,6 +147,18 @@ async fn outstanding_requests_keep_their_capacity_until_caller_releases_them() {
 async fn original_deadline_and_driver_closure_cancel_inflight_requests_without_retry() {
     let (signaling, mut driver) = bridge();
     let mut incoming = signaling.signals().unwrap();
+    let mut timely = Box::pin(signaling.signal(Signal::offer(7, "sdp".into(), PEER.into())));
+    assert!(poll!(timely.as_mut()).is_pending());
+    driver
+        .recv()
+        .await
+        .unwrap()
+        .finish(Ok(SignalDelivery::PeerReceived));
+    tokio::time::advance(signaling.config.send_timeout).await;
+    timely
+        .await
+        .expect("timely completion must survive delayed transport polling");
+
     let mut send = Box::pin(signaling.signal(Signal::offer(7, "sdp".into(), PEER.into())));
     assert!(poll!(send.as_mut()).is_pending());
     let request = driver.recv().await.unwrap();
@@ -170,6 +182,10 @@ async fn original_deadline_and_driver_closure_cancel_inflight_requests_without_r
     assert!(poll!(send.as_mut()).is_pending());
     let request = driver.recv().await.unwrap();
     drop(driver);
+    assert!(
+        request.is_cancelled(),
+        "driver closure must not depend on transport polling"
+    );
     assert!(matches!(
         send.await,
         Err(NetherError::CallerSignaling(CallerSignalingError::Closed))
@@ -244,4 +260,43 @@ async fn cancellation_interrupts_best_effort_terminal_signal_cleanup() {
         "cancellation must stop waiting for best-effort terminal signal delivery"
     );
     assert!(terminal.is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn caller_negotiation_timeout_does_not_automatically_offer_again() {
+    let (signaling, mut driver) = CallerSignaling::new(
+        "1234".into(),
+        PEER.into(),
+        CallerSignalingConfig {
+            ice_mode: IceMode::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let config = crate::ConnectionConfig::default();
+    let negotiation_budget = config.timeouts.negotiation;
+    let mut connect = Box::pin(crate::NetherClient::connect_with(
+        signaling,
+        PEER.into(),
+        config,
+    ));
+    let offer = tokio::select! {
+        request = driver.recv() => request.unwrap(),
+        _ = &mut connect => panic!("connection ended before offering"),
+    };
+    assert_eq!(offer.signal().signal_type, SignalType::Offer);
+    offer.finish(Ok(SignalDelivery::PeerReceived));
+    assert!(poll!(connect.as_mut()).is_pending());
+    tokio::time::advance(negotiation_budget).await;
+    let terminal = tokio::select! {
+        request = driver.recv() => request.unwrap(),
+        _ = &mut connect => panic!("connection ended before terminal signaling"),
+    };
+    assert_eq!(terminal.signal().signal_type, SignalType::Error);
+    terminal.finish(Ok(SignalDelivery::ServiceAccepted));
+    assert!(
+        matches!(connect.now_or_never(), Some(Err(NetherError::Timeout))),
+        "caller policy must own any further connection attempt"
+    );
+    assert!(matches!(driver.recv().now_or_never(), Some(None)));
 }

@@ -129,7 +129,7 @@ fn connected_pair() -> (Session, Session, Instant) {
             match output {
                 SessionOutput::Send(data, to) => offerer_outbox.push((data, to)),
                 SessionOutput::Event(SessionEvent::Ready) => offerer_ready = true,
-                SessionOutput::Event(SessionEvent::Failed) => {
+                SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                     panic!("session failed unexpectedly")
                 }
                 SessionOutput::Message(..) => panic!("unexpected message before Ready"),
@@ -150,7 +150,7 @@ fn connected_pair() -> (Session, Session, Instant) {
             match output {
                 SessionOutput::Send(data, to) => answerer_outbox.push((data, to)),
                 SessionOutput::Event(SessionEvent::Ready) => answerer_ready = true,
-                SessionOutput::Event(SessionEvent::Failed) => {
+                SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                     panic!("session failed unexpectedly")
                 }
                 SessionOutput::Message(..) => panic!("unexpected message before Ready"),
@@ -511,18 +511,23 @@ fn an_authenticated_dtls_peer_close_finishes_the_session_once() {
     assert_eq!(
         output
             .iter()
-            .filter(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+            .filter(|output| matches!(output, SessionOutput::Event(SessionEvent::PeerClosed)))
             .count(),
         1,
         "RTC's authenticated peer-close event left a ready session alive"
     );
     assert_eq!(receiver.gathering_state(), GatheringState::Closed);
-    let failed = output
+    assert!(
+        !output
+            .iter()
+            .any(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+    );
+    let closed = output
         .iter()
-        .position(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+        .position(|output| matches!(output, SessionOutput::Event(SessionEvent::PeerClosed)))
         .unwrap();
     assert!(
-        output[..failed]
+        output[..closed]
             .iter()
             .any(|output| matches!(output, SessionOutput::Send(_, to) if *to == addr(40101))),
         "the authenticated close_notify reply was discarded during teardown"
@@ -550,12 +555,12 @@ fn an_authenticated_dtls_peer_close_finishes_the_session_once() {
         .unwrap();
     assert!(
         receiver.poll().is_none(),
-        "closed session retained work or emitted failure twice"
+        "closed session retained work or emitted a terminal outcome twice"
     );
 }
 
 #[test]
-fn an_authenticated_closing_datagram_delivers_its_final_complete_message_before_failure() {
+fn an_authenticated_closing_datagram_delivers_its_final_complete_message_before_close() {
     let (mut receiver, mut peer, now) = connected_pair();
     peer.handle(SessionInput::Send(
         Channel::Reliable,
@@ -585,10 +590,15 @@ fn an_authenticated_closing_datagram_delivers_its_final_complete_message_before_
         .unwrap();
     let output: Vec<_> = std::iter::from_fn(|| receiver.poll()).collect();
     let data = output.iter().position(|output| matches!(output, SessionOutput::Message(Channel::Reliable, data) if data == b"final reliable payload")).expect("authenticated data preceding close_notify was lost");
-    let failed = output
+    let closed = output
         .iter()
-        .position(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+        .position(|output| matches!(output, SessionOutput::Event(SessionEvent::PeerClosed)))
         .expect("peer close did not terminate the session");
-    assert!(data < failed);
+    assert!(data < closed);
+    assert!(
+        !output
+            .iter()
+            .any(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed)))
+    );
     assert_eq!(receiver.gathering_state(), GatheringState::Closed);
 }

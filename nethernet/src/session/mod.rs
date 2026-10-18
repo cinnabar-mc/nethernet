@@ -41,8 +41,10 @@ pub enum Channel {
 pub enum SessionEvent {
     /// Both data channels are open.
     Ready,
-    /// A transport failed, the DTLS peer closed, or establishment expired; emitted once.
+    /// A transport failed or establishment expired; emitted once.
     Failed,
+    /// The authenticated DTLS peer closed; transport state and timers have been retired.
+    PeerClosed,
 }
 
 pub enum SessionOutput {
@@ -77,7 +79,7 @@ struct Channels {
     unreliable_stream_id: Option<StreamId>,
     reassembly: Framing,
     ready_emitted: bool,
-    failed_emitted: bool,
+    terminal_emitted: bool,
 }
 
 impl Channels {
@@ -295,7 +297,7 @@ impl Session {
     }
 
     fn start_transports_on_selected_pair(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        if self.dtls.is_some() || self.channels.failed_emitted {
+        if self.dtls.is_some() || self.channels.terminal_emitted {
             return Ok(());
         }
         let Some(remote_addr) = self.ice.selected_remote_addr() else {
@@ -420,7 +422,7 @@ impl Session {
             Ok(())
         })();
         // A best-effort reply failure must never keep a removed DTLS association alive.
-        let teardown = self.fail(now);
+        let teardown = self.terminate(SessionEvent::PeerClosed, now);
         final_output.append(&mut self.output);
         self.output = final_output;
         flush.and(teardown)
@@ -447,7 +449,7 @@ impl Session {
     }
 
     fn establish_deadline(&self) -> Option<Instant> {
-        if self.channels.ready_emitted || self.channels.failed_emitted {
+        if self.channels.ready_emitted || self.channels.terminal_emitted {
             return None;
         }
         self.establish_started.map(|at| at + self.establish_within)
@@ -564,7 +566,7 @@ impl Session {
         if self.channels.reliable_stream_id.is_some()
             && self.channels.unreliable_stream_id.is_some()
             && !self.channels.ready_emitted
-            && !self.channels.failed_emitted
+            && !self.channels.terminal_emitted
         {
             self.channels.ready_emitted = true;
             self.output
@@ -582,18 +584,15 @@ impl Session {
     }
 
     fn fail(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        if !self.channels.failed_emitted {
-            self.channels.failed_emitted = true;
-            self.output.clear();
-            self.ice.close(now);
-            self.dtls = None;
-            self.sctp = None;
-            self.early_packets.clear();
-            while let Some((data, to)) = self.ice.poll_write()? {
-                self.output.push_back(SessionOutput::Send(data, to));
-            }
-            self.output
-                .push_back(SessionOutput::Event(SessionEvent::Failed));
+        self.terminate(SessionEvent::Failed, now)
+    }
+
+    /// Retires all protocol state before publishing the single terminal outcome.
+    fn terminate(&mut self, terminal: SessionEvent, now: Instant) -> Result<(), ProtocolError> {
+        if !self.channels.terminal_emitted {
+            self.channels.terminal_emitted = true;
+            self.close(now)?;
+            self.output.push_back(SessionOutput::Event(terminal));
         }
         Ok(())
     }

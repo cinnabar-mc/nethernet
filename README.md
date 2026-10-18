@@ -156,8 +156,7 @@ that bridge without closing the shared service socket.
 Keep account, messaging UUID, advertised network ID, multiplayer token and P-384
 key ownership in the application. Supply its `SdpIdentity` through
 `ConnectionConfig::identity`; the bridge creates no replacement identity key.
-The current transport gathers only host ICE candidates. Service signaling alone
-does not add STUN/TURN gathering or relay connectivity.
+Service signaling alone does not configure STUN/TURN gathering or relay connectivity.
 
 Configured UDP ICE sessions can gather server-reflexive and TURN relay candidates.
 The pure `nethernet::session::IceConfig` owns resolved endpoints, credential
@@ -198,17 +197,19 @@ Bevy may drive the same configured core with its own sockets and clock; configur
 ICE construction and late outgoing candidate wiring in that adapter remain
 incomplete and do not require a Tokio dependency.
 
-The Tokio driver preserves reliable receive order while the application receiver
-is temporarily full. It continues transport timers and signaling, retaining at
-most one additional receiver capacity of messages and a byte budget derived from
-the receiver capacity and protocol segment size. A closed receiver or an exceeded
-pending limit closes the session;
-unreliable receive remains best effort. Existing TURN allocations require the
-same username during password rotation. A new username requires a new socket and
-allocation.
+The Tokio driver admits reliable messages into one FIFO shared with the application
+receiver. Its packet budget is twice the default receiver capacity; its byte budget
+is the default capacity times the protocol segment size. Application backpressure
+does not block transport timers or signaling. Accepted messages remain available
+after transport retirement, followed by EOF on local cancellation or authenticated
+peer close, or one explicit error on transport failure or receive overflow. Dropping
+the reliable receiver closes the session when the next reliable message arrives;
+unreliable receive remains best effort. Existing TURN allocations require the same
+username during password rotation. A new username requires a new socket and allocation.
 
 Before a remote description installs ICE credentials, the core discards peer
 checks for RTC to retry while continuing configured STUN/TURN transactions.
 Signaling completion still has to fit the peers' original establishment budgets.
 An authenticated DTLS peer close delivers any complete final message, routes its
-close reply through the selected ICE path, then releases transport state once.
+close reply through the selected ICE path, then releases transport state once and
+emits `SessionEvent::PeerClosed`. Transport failures emit `SessionEvent::Failed`.

@@ -9,12 +9,8 @@ use crate::signaling::ClientSignaling;
 use crate::transport::{ConnectionConfig, local_bind_addr};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-#[cfg(test)]
-use nethernet::connection::ConnectionInput;
 use nethernet::connection::{Connection as SansConnection, IceMode};
 use nethernet::identity::{TokenTrust, verify_answer};
-#[cfg(test)]
-use nethernet::sans::Sans;
 use nethernet::session::Session as SansSession;
 use rand::Rng;
 use std::io;
@@ -92,7 +88,11 @@ impl Stream for SessionStream {
     type Item = io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx).map(|data| data.map(Ok))
+        self.receiver.poll_recv(cx).map(|result| match result {
+            Ok(Some(data)) => Some(Ok(data)),
+            Ok(None) => None,
+            Err(error) => Some(Err(io::Error::other(error))),
+        })
     }
 }
 

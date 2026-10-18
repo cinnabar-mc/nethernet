@@ -62,7 +62,9 @@ impl Endpoint {
                     self.ready = true;
                     progressed = true;
                 }
-                SessionOutput::Event(SessionEvent::Failed) => panic!("relayed session failed"),
+                SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
+                    panic!("relayed session failed")
+                }
                 SessionOutput::Message(channel, data) => {
                     self.received.push((channel, data));
                     progressed = true;

@@ -374,7 +374,7 @@ mod tests {
                 match output {
                     SessionOutput::Send(data, to) => outbox.push((data, to)),
                     SessionOutput::Event(SessionEvent::Ready) => offerer_ready = true,
-                    SessionOutput::Event(SessionEvent::Failed) => {
+                    SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                         panic!("session failed unexpectedly")
                     }
                     SessionOutput::Message(..) => {}
@@ -394,7 +394,7 @@ mod tests {
                 match output {
                     SessionOutput::Send(data, to) => outbox.push((data, to)),
                     SessionOutput::Event(SessionEvent::Ready) => answerer_ready = true,
-                    SessionOutput::Event(SessionEvent::Failed) => {
+                    SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                         panic!("session failed unexpectedly")
                     }
                     SessionOutput::Message(..) => {}

@@ -84,30 +84,67 @@ async fn a_full_reliable_receiver_keeps_the_session_alive_and_preserves_order() 
     .expect("backpressured session stalled or lost reliable messages");
 }
 
-#[test]
-fn pending_reliable_delivery_has_explicit_packet_and_byte_limits() {
-    use super::backpressure::ReliableBacklog;
-    let (sender, _receiver) = mpsc::channel(1);
-    sender.try_send(Bytes::from_static(b"full")).unwrap();
-    let mut packets = ReliableBacklog::default();
-    for _ in 0..PACKET_CHANNEL_CAPACITY {
-        packets.deliver(&sender, Bytes::from_static(b"x")).unwrap();
-    }
-    assert!(
-        packets
-            .deliver(&sender, Bytes::from_static(b"overflow"))
-            .is_err()
-    );
-    let mut bytes = ReliableBacklog::default();
-    let maximum = PACKET_CHANNEL_CAPACITY * nethernet::protocol::constants::MAX_MESSAGE_SIZE;
-    bytes
-        .deliver(&sender, Bytes::from(vec![0; maximum]))
-        .unwrap();
-    assert!(
-        bytes
-            .deliver(&sender, Bytes::from_static(b"overflow"))
-            .is_err()
-    );
+#[tokio::test]
+async fn a_reliable_receive_overflow_delivers_its_accepted_prefix_before_an_error() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ((sender, _sender_reliable), (receiver, mut reliable, _unreliable)) =
+            connected_pair().await;
+        let capacity = receive::RELIABLE_PACKET_CAPACITY;
+        for index in 0..=capacity {
+            sender
+                .send(Bytes::copy_from_slice(&(index as u32).to_be_bytes()))
+                .await
+                .unwrap();
+        }
+        receiver.closed().await;
+        for index in 0..capacity {
+            assert_eq!(
+                reliable.recv().await.unwrap().unwrap().as_ref(),
+                &(index as u32).to_be_bytes()
+            );
+        }
+        assert!(matches!(
+            reliable.recv().await,
+            Err(NetherError::ReceiveCapacity)
+        ));
+        assert!(reliable.recv().await.unwrap().is_none());
+        sender.close().await.unwrap();
+    })
+    .await
+    .expect("receive overflow failed to retain its accepted prefix and terminal error");
+}
+
+#[tokio::test]
+async fn local_cancel_and_driver_abort_retain_accepted_data_with_distinct_outcomes() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for abort in [false, true] {
+            let ((sender, _sender_reliable), (receiver, mut reliable, _unreliable)) =
+                connected_pair().await;
+            let payload = Bytes::from_static(b"accepted before shutdown");
+            sender.send(payload.clone()).await.unwrap();
+            while reliable.rx.len() == 0 {
+                assert!(!receiver.is_closed().await);
+                tokio::task::yield_now().await;
+            }
+            if abort {
+                reliable._guard.task.abort();
+            } else {
+                receiver.close().await.unwrap();
+            }
+            receiver.closed().await;
+            assert_eq!(reliable.recv().await.unwrap().unwrap(), payload);
+            if abort {
+                assert!(matches!(
+                    reliable.recv().await,
+                    Err(NetherError::ConnectionClosed)
+                ));
+            }
+            assert!(reliable.recv().await.unwrap().is_none());
+            sender.close().await.unwrap();
+        }
+    })
+    .await
+    .expect("shutdown lost accepted data or failed to publish its terminal outcome");
 }
 
 mod peer;

@@ -1,15 +1,14 @@
 //! A connected session driven by one task, with reliable and unreliable channels and peer metadata.
-mod backpressure;
 pub(crate) mod command;
 pub(crate) mod guard;
 pub(crate) mod outgoing;
+mod receive;
 
 pub(crate) use command::Command;
 
 use crate::addr::Addr;
 use crate::error::{NetherError, Result};
 use crate::signaling::ClientSignaling;
-use backpressure::ReliableBacklog;
 use bytes::Bytes;
 use futures::future::{BoxFuture, pending};
 use guard::{ConnectionGuard, transport_now};
@@ -19,6 +18,7 @@ use nethernet::sans::Sans;
 pub use nethernet::session::Channel;
 use nethernet::session::{SessionEvent, SessionOutput};
 use outgoing::signal_send;
+use receive::{AdmissionError, Producer, Receiver, Terminal};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -44,7 +44,7 @@ impl Drop for TaskGuard {
     }
 }
 
-/// Cloneable handle; the connection closes once every handle and receiver is dropped.
+/// Cloneable handle; closing it or dropping every command handle retires the transport.
 #[derive(Clone)]
 pub struct Session {
     local_addr: Addr,
@@ -54,18 +54,18 @@ pub struct Session {
     _guard: Arc<TaskGuard>,
 }
 
-/// Incoming messages of one channel; yields None once the connection closes.
+/// Incoming accepted messages, followed by EOF on orderly close or one explicit receive error.
 pub struct SessionReceiver {
-    rx: mpsc::Receiver<Bytes>,
+    rx: Receiver,
     _guard: Arc<TaskGuard>,
 }
 
 impl SessionReceiver {
     pub async fn recv(&mut self) -> Result<Option<Bytes>> {
-        Ok(self.rx.recv().await)
+        futures::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Bytes>> {
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>>> {
         self.rx.poll_recv(cx)
     }
 }
@@ -106,8 +106,8 @@ impl Session {
         oneshot::Receiver<()>,
     ) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (packet_tx, packet_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
-        let (unreliable_tx, unreliable_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
+        let (packet_tx, packet_rx) = receive::channel(Channel::Reliable);
+        let (unreliable_tx, unreliable_rx) = receive::channel(Channel::Unreliable);
         let (ready_tx, ready_rx) = oneshot::channel();
         let close_token = CancellationToken::new();
 
@@ -158,43 +158,40 @@ impl Session {
         socket: Arc<UdpSocket>,
         connection: SansConnection,
         mut commands: mpsc::UnboundedReceiver<Command>,
-        packet_tx: mpsc::Sender<Bytes>,
-        unreliable_tx: mpsc::Sender<Bytes>,
+        packet_tx: Producer,
+        unreliable_tx: Producer,
         mut ready_tx: Option<oneshot::Sender<()>>,
         close_token: CancellationToken,
         signaling: Option<(ClientSignaling, Duration)>,
     ) -> JoinHandle<()> {
         let mut guard = ConnectionGuard::new(connection, socket.clone());
+        let driver_closed = close_token.clone().drop_guard();
         tokio::spawn(async move {
+            let _driver_closed = driver_closed;
             let connection = guard.core();
             let mut buf = vec![0u8; 65536];
             let mut wake = transport_now();
-            let mut reliable = ReliableBacklog::default();
             let mut outgoing: Option<BoxFuture<'static, Result<()>>> = None;
             let mut remote_addr = None;
             let mut rtt = None;
             let mut player: Option<Arc<PlayerInfo>> = None;
             let mut host: Option<String> = None;
 
-            'drive: loop {
+            let terminal = 'drive: loop {
                 tokio::select! {
                     biased;
 
-                    _ = close_token.cancelled() => break,
+                    _ = close_token.cancelled() => break Terminal::Eof,
                     _ = tokio::time::sleep_until(wake.into()) => {
                         let now = transport_now();
-                        if connection.handle(ConnectionInput::Timeout(now)).is_err() { break; }
+                        if connection.handle(ConnectionInput::Timeout(now)).is_err() { break Terminal::Transport; }
                         wake = now + MAX_IDLE;
                     },
                     result = async {
                         match &mut outgoing { Some(send) => send.await, None => pending().await }
                     } => {
                         outgoing = None;
-                        if result.is_err() { break; }
-                    },
-                    permit = packet_tx.reserve(), if !reliable.is_empty() => {
-                        let Ok(permit) = permit else { break; };
-                        if let Some(packet) = reliable.pop() { permit.send(packet); }
+                        if result.is_err() { break Terminal::Transport; }
                     },
                     received = socket.recv_from(&mut buf) => match received {
                         Ok((n, from)) => {
@@ -240,7 +237,7 @@ impl Session {
                             let result = connection.update_turn_credentials(server, credentials, transport_now()).map_err(NetherError::from);
                             let _ = reply.send(result);
                         }
-                        None => break,
+                        None => break Terminal::Eof,
                     },
                 }
 
@@ -259,18 +256,20 @@ impl Session {
                         }
                         SessionOutput::Event(SessionEvent::Failed) => {
                             tracing::debug!("session transport failed, closing");
-                            break 'drive;
+                            break 'drive Terminal::Transport;
+                        }
+                        SessionOutput::Event(SessionEvent::PeerClosed) => {
+                            break 'drive Terminal::Eof;
                         }
                         SessionOutput::Message(Channel::Reliable, data) => {
-                            if reliable.deliver(&packet_tx, Bytes::from(data)).is_err() {
-                                tracing::debug!(
-                                    "reliable receiver closed or pending delivery limit reached"
-                                );
-                                break 'drive;
+                            match packet_tx.push(Bytes::from(data)) {
+                                Ok(()) => {}
+                                Err(AdmissionError::Full) => break 'drive Terminal::Capacity,
+                                Err(AdmissionError::Closed) => break 'drive Terminal::Transport,
                             }
                         }
                         SessionOutput::Message(Channel::Unreliable, data) => {
-                            let _ = unreliable_tx.try_send(Bytes::from(data));
+                            let _ = unreliable_tx.push(Bytes::from(data));
                         }
                         SessionOutput::Wait(wait) => {
                             wake = transport_now() + wait.min(MAX_IDLE);
@@ -286,8 +285,9 @@ impl Session {
                 }
 
                 rtt = connection.rtt();
-            }
-
+            };
+            packet_tx.finish(terminal);
+            unreliable_tx.finish(terminal);
             close_token.cancel();
         })
     }

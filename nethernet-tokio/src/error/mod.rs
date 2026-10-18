@@ -48,6 +48,10 @@ pub enum NetherError {
     #[error("Connection closed")]
     ConnectionClosed,
 
+    /// Reliable receive admission exceeded its packet or byte budget; accepted data is delivered first.
+    #[error("accepted receive capacity exceeded")]
+    ReceiveCapacity,
+
     #[error("Pending offers from {0} exceed the limit")]
     PendingCountExceeded(String),
 

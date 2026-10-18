@@ -226,7 +226,9 @@ fn drive<K: Eq + Hash + Clone>(
                             return;
                         }
                     }
-                    SessionOutput::Event(SessionEvent::Failed) => failed.push(id.clone()),
+                    SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
+                        failed.push(id.clone())
+                    }
                     SessionOutput::Message(channel, data) => {
                         let message = ConnectionEvent::Message(channel, data.into_boxed_slice());
                         if events.try_send((id.clone(), message)).is_err() {

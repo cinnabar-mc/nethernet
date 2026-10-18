@@ -339,6 +339,7 @@ impl Server {
                         && permission.pending == Some(id)
                     {
                         permission.pending = None;
+                        permission.attempts = 0;
                         permission.valid_until = Some(
                             now.checked_add(PERMISSION_LIFETIME)
                                 .ok_or(IceError::Server)?,
@@ -407,6 +408,14 @@ impl Server {
         let relay = self.relay.ok_or(IceError::Server)?;
         if peer.is_ipv4() != relay.is_ipv4() {
             return Err(IceError::Configuration);
+        }
+        // A refused candidate cannot terminate checks for other peers or retain queued data.
+        if self.permissions.get(&peer).is_some_and(|permission| {
+            permission.attempts >= MAX_PERMISSION_ATTEMPTS
+                && permission.pending.is_none()
+                && permission.valid_until.is_none()
+        }) {
+            return Ok(());
         }
         if self.permissions.get(&peer).is_some_and(|permission| {
             permission

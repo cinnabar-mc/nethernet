@@ -4,13 +4,14 @@ use crate::addr::Addr;
 use crate::error::{NetherError, Result, SignalErrorCode};
 use crate::protocol::{Signal, SignalType};
 use crate::session::guard::{ConnectionGuard, GatheringGuard, transport_now};
-use crate::session::{AcceptedSession, Command, Session, SessionReceiver};
+use crate::session::{AcceptedSession, Command, Session, SessionReceiver, SessionSender};
 use crate::signaling::ClientSignaling;
 use crate::transport::{ConnectionConfig, local_bind_addr};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use nethernet::connection::{Connection as SansConnection, IceMode};
 use nethernet::identity::{TokenTrust, verify_answer};
+use nethernet::phase::{Connecting, Retired};
 use nethernet::session::Session as SansSession;
 use rand::Rng;
 use std::io;
@@ -107,7 +108,7 @@ impl Stream for SessionStream {
 pub struct NetherClient {
     session: Session,
     unreliable: SessionReceiver,
-    reader: StreamReader<SessionStream, Bytes>,
+    reader: Option<StreamReader<SessionStream, Bytes>>,
     send_future: Option<ReusableBoxFuture<'static, Result<()>>>,
     shutdown_future: Option<ReusableBoxFuture<'static, Result<()>>>,
 }
@@ -292,7 +293,7 @@ impl NetherClient {
         let local = Addr::new(signaling.network_id(), connection_id);
         let remote = Addr::new(remote_network_id.to_string(), connection_id);
 
-        let (session, reliable, unreliable, ready_rx) = Session::spawn_with_signaling(
+        let (session, reliable, unreliable, ready_rx) = Session::<Connecting>::spawn_with_signaling(
             socket,
             connection,
             local,
@@ -309,7 +310,7 @@ impl NetherClient {
             signaling.clone(),
         );
 
-        tokio::time::timeout(config.timeouts.establish(), ready_rx)
+        let ready = tokio::time::timeout(config.timeouts.establish(), ready_rx)
             .await
             .map_err(|_| {
                 (
@@ -319,7 +320,11 @@ impl NetherClient {
             })?
             .map_err(|_| (None, NetherError::ConnectionClosed))?;
 
-        Ok(Self::from_session(session, reliable, unreliable))
+        Ok(Self::from_session(
+            session.establish(ready),
+            reliable,
+            unreliable,
+        ))
     }
 
     pub(crate) fn from_session(
@@ -330,7 +335,7 @@ impl NetherClient {
         Self {
             session,
             unreliable,
-            reader: StreamReader::new(SessionStream { receiver: reliable }),
+            reader: Some(StreamReader::new(SessionStream { receiver: reliable })),
             send_future: None,
             shutdown_future: None,
         }
@@ -348,13 +353,28 @@ impl NetherClient {
         self.unreliable.recv().await
     }
 
-    /// Next reliable message; None once the connection closes.
+    /// Next reliable message; a partially read stream chunk is returned before later messages.
+    /// Returns None after the accepted prefix and ordinary terminal have been consumed.
     pub async fn recv(&mut self) -> Result<Option<Bytes>> {
-        self.reader.get_mut().receiver.recv().await
+        let (mut stream, chunk) = self
+            .reader
+            .take()
+            .expect("the client retains its reliable reader")
+            .into_inner_with_chunk();
+        stream.receiver = stream.receiver.retain_reader_chunk(chunk);
+        self.reader = Some(StreamReader::new(stream));
+        self.reader
+            .as_mut()
+            .expect("the reader is restored before receiving")
+            .get_mut()
+            .receiver
+            .recv()
+            .await
     }
 
-    pub async fn close(&self) -> Result<()> {
-        self.session.close().await
+    /// Consumes the live client and retains its original accepted receivers for draining.
+    pub fn close(self) -> AcceptedSession<Retired> {
+        self.into_accepted().close()
     }
 
     pub async fn remote_addr(&self) -> Addr {
@@ -369,17 +389,22 @@ impl NetherClient {
         self.session.rtt().await
     }
 
-    /// Splits into the session and its two receivers.
+    /// Splits into the session and original receivers, retaining any unread stream chunk first.
     pub fn into_accepted(self) -> AcceptedSession {
+        let (stream, chunk) = self
+            .reader
+            .expect("the client retains its reliable reader")
+            .into_inner_with_chunk();
         AcceptedSession {
             session: self.session,
-            reliable: self.reader.into_inner().receiver,
+            reliable: stream.receiver.retain_reader_chunk(chunk),
             unreliable: self.unreliable,
         }
     }
 
-    pub fn session(&self) -> Session {
-        self.session.clone()
+    /// Shares established sending and synchronous cancellation without duplicating lifecycle ownership.
+    pub fn sender(&self) -> SessionSender {
+        self.session.sender()
     }
 }
 
@@ -389,7 +414,12 @@ impl AsyncRead for NetherClient {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(cx, buf)
+        Pin::new(
+            self.reader
+                .as_mut()
+                .expect("the client retains its reliable reader"),
+        )
+        .poll_read(cx, buf)
     }
 }
 
@@ -414,7 +444,7 @@ impl AsyncWrite for NetherClient {
 
         let data = Bytes::copy_from_slice(buf);
         let len = data.len();
-        let session = self.session.clone();
+        let session = self.session.sender();
         let mut fut = ReusableBoxFuture::new(async move { session.send(data).await });
 
         match fut.poll(cx) {
@@ -453,7 +483,7 @@ impl AsyncWrite for NetherClient {
         }
 
         if self.shutdown_future.is_none() {
-            let session = self.session.clone();
+            let session = self.session.sender();
             self.shutdown_future =
                 Some(ReusableBoxFuture::new(async move { session.close().await }));
         }
@@ -587,7 +617,7 @@ mod tests {
                 for answer in answers {
                     server.signal(answer).await.unwrap();
                 }
-                let (session, mut reliable, _unreliable, ready) = Session::spawn(
+                let (session, mut reliable, _unreliable, ready) = Session::<Connecting>::spawn(
                     socket,
                     connection,
                     Addr::new(server.network_id(), offer.connection_id),
@@ -601,7 +631,7 @@ mod tests {
                     session.close_token(),
                     server.clone().into(),
                 );
-                ready.await.unwrap();
+                let session = session.establish(ready.await.unwrap());
                 let body = reliable.recv().await.unwrap().unwrap();
                 session.send(body).await.unwrap();
                 echoed_rx.await.unwrap();
@@ -620,7 +650,7 @@ mod tests {
                     b"inline answer"[..]
                 );
                 echoed_tx.send(()).unwrap();
-                connection.close().await.unwrap();
+                drop(connection.close());
             };
             tokio::join!(accept, connect);
         })

@@ -1,6 +1,6 @@
 //! LAN client: discovers servers by UDP broadcast and connects to one by network id.
 use crate::connection::ConnectionEvent;
-use crate::outbound::{ClientIceConfig, Outbound, Received};
+use crate::outbound::{ClientIceConfig, EstablishedClient, Outbound, Received};
 use crate::socket::recv_discovery;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
@@ -69,7 +69,7 @@ pub struct NetherClient {
     attempts: u32,
     attempts_left: u32,
     target: u64,
-    ready: bool,
+    established: Option<EstablishedClient>,
     remote_addr: Option<SocketAddr>,
     rtt: Option<Duration>,
     identity: Option<ServerIdentity>,
@@ -110,7 +110,7 @@ impl NetherClient {
             attempts: DEFAULT_ATTEMPTS,
             attempts_left: 0,
             target: 0,
-            ready: false,
+            established: None,
             remote_addr: None,
             rtt: None,
             identity: None,
@@ -143,8 +143,7 @@ impl NetherClient {
         server: SocketAddr,
         credentials: TurnCredentials,
     ) -> Result<(), nethernet::error::ProtocolError> {
-        self.transport
-            .as_mut()
+        self.transport_mut()
             .ok_or_else(|| nethernet::error::ProtocolError::Other("not connected".into()))?
             .update_turn_credentials(server, credentials, Instant::now())
     }
@@ -165,7 +164,7 @@ impl NetherClient {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.ready
+        self.established.is_some()
     }
 
     pub fn rtt(&self) -> Option<Duration> {
@@ -178,9 +177,8 @@ impl NetherClient {
 
     /// Starts negotiating; Connected follows once the data channels open.
     pub fn connect(&mut self, target_network_id: u64) -> std::io::Result<()> {
-        self.transport = None;
+        self.retire_transport(false);
         self.connected = false;
-        self.ready = false;
         self.connecting_deadline = None;
         self.remote_addr = None;
         self.rtt = None;
@@ -214,57 +212,43 @@ impl NetherClient {
         self.connected = true;
         self.connecting_deadline = Some(now + self.timeouts.negotiation);
         self.answered = false;
-        self.ready = false;
         self.remote_addr = None;
         self.rtt = None;
         Ok(())
     }
 
     pub fn disconnect(&mut self) {
+        let was_ready = self.established.is_some();
         self.received = Received::default();
         self.connecting_deadline = None;
         if self.connected {
-            self.transport = None;
+            self.retire_transport(false);
             self.connected = false;
         }
-        if self.ready {
-            self.ready = false;
+        if was_ready {
             self.remote_addr = None;
             self.rtt = None;
             self.events.push_back(NetherClientEvent::Disconnected);
         }
     }
 
-    pub fn send(&mut self, data: &[u8]) -> Result<(), nethernet::error::ProtocolError> {
-        self.send_on(Channel::Reliable, data)
-    }
-
-    pub fn send_unreliable(&mut self, data: &[u8]) -> Result<(), nethernet::error::ProtocolError> {
-        self.send_on(Channel::Unreliable, data)
-    }
-
-    fn send_on(
-        &mut self,
-        channel: Channel,
-        data: &[u8],
-    ) -> Result<(), nethernet::error::ProtocolError> {
-        if !self.connected {
-            return Err(nethernet::error::ProtocolError::Other(
-                "not connected".to_string(),
-            ));
-        }
-        self.transport
-            .as_mut()
-            .ok_or_else(|| nethernet::error::ProtocolError::Other("not connected".into()))?
-            .send(channel, data, Instant::now())
+    /// Borrows the actual transport owner created by Ready; pending discovery has no send capability.
+    pub fn established(&mut self) -> Option<&mut EstablishedClient> {
+        self.established.as_mut()
     }
 
     pub fn recv(&mut self) -> Option<Box<[u8]>> {
-        self.received.pop(Channel::Reliable)
+        match &mut self.established {
+            Some(entry) => entry.recv(),
+            None => self.received.pop(Channel::Reliable),
+        }
     }
 
     pub fn recv_unreliable(&mut self) -> Option<Box<[u8]>> {
-        self.received.pop(Channel::Unreliable)
+        match &mut self.established {
+            Some(entry) => entry.recv_unreliable(),
+            None => self.received.pop(Channel::Unreliable),
+        }
     }
 
     pub fn next_event(&mut self) -> Option<NetherClientEvent> {
@@ -305,7 +289,7 @@ impl NetherClient {
             .is_some_and(|deadline| now >= deadline)
         {
             if !self.answered && self.attempts_left > 0 {
-                self.transport = None;
+                self.retire_transport(false);
                 if self.begin_attempt().is_ok() {
                     return;
                 }
@@ -314,27 +298,29 @@ impl NetherClient {
             return;
         }
         if self
-            .transport
-            .as_mut()
+            .transport_mut()
             .is_some_and(|transport| transport.update(now).is_err())
         {
             self.fail_connection();
             return;
         }
-        while let Some(signal) = self
-            .transport
-            .as_mut()
-            .and_then(Outbound::poll_local_signal)
-        {
+        while let Some(signal) = self.transport_mut().and_then(Outbound::poll_local_signal) {
             if self.send_signal(signal, now).is_err() {
                 self.fail_connection();
                 return;
             }
         }
-        while let Some(event) = self.transport.as_mut().and_then(Outbound::poll_event) {
+        while let Some(event) = self.transport_mut().and_then(Outbound::poll_event) {
             match event {
-                ConnectionEvent::Ready(addr) if !self.ready => {
-                    self.ready = true;
+                ConnectionEvent::Ready(addr) if self.established.is_none() => {
+                    let transport = self
+                        .transport
+                        .take()
+                        .expect("Ready retains its original pending transport");
+                    self.established = Some(EstablishedClient {
+                        transport,
+                        received: std::mem::take(&mut self.received),
+                    });
                     self.remote_addr = addr;
                     self.connecting_deadline = None;
                     self.events.push_back(NetherClientEvent::Connected);
@@ -342,7 +328,14 @@ impl NetherClient {
                 ConnectionEvent::Ready(_) => {}
                 ConnectionEvent::Rtt(rtt) => self.rtt = Some(rtt),
                 ConnectionEvent::Message(channel, data) => {
-                    if self.received.push(channel, data).is_err() {
+                    let received = match &mut self.established {
+                        Some(entry) => &mut entry.received,
+                        None => &mut self.received,
+                    };
+                    if let Err(data) = received.push(channel, data) {
+                        self.transport_mut()
+                            .expect("the original transport retains rejected promotion")
+                            .retain_rejected_message(channel, data);
                         self.fail_connection();
                         return;
                     }
@@ -357,10 +350,9 @@ impl NetherClient {
 
     /// Retires the single attempt and prevents late delivery or timers after failure.
     fn fail_connection(&mut self) {
-        self.transport = None;
+        self.retire_transport(true);
         self.connecting_deadline = None;
         self.connected = false;
-        self.ready = false;
         self.remote_addr = None;
         self.rtt = None;
         self.events.push_back(NetherClientEvent::Disconnected);
@@ -378,8 +370,7 @@ impl NetherClient {
         if signal.signal_type == SignalType::Offer
             || !self.connected
             || signal.network_id != self.target.to_string()
-            || self.transport.as_mut().and_then(Outbound::connection_id)
-                != Some(signal.connection_id)
+            || self.transport_mut().and_then(Outbound::connection_id) != Some(signal.connection_id)
             || self
                 .connecting_deadline
                 .is_some_and(|deadline| now >= deadline)
@@ -399,7 +390,7 @@ impl NetherClient {
                 );
                 let _ = self.signaler.handle(LanSignalerInput::Signal(refusal, now));
                 self.connecting_deadline = None;
-                self.transport = None;
+                self.retire_transport(false);
                 self.connected = false;
                 self.events.push_back(NetherClientEvent::Disconnected);
             }
@@ -414,8 +405,7 @@ impl NetherClient {
         }
         let kind = signal.signal_type;
         if self
-            .transport
-            .as_mut()
+            .transport_mut()
             .is_some_and(|transport| transport.signal(signal, now).is_err())
         {
             if kind == SignalType::Candidate {
@@ -425,4 +415,29 @@ impl NetherClient {
             }
         }
     }
+    /// Drives the same exclusive socket in either phase; only the ready entry exposes send publicly.
+    fn transport_mut(&mut self) -> Option<&mut Outbound> {
+        match &mut self.established {
+            Some(entry) => Some(&mut entry.transport),
+            None => self.transport.as_mut(),
+        }
+    }
+
+    /// Consumes the actual ready owner, retaining accepted data only for retrospective failure reads.
+    fn retire_transport(&mut self, retain_received: bool) {
+        let pending = self.transport.take();
+        if let Some(entry) = self.established.take() {
+            let received = entry.close();
+            if retain_received {
+                self.received = received;
+            }
+        }
+        if retain_received && let Some(transport) = pending {
+            self.received.retain_transport(transport.retire());
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "client/retirement_tests.rs"]
+mod retirement_tests;

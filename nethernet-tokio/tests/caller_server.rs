@@ -85,7 +85,7 @@ async fn caller_server_keeps_peer_isolation_and_accepted_lifetime_on_listener_cl
         service.close();
         assert!(matches!(accepted.reliable.recv().await, Err(NetherError::ConnectionClosed)));
         assert!(accepted.reliable.recv().await.unwrap().is_none());
-        second.close().await.unwrap();
+        second.sender().close().await.unwrap();
     }).await.expect("finite multi-peer caller server fixture stalled");
 }
 

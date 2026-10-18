@@ -7,7 +7,7 @@ fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
 }
 
-fn drain(session: &mut Session) -> (usize, Option<Duration>) {
+fn drain<S: Phase>(session: &mut Session<S>) -> (usize, Option<Duration>) {
     let mut failed = 0;
     let mut shortest_wait: Option<Duration> = None;
     while let Some(output) = session.poll() {
@@ -90,7 +90,16 @@ fn a_ready_session_never_fails_on_the_deadline() {
     }
 }
 
-fn connected_pair() -> (Session, Session, Instant) {
+/// Returns the real pair with handshake outputs already consumed for existing exchange fixtures.
+fn connected_pair() -> (Session<Established>, Session<Established>, Instant) {
+    let (mut offerer, mut answerer, now) = connected_pair_with_pending_ready();
+    while offerer.poll().is_some() {}
+    while answerer.poll().is_some() {}
+    (offerer, answerer, now)
+}
+
+/// Retains each actual Ready output while the same pair completes its wire handshake.
+fn connected_pair_with_pending_ready() -> (Session<Established>, Session<Established>, Instant) {
     let mut now = Instant::now();
 
     let (mut offerer, offer) = Session::new(addr(40100), true, 1, now).unwrap();
@@ -117,8 +126,8 @@ fn connected_pair() -> (Session, Session, Instant) {
         ))
         .unwrap();
 
-    let mut offerer_ready = false;
-    let mut answerer_ready = false;
+    let mut offerer_ready = None;
+    let mut answerer_ready = None;
 
     for _ in 0..5000 {
         let mut progressed = false;
@@ -128,7 +137,7 @@ fn connected_pair() -> (Session, Session, Instant) {
             progressed = true;
             match output {
                 SessionOutput::Send(data, to) => offerer_outbox.push((data, to)),
-                SessionOutput::Event(SessionEvent::Ready) => offerer_ready = true,
+                output @ SessionOutput::Event(SessionEvent::Ready) => offerer_ready = Some(output),
                 SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                     panic!("session failed unexpectedly")
                 }
@@ -149,7 +158,7 @@ fn connected_pair() -> (Session, Session, Instant) {
             progressed = true;
             match output {
                 SessionOutput::Send(data, to) => answerer_outbox.push((data, to)),
-                SessionOutput::Event(SessionEvent::Ready) => answerer_ready = true,
+                output @ SessionOutput::Event(SessionEvent::Ready) => answerer_ready = Some(output),
                 SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                     panic!("session failed unexpectedly")
                 }
@@ -165,7 +174,7 @@ fn connected_pair() -> (Session, Session, Instant) {
                 .unwrap();
         }
 
-        if offerer_ready && answerer_ready {
+        if offerer_ready.is_some() && answerer_ready.is_some() {
             break;
         }
 
@@ -176,14 +185,24 @@ fn connected_pair() -> (Session, Session, Instant) {
         }
     }
 
-    assert!(offerer_ready, "offerer never became ready");
-    assert!(answerer_ready, "answerer never became ready");
+    assert!(offerer_ready.is_some(), "offerer never became ready");
+    assert!(answerer_ready.is_some(), "answerer never became ready");
     assert_eq!(offerer.remote_addr(), Some(addr(40101)));
     assert_eq!(answerer.remote_addr(), Some(addr(40100)));
 
     while offerer.poll().is_some() {}
     while answerer.poll().is_some() {}
-    (offerer, answerer, now)
+    offerer.output.push_back(offerer_ready.unwrap());
+    answerer.output.push_back(answerer_ready.unwrap());
+    (
+        offerer
+            .try_establish()
+            .unwrap_or_else(|_| panic!("offerer lost actual Ready")),
+        answerer
+            .try_establish()
+            .unwrap_or_else(|_| panic!("answerer lost actual Ready")),
+        now,
+    )
 }
 
 /// Full ICE can use its numeric path while an unsupported mDNS host remains unresolved.
@@ -262,12 +281,8 @@ fn ice_failure_preserves_queued_reliable_messages_before_single_terminal() {
         b"second accepted payload".as_slice(),
     ];
     for message in messages {
-        peer.handle(SessionInput::Send(
-            Channel::Reliable,
-            Bytes::copy_from_slice(message),
-            now,
-        ))
-        .unwrap();
+        peer.send(Channel::Reliable, Bytes::copy_from_slice(message), now)
+            .unwrap();
     }
     while let Some(output) = peer.poll() {
         if let SessionOutput::Send(data, to) = output {
@@ -330,18 +345,14 @@ fn ice_failure_preserves_queued_reliable_messages_before_single_terminal() {
         "failed session repeated its terminal or stale work"
     );
     assert!(matches!(
-        receiver.handle(SessionInput::Send(
-            Channel::Reliable,
-            Bytes::from_static(b"late"),
-            failed_at
-        )),
+        receiver.send(Channel::Reliable, Bytes::from_static(b"late"), failed_at),
         Err(ProtocolError::Ice(IceError::Closed))
     ));
 }
 
-fn forward(
-    from: &mut Session,
-    to: &mut Session,
+fn forward<S: Live>(
+    from: &mut Session<S>,
+    to: &mut Session<S>,
     (from_addr, to_addr): (SocketAddr, SocketAddr),
     ready: &mut bool,
     now: Instant,
@@ -360,9 +371,9 @@ fn forward(
     progressed
 }
 
-fn drive_until_ready(
-    offerer: &mut Session,
-    answerer: &mut Session,
+fn drive_until_ready<S: Live>(
+    offerer: &mut Session<S>,
+    answerer: &mut Session<S>,
     mut now: Instant,
 ) -> (bool, bool) {
     let (mut offerer_ready, mut answerer_ready) = (false, false);
@@ -444,11 +455,7 @@ fn a_send_is_written_without_waiting_for_a_timeout() {
     let (mut offerer, _answerer, now) = connected_pair();
 
     offerer
-        .handle(SessionInput::Send(
-            Channel::Reliable,
-            Bytes::from_static(b"now"),
-            now,
-        ))
+        .send(Channel::Reliable, Bytes::from_static(b"now"), now)
         .unwrap();
 
     let sent = std::iter::from_fn(|| offerer.poll())
@@ -457,8 +464,8 @@ fn a_send_is_written_without_waiting_for_a_timeout() {
 }
 
 fn reliable_messages_after_exchange(
-    receiver: &mut Session,
-    sender: &mut Session,
+    receiver: &mut Session<Established>,
+    sender: &mut Session<Established>,
     mut now: Instant,
 ) -> Vec<Vec<u8>> {
     let mut received = Vec::new();
@@ -540,32 +547,32 @@ fn full_handshake_and_bidirectional_data_exchange() {
     let (mut offerer, mut answerer, mut now) = connected_pair();
 
     offerer
-        .handle(SessionInput::Send(
+        .send(
             Channel::Reliable,
             Bytes::from_static(b"hello from offerer (reliable)"),
             now,
-        ))
+        )
         .unwrap();
     offerer
-        .handle(SessionInput::Send(
+        .send(
             Channel::Unreliable,
             Bytes::from_static(b"hello from offerer (unreliable)"),
             now,
-        ))
+        )
         .unwrap();
     answerer
-        .handle(SessionInput::Send(
+        .send(
             Channel::Reliable,
             Bytes::from_static(b"hello from answerer (reliable)"),
             now,
-        ))
+        )
         .unwrap();
     answerer
-        .handle(SessionInput::Send(
+        .send(
             Channel::Unreliable,
             Bytes::from_static(b"hello from answerer (unreliable)"),
             now,
-        ))
+        )
         .unwrap();
 
     let mut offerer_received = Vec::new();
@@ -691,11 +698,7 @@ fn an_authenticated_dtls_peer_close_finishes_the_session_once() {
             .any(|output| matches!(output, SessionOutput::Message(..) | SessionOutput::Wait(..)))
     );
     assert!(matches!(
-        receiver.handle(SessionInput::Send(
-            Channel::Reliable,
-            Bytes::from_static(b"closed"),
-            now
-        )),
+        receiver.send(Channel::Reliable, Bytes::from_static(b"closed"), now),
         Err(ProtocolError::Ice(IceError::Closed))
     ));
     for (data, _) in close_packets {
@@ -715,11 +718,11 @@ fn an_authenticated_dtls_peer_close_finishes_the_session_once() {
 #[test]
 fn an_authenticated_closing_datagram_delivers_its_final_complete_message_before_close() {
     let (mut receiver, mut peer, now) = connected_pair();
-    peer.handle(SessionInput::Send(
+    peer.send(
         Channel::Reliable,
         Bytes::from_static(b"final reliable payload"),
         now,
-    ))
+    )
     .unwrap();
     let mut datagram = Vec::new();
     while let Some(output) = peer.poll() {
@@ -759,11 +762,11 @@ fn an_authenticated_closing_datagram_delivers_its_final_complete_message_before_
 #[test]
 fn a_complete_queued_message_survives_a_later_authenticated_closing_packet() {
     let (mut receiver, mut peer, now) = connected_pair();
-    peer.handle(SessionInput::Send(
+    peer.send(
         Channel::Reliable,
         Bytes::from_static(b"already accepted by the core"),
         now,
-    ))
+    )
     .unwrap();
     while let Some(output) = peer.poll() {
         if let SessionOutput::Send(data, to) = output {
@@ -811,4 +814,61 @@ fn a_complete_queued_message_survives_a_later_authenticated_closing_packet() {
         SessionOutput::Event(SessionEvent::Failed) | SessionOutput::Wait(..)
     )));
     assert_eq!(receiver.gathering_state(), GatheringState::Closed);
+}
+
+/// Consuming local retirement retains genuine readiness and reliable output that the caller has not polled.
+#[test]
+fn consuming_close_retains_the_actual_ready_and_reliable_output_prefix() {
+    let (mut receiver, mut peer, now) = connected_pair_with_pending_ready();
+    let messages = [b"first accepted".as_slice(), b"second accepted".as_slice()];
+    for message in messages {
+        peer.send(Channel::Reliable, Bytes::copy_from_slice(message), now)
+            .unwrap();
+    }
+    while let Some(output) = peer.poll() {
+        if let SessionOutput::Send(data, to) = output {
+            assert_eq!(to, addr(40100));
+            receiver
+                .handle(SessionInput::Packet(data.into(), addr(40101), now))
+                .unwrap();
+        }
+    }
+    let accepted = receiver
+        .output
+        .iter()
+        .filter_map(|output| match output {
+            SessionOutput::Message(Channel::Reliable, data) => Some(data.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accepted, messages,
+        "the real RTC peer did not produce the accepted prefix"
+    );
+    assert!(matches!(
+        receiver.output.front(),
+        Some(SessionOutput::Event(SessionEvent::Ready))
+    ));
+    let (mut retired, result) = receiver.close(now);
+    result.unwrap();
+    assert!(
+        matches!(
+            retired.poll(),
+            Some(SessionOutput::Event(SessionEvent::Ready))
+        ),
+        "local retirement lost actual pending readiness"
+    );
+    for expected in messages {
+        assert!(
+            matches!(retired.poll(), Some(SessionOutput::Message(Channel::Reliable, data)) if data == expected),
+            "local retirement lost the accepted reliable prefix"
+        );
+    }
+    assert!(
+        !std::iter::from_fn(|| retired.poll()).any(|output| matches!(
+            output,
+            SessionOutput::Message(..) | SessionOutput::Event(SessionEvent::Ready)
+        ))
+    );
+    assert!(retired.poll().is_none());
 }

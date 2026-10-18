@@ -36,6 +36,37 @@ local session; the returned `Description` retains it for every encoding.
 `Admitted::answer` takes the same inputs when creating a server session. The Tokio
 and Bevy adapters generate these identifiers at their runtime boundary.
 
+`Session<Connecting>` and `Connection<Connecting>` can drive control input and
+drain their original accepted output, including messages received during
+establishment. Only the consuming `try_establish` transition, backed by both
+actual data channels opening, returns `Established`. If it is still pending, the
+original owner is returned unchanged. Application `send` exists only on
+`Established`; control inputs cannot bypass that boundary.
+
+Core `close(self, now)` consumes a live owner and returns `(Retired, teardown_result)`.
+Drain the retired owner's already accepted messages and best-effort deallocation
+output even when teardown reports an error. It cannot accept input, credentials
+or new application sends.
+Remote failure still arrives at runtime and preserves the existing accepted
+message/terminal order; readiness does not promise that a remote peer stays live.
+
+Tokio `Session` is a unique lifecycle owner. `session.sender()` or
+`client.sender()` shares an established `SessionSender` for concurrent send and
+control work. `start_close` on that capability requests global closure
+synchronously, including from an application's Drop; other capabilities then
+observe closure at runtime. Consuming `Session::close` returns a retired owner,
+and consuming `NetherClient::close` returns the retired session with both original
+receivers so accepted messages remain readable.
+
+Bevy clients remain stable discovery resources. Borrow
+`client.established()` to access the actual ready transport's send methods;
+retrospective receive remains available on the resource before or after a ready
+connection. Bevy servers return opaque `EstablishedSessionId` capabilities from
+`sessions()` and connected events. Their descriptive `id()` cannot authorize
+sending or closing a different pool entry, including a later reuse of the same
+peer ids. Closing consumes the local capability; its copies observe remote or
+global closure at runtime.
+
 `HttpSignalerInput::Request` carries both `now: Instant` for answer deadlines and
 `wall: SystemTime` for credential expiry. Supply the receive time from each clock;
 UTC changes do not alter pending-answer deadlines. HTTP execution stays in the
@@ -136,7 +167,9 @@ for capacity.
 `ConnectionConfig::identity` accepts an `Arc<dyn SdpIdentity>`. Use
 `SelfSignedIdentity::new(now, lifetime)` for signed-out client offers. Its token
 carries base64 DER public keys in `cpk` and `x5u`, and signs the SDP fingerprints.
-Borrow `signing_key()` when a later application login must use the same key.
+Use `SelfSignedIdentity::from_key` with a caller-owned `Arc<SigningKey>` when a
+later application Login must own the same proof. `new` still generates one key;
+`signing_key()` borrows it.
 Time and lifetime are explicit inputs; expired identities cannot sign offers.
 
 `ServerIdentity` retains its existing JWK token format and also implements
@@ -280,7 +313,10 @@ existing shared-socket worker and command/event queues; this does not multiplex
 multiple relay allocations onto a shared TURN tuple. Outbound work reads at most
 64 datagrams and drains at most 1024 core outputs per update. Transport delivery
 and application delivery each retain at most 1024 messages and 16 MiB; exceeding a
-receive budget closes the client explicitly. Sends apply core expiry immediately
+receive budget closes the client explicitly. On transport failure, both existing
+delivery stages retain their accepted messages for retrospective reads; neither
+stage admits new data after retirement. Explicit disconnect or a new connection
+discards the old receive owner. Sends apply core expiry immediately
 and return `WouldBlock` before admitting more work when the drain budget is full.
 Cancellation drops the socket owner after finite best-effort relay release.
 Initial HTTP hostname resolution/platform TLS setup are synchronous explicit

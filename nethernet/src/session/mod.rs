@@ -5,6 +5,7 @@ mod ice;
 mod sctp;
 
 use crate::error::ProtocolError;
+use crate::phase::{Connecting, Established, Live, Phase, Retired};
 use crate::protocol::constants::{LOCAL_SCTP_MAX_MESSAGE_SIZE, SCTP_MAX_MESSAGE_SIZE};
 use crate::protocol::message::{Message as Framing, MessageSegment};
 use crate::protocol::webrtc::{Description, DtlsRole, certificate};
@@ -22,6 +23,7 @@ use rtc::ice::state::ConnectionState as IceConnectionState;
 use rtc::sctp::{Event as SctpEvent, PayloadProtocolIdentifier, StreamId};
 use sctp::SctpLayer;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -63,9 +65,6 @@ pub enum SessionInput {
 
     RemoteCandidate(Candidate, Instant),
 
-    /// Fails until the channel has opened.
-    Send(Channel, bytes::Bytes, Instant),
-
     Timeout(Instant),
 }
 
@@ -99,7 +98,27 @@ impl Channels {
 }
 
 /// ICE, DTLS and SCTP stacks bound to one local address, with one reliable and one unreliable channel.
-pub struct Session {
+/// Connecting may drain accepted messages but cannot send application data.
+///
+/// ```compile_fail
+/// use nethernet::{phase::Connecting, session::{Session, Channel}};
+/// fn premature(session: &mut Session<Connecting>, now: std::time::Instant) {
+///     session.send(Channel::Reliable, bytes::Bytes::new(), now);
+/// }
+/// ```
+///
+/// A consumed local close owner exposes only retrospective output.
+///
+/// ```compile_fail
+/// use nethernet::{phase::Established, session::{Session, Channel}};
+/// fn retired(session: Session<Established>, now: std::time::Instant) {
+///     let (mut retired, _) = session.close(now);
+///     retired.send(Channel::Reliable, bytes::Bytes::new(), now);
+/// }
+/// ```
+#[must_use = "retain the session owner through retirement and drain its accepted output"]
+pub struct Session<S: Phase = Connecting> {
+    _phase: PhantomData<S>,
     is_controlling: bool,
     ice: IceLayer,
     certificate: Option<rtc::dtls::crypto::Certificate>,
@@ -120,7 +139,7 @@ pub struct Session {
 
 pub use dtls::DtlsLayer;
 
-impl Session {
+impl Session<Connecting> {
     /// The controlling side is the offerer: it announces the DTLS server role and opens the data channels.
     /// The caller supplies a distinct SDP origin identifier for each local session.
     pub fn new(
@@ -172,6 +191,7 @@ impl Session {
         };
 
         let session = Self {
+            _phase: PhantomData,
             is_controlling,
             ice,
             certificate: Some(certificate),
@@ -190,8 +210,58 @@ impl Session {
         Ok((session, local_description))
     }
 
+    /// Consumes this owner only after the actual two-channel readiness condition.
+    /// Pending ownership is returned unchanged, including its output FIFO and allocation.
+    #[allow(
+        clippy::result_large_err,
+        reason = "returns the original pending allocation without boxing"
+    )]
+    pub fn try_establish(self) -> Result<Session<Established>, Self> {
+        if self.channels.ready_emitted {
+            Ok(self.rephase())
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl<S: Phase> Session<S> {
+    /// Transfers the same transport and output storage without performing protocol work.
+    pub(crate) fn rephase<T: Phase>(self) -> Session<T> {
+        Session {
+            _phase: PhantomData,
+            is_controlling: self.is_controlling,
+            ice: self.ice,
+            certificate: self.certificate,
+            pending_role_fingerprint: self.pending_role_fingerprint,
+            remote_max_message_size: self.remote_max_message_size,
+            early_packets: self.early_packets,
+            remote: self.remote,
+            dtls: self.dtls,
+            sctp: self.sctp,
+            channels: self.channels,
+            output: self.output,
+            establish_within: self.establish_within,
+            establish_started: self.establish_started,
+        }
+    }
+
+    /// Whether this exact owner produced the protocol's actual readiness condition.
+    pub(crate) fn became_ready(&self) -> bool {
+        self.channels.ready_emitted
+    }
+
+    /// Drains the original wire, accepted-message and terminal FIFO.
+    /// Connecting receives are retrospective accepted data, not permission to send.
+    pub fn poll(&mut self) -> Option<SessionOutput> {
+        self.output.pop_front()
+    }
+
     /// Time allowed from the remote description until `Ready` before `Failed` is emitted; defaults to 10 seconds.
-    pub fn set_establish_deadline(&mut self, within: Duration) {
+    pub fn set_establish_deadline(&mut self, within: Duration)
+    where
+        S: Live,
+    {
         self.establish_within = within;
     }
 
@@ -205,7 +275,10 @@ impl Session {
     }
 
     /// Drains each gathered candidate once. Callers send these incrementally when using trickle ICE.
-    pub fn poll_local_candidate(&mut self) -> Option<Candidate> {
+    pub fn poll_local_candidate(&mut self) -> Option<Candidate>
+    where
+        S: Live,
+    {
         self.ice.poll_local_candidate()
     }
 
@@ -220,7 +293,10 @@ impl Session {
         server: SocketAddr,
         credentials: TurnCredentials,
         now: Instant,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), ProtocolError>
+    where
+        S: Live,
+    {
         let result = self.ice.update_credentials(server, credentials, now);
         if self.ice.selected_route_failed() {
             self.fail(now)?;
@@ -232,7 +308,28 @@ impl Session {
     }
 
     /// Cancels gathering, checks and relay timers immediately. Drain best-effort deallocation sends before dropping.
-    pub fn close(&mut self, now: Instant) -> Result<(), ProtocolError> {
+    pub fn close(mut self, now: Instant) -> (Session<Retired>, Result<(), ProtocolError>)
+    where
+        S: Live,
+    {
+        if self.ice.gathering_state() == GatheringState::Closed {
+            return (self.rephase(), Ok(()));
+        }
+        let mut accepted = std::mem::take(&mut self.output);
+        accepted.retain(|output| {
+            matches!(
+                output,
+                SessionOutput::Message(..) | SessionOutput::Event(..)
+            )
+        });
+        let result = self.close_transport(now);
+        accepted.append(&mut self.output);
+        self.output = accepted;
+        (self.rephase(), result)
+    }
+
+    /// Retires the engine while keeping its owner available to drain teardown output.
+    fn close_transport(&mut self, now: Instant) -> Result<(), ProtocolError> {
         if self.ice.gathering_state() == GatheringState::Closed {
             return Ok(());
         }
@@ -468,7 +565,7 @@ impl Session {
         .min()
     }
 
-    fn send(
+    fn send_message(
         &mut self,
         channel: Channel,
         data: bytes::Bytes,
@@ -599,7 +696,7 @@ impl Session {
                     SessionOutput::Message(..) | SessionOutput::Event(SessionEvent::Ready)
                 )
             });
-            let teardown = self.close(now);
+            let teardown = self.close_transport(now);
             accepted.append(&mut self.output);
             accepted.push_back(SessionOutput::Event(terminal));
             self.output = accepted;
@@ -609,7 +706,35 @@ impl Session {
     }
 }
 
-impl Sans for Session {
+impl Session<Established> {
+    /// Admits application data only on an owner that reached actual readiness.
+    pub fn send(
+        &mut self,
+        channel: Channel,
+        data: bytes::Bytes,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        self.expire_before_input(now)?;
+        if self.ice.gathering_state() == GatheringState::Closed {
+            return Err(IceError::Closed.into());
+        }
+        self.send_message(channel, data, now)?;
+        self.pump(now)
+    }
+}
+
+impl<S: Phase> Session<S> {
+    /// Applies the original absolute credential/terminal fence before any input admission.
+    fn expire_before_input(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        self.ice.expire(now);
+        if self.ice.selected_route_failed() {
+            self.fail(now)?;
+        }
+        Ok(())
+    }
+}
+
+impl<S: Live> Sans for Session<S> {
     type Input = SessionInput;
     type Output = SessionOutput;
     type Error = ProtocolError;
@@ -619,13 +744,9 @@ impl Sans for Session {
             SessionInput::Packet(_, _, now)
             | SessionInput::RemoteDescription(_, _, now)
             | SessionInput::RemoteCandidate(_, now)
-            | SessionInput::Send(_, _, now)
             | SessionInput::Timeout(now) => *now,
         };
-        self.ice.expire(now);
-        if self.ice.selected_route_failed() {
-            self.fail(now)?;
-        }
+        self.expire_before_input(now)?;
         if self.ice.gathering_state() == GatheringState::Closed {
             return match msg {
                 SessionInput::Packet(..) | SessionInput::Timeout(..) => Ok(()),
@@ -639,10 +760,6 @@ impl Sans for Session {
             }
             SessionInput::RemoteCandidate(candidate, now) => {
                 self.add_remote_candidate(candidate, now)
-            }
-            SessionInput::Send(channel, data, now) => {
-                self.send(channel, data, now)?;
-                self.pump(now)
             }
             SessionInput::Timeout(now) => self.handle_timeout(now),
         }

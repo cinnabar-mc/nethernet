@@ -37,7 +37,7 @@ async fn lan_roundtrip() {
             mut reliable,
             mut unreliable,
         } = listener.accept().await.unwrap();
-        let unreliable_session = session.clone();
+        let unreliable_session = session.sender();
         tokio::spawn(async move {
             while let Ok(Some(data)) = unreliable.recv().await {
                 unreliable_session.send_unreliable(data).await.unwrap();
@@ -78,7 +78,7 @@ async fn lan_roundtrip() {
     assert_eq!(&echoed[..], b"fast");
 
     assert_eq!(stream.remote_addr().await.network_id, "1234");
-    stream.close().await.unwrap();
+    stream.sender().close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

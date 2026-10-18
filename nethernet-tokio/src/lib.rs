@@ -18,9 +18,10 @@ pub use ice::{IceResolveError, resolve_ice_servers};
 pub use nethernet::identity::{
     PlayerInfo, SdpIdentity, SelfSignedIdentity, ServerIdentity, TokenIdentity, TokenTrust,
 };
+pub use nethernet::phase::{Connecting, Established, Live, Phase, Retired};
 pub use protocol::packet::discovery::{MessagePacket, RequestPacket, ResponsePacket, ServerData};
 pub use protocol::{Message, MessageSegment, Signal, SignalType};
-pub use session::{AcceptedSession, Session, SessionReceiver};
+pub use session::{AcceptedSession, Session, SessionReceiver, SessionSender};
 pub use signaling::caller::server::{
     CallerServerSignaling, CallerServerSignalingConfig, CallerServerSignalingDriver,
 };

@@ -3,6 +3,7 @@ pub mod admission;
 pub mod connection;
 pub mod error;
 pub mod identity;
+pub mod phase;
 pub mod protocol;
 pub mod sans;
 pub mod session;
@@ -19,6 +20,7 @@ pub mod prelude {
         jwk::{Jwk, JwkSet, MinecraftKeys},
         jwt::Claims,
     };
+    pub use crate::phase::{Connecting, Established, Retired};
     pub use crate::protocol::packet::discovery::{
         MessagePacket, Packets, RequestPacket, ResponsePacket, ServerData,
     };

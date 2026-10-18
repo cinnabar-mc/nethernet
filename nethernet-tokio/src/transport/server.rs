@@ -126,7 +126,7 @@ impl NetherServer {
         self.cancel_token.cancel();
         self.incoming.close();
         while let Ok(accepted) = self.incoming.try_recv() {
-            accepted.session.close().await?;
+            drop(accepted.close());
         }
         if let Some(task) = self.signal_handler_task.as_mut() {
             let _ = task.await;

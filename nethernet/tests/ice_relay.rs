@@ -2,6 +2,7 @@
 #[path = "support/turn.rs"]
 mod turn;
 use nethernet::error::ProtocolError;
+use nethernet::phase::{Connecting, Established, Live, Phase};
 use nethernet::protocol::webrtc::Description;
 use nethernet::sans::Sans;
 use nethernet::session::{
@@ -40,14 +41,14 @@ fn config(server: SocketAddr, now: Instant, policy: IcePolicy) -> IceConfig {
     }
 }
 
-struct Endpoint {
+struct Endpoint<S: Phase = Connecting> {
     local: SocketAddr,
-    session: Session,
+    session: Session<S>,
     ready: bool,
     received: Vec<(Channel, Vec<u8>)>,
 }
 
-impl Endpoint {
+impl<S: Phase> Endpoint<S> {
     /// Routes every send to the test TURN server, rejecting any unintended direct fallback.
     fn drain(&mut self, server: &mut TurnPeer) -> bool {
         let mut progressed = false;
@@ -77,7 +78,7 @@ impl Endpoint {
 }
 
 /// Advances only caller-owned monotonic time and finite packet queues.
-fn step(endpoints: &mut [Endpoint; 2], server: &mut TurnPeer, now: &mut Instant) {
+fn step<S: Live>(endpoints: &mut [Endpoint<S>; 2], server: &mut TurnPeer, now: &mut Instant) {
     let mut progressed = false;
     for endpoint in &mut *endpoints {
         progressed |= endpoint.drain(server);
@@ -95,8 +96,8 @@ fn step(endpoints: &mut [Endpoint; 2], server: &mut TurnPeer, now: &mut Instant)
 }
 
 /// Delivers finite queued server responses without advancing caller time.
-fn deliver_server_packets(
-    endpoints: &mut [Endpoint; 2],
+fn deliver_server_packets<S: Live>(
+    endpoints: &mut [Endpoint<S>; 2],
     server: &mut TurnPeer,
     now: Instant,
 ) -> bool {
@@ -116,7 +117,7 @@ fn deliver_server_packets(
 }
 
 /// Completes gathering and applies full descriptions before the actual secured transport handshake.
-fn pair(v6: bool) -> ([Endpoint; 2], TurnPeer, Instant) {
+fn pair(v6: bool) -> ([Endpoint<Established>; 2], TurnPeer, Instant) {
     pair_with_candidates(v6, Vec::new(), false)
 }
 
@@ -125,7 +126,7 @@ fn pair_with_candidates(
     v6: bool,
     extra: Vec<Candidate>,
     refuse_extra: bool,
-) -> ([Endpoint; 2], TurnPeer, Instant) {
+) -> ([Endpoint<Established>; 2], TurnPeer, Instant) {
     pair_with_binding(v6, extra, refuse_extra, false)
 }
 
@@ -135,7 +136,7 @@ fn pair_with_binding(
     extra: Vec<Candidate>,
     refuse_extra: bool,
     drop_bindings: bool,
-) -> ([Endpoint; 2], TurnPeer, Instant) {
+) -> ([Endpoint<Established>; 2], TurnPeer, Instant) {
     let mut now = Instant::now();
     let mut server = TurnPeer::new(addr(v6, 3478));
     server.drop_bindings = drop_bindings;
@@ -146,6 +147,14 @@ fn pair_with_binding(
     let (a, a_description) =
         Session::new_with_ice(addr(v6, 41000), true, 1, ice.clone(), now).unwrap();
     let (b, b_description) = Session::new_with_ice(addr(v6, 41001), false, 2, ice, now).unwrap();
+    let a = match a.try_establish() {
+        Err(a) => a,
+        Ok(_) => panic!("gathering cannot produce data-channel readiness"),
+    };
+    let b = match b.try_establish() {
+        Err(b) => b,
+        Ok(_) => panic!("gathering cannot produce data-channel readiness"),
+    };
     let mut endpoints = [
         Endpoint {
             local: addr(v6, 41000),
@@ -230,6 +239,15 @@ fn pair_with_binding(
         endpoints.iter().all(|endpoint| endpoint.ready),
         "ICE/DTLS/SCTP did not complete through TURN"
     );
+    let endpoints = endpoints.map(|endpoint| Endpoint {
+        local: endpoint.local,
+        session: endpoint
+            .session
+            .try_establish()
+            .unwrap_or_else(|_| panic!("actual relay Ready lost")),
+        ready: endpoint.ready,
+        received: endpoint.received,
+    });
     (endpoints, server, now)
 }
 
@@ -250,11 +268,11 @@ fn unanswered_gathering_binding_cannot_retire_an_established_relay() {
         assert_eq!(endpoint.session.local_candidates().len(), 1);
         endpoint
             .session
-            .handle(SessionInput::Send(
+            .send(
                 Channel::Reliable,
                 b"relay after gathering timeout".as_slice().into(),
                 now,
-            ))
+            )
             .unwrap();
     }
     for _ in 0..1000 {
@@ -284,11 +302,7 @@ fn full_ice_ignores_unsupported_candidates_and_keeps_the_udp_session() {
     let (mut endpoints, mut server, mut now) = pair_with_candidates(false, vec![tcp], false);
     endpoints[0]
         .session
-        .handle(SessionInput::Send(
-            Channel::Reliable,
-            b"usable UDP path".as_slice().into(),
-            now,
-        ))
+        .send(Channel::Reliable, b"usable UDP path".as_slice().into(), now)
         .unwrap();
     for _ in 0..1000 {
         step(&mut endpoints, &mut server, &mut now);
@@ -316,11 +330,11 @@ fn denied_turn_candidate_permission_keeps_other_pairs_viable() {
     );
     endpoints[0]
         .session
-        .handle(SessionInput::Send(
+        .send(
             Channel::Reliable,
             b"other relay remains live".as_slice().into(),
             now,
-        ))
+        )
         .unwrap();
     for _ in 0..1000 {
         step(&mut endpoints, &mut server, &mut now);
@@ -342,19 +356,11 @@ fn relay_only_sessions_secure_and_exchange_both_channels_over_ipv4_and_ipv6_udp(
         for endpoint in &mut endpoints {
             endpoint
                 .session
-                .handle(SessionInput::Send(
-                    Channel::Reliable,
-                    reliable.clone().into(),
-                    now,
-                ))
+                .send(Channel::Reliable, reliable.clone().into(), now)
                 .unwrap();
             endpoint
                 .session
-                .handle(SessionInput::Send(
-                    Channel::Unreliable,
-                    b"relayed".as_slice().into(),
-                    now,
-                ))
+                .send(Channel::Unreliable, b"relayed".as_slice().into(), now)
                 .unwrap();
         }
         for _ in 0..3000 {
@@ -407,14 +413,17 @@ fn relay_only_sessions_secure_and_exchange_both_channels_over_ipv4_and_ipv6_udp(
         }
         assert!(server.refreshes >= 2);
         assert_eq!(server.allocation_count(), 2);
-        for endpoint in &mut endpoints {
-            endpoint.session.close(now).unwrap();
+        for endpoint in endpoints {
+            let (session, result) = endpoint.session.close(now);
+            result.unwrap();
+            let mut endpoint = Endpoint {
+                local: endpoint.local,
+                session,
+                ready: endpoint.ready,
+                received: endpoint.received,
+            };
             endpoint.drain(&mut server);
             assert_eq!(endpoint.session.gathering_state(), GatheringState::Closed);
-            endpoint
-                .session
-                .handle(SessionInput::Timeout(now + Duration::from_secs(3600)))
-                .unwrap();
             assert!(endpoint.session.poll().is_none());
         }
         assert_eq!(server.allocation_count(), 0);
@@ -443,10 +452,8 @@ fn gathering_has_a_deadline_and_rejects_wrong_source_or_corrupt_authenticated_su
         .unwrap();
     assert_eq!(unreachable.gathering_state(), GatheringState::Complete);
     assert_eq!(unreachable.local_candidates().len(), 1);
-    unreachable.close(start + Duration::from_secs(2)).unwrap();
-    unreachable
-        .handle(SessionInput::Timeout(start + Duration::from_secs(500)))
-        .unwrap();
+    let (mut unreachable, result) = unreachable.close(start + Duration::from_secs(2));
+    result.unwrap();
     assert!(unreachable.poll().is_none());
 
     let mut server = TurnPeer::new(server_addr);
@@ -501,7 +508,8 @@ fn gathering_has_a_deadline_and_rejects_wrong_source_or_corrupt_authenticated_su
     session
         .handle(SessionInput::Timeout(start + Duration::from_secs(1200)))
         .unwrap();
-    session.close(start + Duration::from_secs(1200)).unwrap();
+    let (mut session, result) = session.close(start + Duration::from_secs(1200));
+    result.unwrap();
     assert!(session.poll().is_none());
 }
 
@@ -619,10 +627,8 @@ fn allocation_refresh_and_expiry_are_driven_without_a_remote_peer() {
             .iter()
             .all(|candidate| candidate.candidate_type() != CandidateType::Relay)
     );
-    session.close(expired).unwrap();
-    session
-        .handle(SessionInput::Timeout(expired + Duration::from_secs(1000)))
-        .unwrap();
+    let (mut session, result) = session.close(expired);
+    result.unwrap();
     assert!(session.poll().is_none());
 }
 
@@ -678,12 +684,15 @@ fn unanswered_permissions_reach_a_finite_pending_data_limit() {
         bounded,
         "unanswered permissions never reached the advertised pending-data cap"
     );
-    session.close(now).unwrap();
-    drive_gatherer(&mut session, local, &mut server, now);
+    let (mut session, result) = session.close(now);
+    result.unwrap();
+    while let Some(output) = session.poll() {
+        if let SessionOutput::Send(data, to) = output {
+            assert_eq!(to, server.addr);
+            server.receive(local, data);
+        }
+    }
     assert_eq!(server.allocation_count(), 0);
-    session
-        .handle(SessionInput::Timeout(now + Duration::from_secs(1000)))
-        .unwrap();
     assert!(session.poll().is_none());
 }
 
@@ -734,7 +743,8 @@ fn a_connection_trickles_candidates_gathered_after_the_initial_offer_once() {
         nethernet::protocol::webrtc::candidate::parse_ice_candidate(&candidate.data).unwrap();
     assert_eq!(candidate.candidate_type(), CandidateType::ServerReflexive);
     assert!(connection.poll_local_signal().is_none());
-    connection.close(now).unwrap();
+    let (_retired, result) = connection.close(now);
+    result.unwrap();
 }
 
 #[test]
@@ -760,11 +770,11 @@ fn a_selected_relay_expires_before_send_even_without_a_timeout_input() {
             now + Duration::from_secs(601)
         };
         while endpoints[0].session.poll().is_some() {}
-        let result = endpoints[0].session.handle(SessionInput::Send(
+        let result = endpoints[0].session.send(
             Channel::Unreliable,
             b"must not leave an expired relay".as_slice().into(),
             expired,
-        ));
+        );
         let output: Vec<_> = std::iter::from_fn(|| endpoints[0].session.poll()).collect();
         assert!(
             !output
@@ -810,11 +820,11 @@ fn changing_turn_username_preserves_the_original_allocation_and_credentials() {
     );
     endpoints[0]
         .session
-        .handle(SessionInput::Send(
+        .send(
             Channel::Unreliable,
             b"original allocation still works".as_slice().into(),
             now,
-        ))
+        )
         .unwrap();
     for _ in 0..100 {
         step(&mut endpoints, &mut server, &mut now);
@@ -831,7 +841,7 @@ fn changing_turn_username_preserves_the_original_allocation_and_credentials() {
 
 /// Keeps consent alive while deterministically advancing to a scheduled maintenance boundary.
 fn advance_pair_to(
-    endpoints: &mut [Endpoint; 2],
+    endpoints: &mut [Endpoint<Established>; 2],
     server: &mut TurnPeer,
     now: &mut Instant,
     target: Instant,
@@ -897,11 +907,11 @@ fn scheduled_permission_stale_nonce_preserves_relay_and_recovers_on_its_next_ref
     assert_eq!(server.allocation_count(), 2);
     endpoints[0]
         .session
-        .handle(SessionInput::Send(
+        .send(
             Channel::Unreliable,
             b"permission maintenance recovered".as_slice().into(),
             now,
-        ))
+        )
         .unwrap();
     for _ in 0..100 {
         step(&mut endpoints, &mut server, &mut now);

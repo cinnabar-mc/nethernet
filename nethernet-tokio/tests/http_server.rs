@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use nethernet_tokio::error::SignalErrorCode;
 use nethernet_tokio::signaling::http::{HttpServerConfig, HttpSignaling, HttpSignalingServer};
 use nethernet_tokio::{
     AcceptedSession, ConnectionConfig, NetherClient, NetherError, NetherServer, ServerData,
@@ -74,6 +73,15 @@ async fn connect_once(url: &str, peer: &str) -> Result<NetherClient, NetherError
     NetherClient::connect_with(HttpSignaling::new(peer.into()).unwrap(), url.into(), config).await
 }
 
+/// Matches the existing public HTTP refusal, keeping other errors and successful connections distinct.
+fn http_forbidden(result: &Result<NetherClient, NetherError>) -> bool {
+    let expected = nethernet::signaling::http::join::JoinResponseError::Status(
+        http::StatusCode::FORBIDDEN.as_u16(),
+    )
+    .to_string();
+    matches!(result, Err(NetherError::Other(message)) if *message == expected)
+}
+
 #[tokio::test]
 async fn queued_and_live_accepted_sessions_hold_the_server_capacity() {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -85,12 +93,7 @@ async fn queued_and_live_accepted_sessions_hold_the_server_capacity() {
         let first = connect_once(&url, "peer-one").await.unwrap();
         let refused = connect_once(&url, "peer-two").await;
         assert!(
-            matches!(
-                &refused,
-                Err(NetherError::Signaled(
-                    SignalErrorCode::IncomingConnectionIgnored
-                ))
-            ),
+            http_forbidden(&refused),
             "a connected session queued for accept must retain the server capacity: connected={}, error={:?}",
             refused.is_ok(),
             refused.as_ref().err()
@@ -98,12 +101,7 @@ async fn queued_and_live_accepted_sessions_hold_the_server_capacity() {
         let mut accepted = listener.accept().await.unwrap();
         let refused = connect_once(&url, "peer-three").await;
         assert!(
-            matches!(
-                &refused,
-                Err(NetherError::Signaled(
-                    SignalErrorCode::IncomingConnectionIgnored
-                ))
-            ),
+            http_forbidden(&refused),
             "transferring a live session to its consumer must not release server capacity: connected={}, error={:?}",
             refused.is_ok(),
             refused.as_ref().err()
@@ -161,12 +159,7 @@ async fn closed_accepted_receivers_retain_capacity_until_their_owners_retire() {
         drop(accepted.session);
         let refused = connect_once(&url, "refused-peer").await;
         assert!(
-            matches!(
-                &refused,
-                Err(NetherError::Signaled(
-                    SignalErrorCode::IncomingConnectionIgnored
-                ))
-            ),
+            http_forbidden(&refused),
             "closed receivers must keep their original session reservation: connected={}, error={:?}",
             refused.is_ok(),
             refused.as_ref().err()
@@ -176,7 +169,7 @@ async fn closed_accepted_receivers_retain_capacity_until_their_owners_retire() {
         let replacement = loop {
             match connect_once(&url, "replacement-peer").await {
                 // Actual actor destruction may still be queued; wait through its public refusal.
-                Err(NetherError::Signaled(SignalErrorCode::IncomingConnectionIgnored)) => {
+                result if http_forbidden(&result) => {
                     tokio::task::yield_now().await;
                 }
                 result => break result.unwrap(),

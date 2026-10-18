@@ -46,6 +46,7 @@ async fn concurrent_sends_wait_outside_the_bounded_real_session_command_queue() 
     tokio::time::timeout(Duration::from_secs(10), async {
         let ((sender, _sender_reliable), (receiver, _reliable, _unreliable)) =
             connected_pair().await;
+        let queued_commands = sender.queued_commands();
         let mut held = Vec::new();
         for _ in 0..command::COMMAND_CAPACITY * 2 {
             let mut sending = Box::pin(sender.send(Bytes::from_static(b"bounded actual send")));
@@ -53,7 +54,7 @@ async fn concurrent_sends_wait_outside_the_bounded_real_session_command_queue() 
             held.push(sending);
         }
         assert!(
-            sender.queued_commands() <= command::COMMAND_CAPACITY,
+            queued_commands.await.unwrap() <= command::COMMAND_CAPACITY,
             "concurrent sends must retain excess payloads at their caller, not in an unbounded actor queue"
         );
         drop(held);

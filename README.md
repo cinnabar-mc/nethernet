@@ -197,3 +197,12 @@ IPv6 outer UDP. Explicit IPv6 relay allocation and TURN TCP/TLS remain incomplet
 Bevy may drive the same configured core with its own sockets and clock; configured
 ICE construction and late outgoing candidate wiring in that adapter remain
 incomplete and do not require a Tokio dependency.
+
+The Tokio driver preserves reliable receive order while the application receiver
+is temporarily full. It continues transport timers and signaling, retaining at
+most one additional receiver capacity of messages and a byte budget derived from
+the receiver capacity and protocol segment size. A closed receiver or an exceeded
+pending limit closes the session;
+unreliable receive remains best effort. Existing TURN allocations require the
+same username during password rotation. A new username requires a new socket and
+allocation.

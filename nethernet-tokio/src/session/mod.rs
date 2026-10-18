@@ -1,4 +1,5 @@
 //! A connected session driven by one task, with reliable and unreliable channels and peer metadata.
+mod backpressure;
 pub(crate) mod command;
 pub(crate) mod guard;
 pub(crate) mod outgoing;
@@ -8,6 +9,7 @@ pub(crate) use command::Command;
 use crate::addr::Addr;
 use crate::error::{NetherError, Result};
 use crate::signaling::ClientSignaling;
+use backpressure::ReliableBacklog;
 use bytes::Bytes;
 use futures::future::{BoxFuture, pending};
 use guard::{ConnectionGuard, transport_now};
@@ -27,7 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_IDLE: Duration = Duration::from_secs(1);
 
-const PACKET_CHANNEL_CAPACITY: usize = 1024;
+const PACKET_CHANNEL_CAPACITY: usize =
+    nethernet::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY;
 
 struct TaskGuard {
     close_token: CancellationToken,
@@ -166,6 +169,7 @@ impl Session {
             let connection = guard.core();
             let mut buf = vec![0u8; 65536];
             let mut wake = transport_now();
+            let mut reliable = ReliableBacklog::default();
             let mut outgoing: Option<BoxFuture<'static, Result<()>>> = None;
             let mut remote_addr = None;
             let mut rtt = None;
@@ -187,6 +191,10 @@ impl Session {
                     } => {
                         outgoing = None;
                         if result.is_err() { break; }
+                    },
+                    permit = packet_tx.reserve(), if !reliable.is_empty() => {
+                        let Ok(permit) = permit else { break; };
+                        if let Some(packet) = reliable.pop() { permit.send(packet); }
                     },
                     received = socket.recv_from(&mut buf) => match received {
                         Ok((n, from)) => {
@@ -254,7 +262,10 @@ impl Session {
                             break 'drive;
                         }
                         SessionOutput::Message(Channel::Reliable, data) => {
-                            if packet_tx.try_send(Bytes::from(data)).is_err() {
+                            if reliable.deliver(&packet_tx, Bytes::from(data)).is_err() {
+                                tracing::debug!(
+                                    "reliable receiver closed or pending delivery limit reached"
+                                );
                                 break 'drive;
                             }
                         }
@@ -376,3 +387,6 @@ impl Session {
         self.close_token.is_cancelled()
     }
 }
+
+#[cfg(test)]
+mod tests;

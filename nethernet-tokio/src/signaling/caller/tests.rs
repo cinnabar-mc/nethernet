@@ -76,6 +76,47 @@ async fn a_service_batch_larger_than_the_caller_queue_waits_and_preserves_order(
     assert_eq!(stale.await, Err(CallerSignalingError::RouteMismatch));
 }
 
+/// Capacity released after expiry cannot publish an expired envelope, even when timeout polls it first.
+#[tokio::test(start_paused = true)]
+async fn incoming_admission_rechecks_original_deadline_after_capacity_wait() {
+    let (caller, mut driver) = bridge();
+    let mut incoming = caller.signals().unwrap();
+    let mut offer = Box::pin(caller.signal(Signal::offer(9, "sdp".into(), PEER.into())));
+    assert!(poll!(offer.as_mut()).is_pending());
+    driver
+        .recv()
+        .await
+        .unwrap()
+        .finish(Ok(SignalDelivery::PeerReceived));
+    offer.await.unwrap();
+    driver.try_deliver(PEER, "CANDIDATEADD 9 prefix").unwrap();
+    let deadline = tokio::time::Instant::now().into_std() + Duration::from_secs(1);
+    let mut late = Box::pin(
+        driver
+            .prepare_delivery_before(PEER, "CANDIDATEADD 9 expired", deadline)
+            .unwrap(),
+    );
+    assert!(poll!(late.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(incoming.next().await.unwrap().data, "prefix");
+    assert_eq!(
+        late.await,
+        Err(CallerSignalingError::TimedOut),
+        "expired incoming envelope escaped its original admission deadline"
+    );
+    assert!(incoming.next().now_or_never().is_none());
+
+    let timely = driver
+        .prepare_delivery_before(
+            PEER,
+            "CANDIDATEADD 9 timely",
+            tokio::time::Instant::now().into_std() + Duration::from_secs(1),
+        )
+        .unwrap();
+    timely.await.unwrap();
+    assert_eq!(incoming.next().await.unwrap().data, "timely");
+}
+
 /// Creates a small bridge so every queue limit can be exercised without I/O.
 fn bridge() -> (CallerSignaling, CallerSignalingDriver) {
     CallerSignaling::new(

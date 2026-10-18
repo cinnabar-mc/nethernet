@@ -350,6 +350,38 @@ impl CallerSignalingDriver {
         impl std::future::Future<Output = std::result::Result<(), CallerSignalingError>> + Send + use<>,
         CallerSignalingError,
     > {
+        self.prepare_delivery_inner(sender, wire, None)
+    }
+
+    /// Retains an incoming envelope's original absolute deadline through actual transport admission.
+    /// Dropping this owned future before admission sends nothing; receipts follow successful admission.
+    pub fn prepare_delivery_before(
+        &self,
+        sender: &str,
+        wire: &str,
+        deadline: Instant,
+    ) -> std::result::Result<
+        impl std::future::Future<Output = std::result::Result<(), CallerSignalingError>> + Send + use<>,
+        CallerSignalingError,
+    > {
+        let delivery = self.prepare_delivery_inner(sender, wire, Some(deadline))?;
+        Ok(async move {
+            tokio::time::timeout_at(deadline.into(), delivery)
+                .await
+                .map_err(|_| CallerSignalingError::TimedOut)?
+        })
+    }
+
+    /// Shares route validation, capacity reservation and subscription admission for either deadline policy.
+    fn prepare_delivery_inner(
+        &self,
+        sender: &str,
+        wire: &str,
+        _deadline: Option<Instant>,
+    ) -> std::result::Result<
+        impl std::future::Future<Output = std::result::Result<(), CallerSignalingError>> + Send + use<>,
+        CallerSignalingError,
+    > {
         let signal = self.decode(sender, wire)?;
         check_subscription(
             &self.inbox.lock().unwrap_or_else(|error| error.into_inner()),

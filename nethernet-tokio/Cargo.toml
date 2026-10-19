@@ -28,6 +28,7 @@ rustls-pemfile.workspace = true
 p384.workspace = true
 
 [dev-dependencies]
+rtc-turn.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = "0.3.23"
 serde_json = "1.0.151"

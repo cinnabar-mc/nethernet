@@ -692,8 +692,8 @@ impl<S: Phase> Session<S> {
                 self.ice.send_selected(data, to, now)?;
             }
         }
-        while let Some((data, to)) = self.ice.poll_write()? {
-            self.output.push_back(SessionOutput::Send(data, to));
+        while let Some(output) = self.ice.poll_write()? {
+            self.output.push_back(output);
         }
         if failed {
             self.fail(now)?;

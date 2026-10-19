@@ -48,6 +48,20 @@ impl SessionSender {
     /// Keep this actual future across unrelated wakes. Cancellation loses its queue
     /// position; dropping a granted permit returns its capacity. The caller can
     /// recheck its own authority before synchronous commit, without another await.
+    /// Commands enter the FIFO in commit order, rather than reservation order.
+    ///
+    /// ```no_run
+    /// use bytes::Bytes;
+    /// use nethernet_tokio::{Result, SessionSender, session::Channel};
+    /// use std::time::Instant;
+    ///
+    /// async fn send_reserved(sender: &SessionSender, payload: Bytes, deadline: Instant) -> Result<()> {
+    ///     let permit = sender.reserve_send(Some(deadline)).await?;
+    ///     // Recheck the application's current grant here; do not await before commit.
+    ///     let receipt = permit.commit(Channel::Reliable, payload)?;
+    ///     receipt.acknowledged().await
+    /// }
+    /// ```
     pub async fn reserve_send(&self, deadline: Option<Instant>) -> Result<SendPermit> {
         let expired = async {
             match deadline {
@@ -110,9 +124,12 @@ impl SendPermit {
 }
 
 impl SendReceipt {
-    /// Consumes the exact actor reply. The caller retains its original overall deadline.
+    /// Consumes the exact actor reply. The original deadline limits capacity acquisition
+    /// and local core admission; it does not bound how long this reply wait lasts.
     /// Dropping this wait may retract a not-yet-admitted deadline-bound command;
-    /// after admission, cancellation cannot undo it. No peer delivery is promised.
+    /// without a deadline, a queued command remains eligible for admission.
+    /// Cancellation preserves any previously admitted prefix and never retracts
+    /// an admitted message. No peer delivery is promised.
     pub async fn acknowledged(self) -> Result<()> {
         let Self { reply, guard } = self;
         let result = reply.await.map_err(|_| NetherError::ConnectionClosed)?;

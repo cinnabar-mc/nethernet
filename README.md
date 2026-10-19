@@ -117,7 +117,7 @@ limit. TLS targets retain the original hostname for verification. Source address
 selection belongs to the connected stream; it is independent of the UDP socket.
 The existing `resolve_ice_servers` API remains UDP-only. Core stream reservations
 require caller-owned stream I/O; the Tokio adapter supplies this through the
-configuration below.
+configuration below. The Bevy adapter likewise supplies stream I/O through its configured TURN targets.
 
 ### Tokio TURN streams
 
@@ -361,28 +361,43 @@ sends later candidates through the retained signaling owner. Runtime session
 handles accept credential rotation through `update_turn_credentials`. Cancelling
 negotiation or dropping the driver stops its state and attempts relay release.
 
-Tokio supports UDP STUN/TURN and TURN over TCP or verified TLS. Relay address
-family is independent of the carrier family. `resolve_ice_targets` returns UDP
-servers and unopened stream targets; pass those targets through `turn_streams`.
-`turn_tls` preserves an explicit caller TLS policy or uses verified platform roots.
-The Bevy adapter below currently accepts UDP servers.
-The Bevy LAN and HTTP clients accept `set_ice_config(Some(ClientIceConfig {
-    bind_addr: local_interface,
-    ice: IceConfig { servers, ..Default::default() },
-}))` using types from `bevy_nethernet::prelude` and `nethernet::session`.
-`local_interface` is a concrete numeric local address with an optional ephemeral
-port; all server endpoints must have the same family. HTTP joins gather Full
+The outer TURN carrier is independent of the requested UDP relay family. TCP/TLS
+carriers below still allocate UDP relays; they do not implement RFC 6062 TCP allocations.
+The Bevy LAN and HTTP clients accept `ClientIceConfig` through the fallible
+`set_ice_config`, using types from `bevy_nethernet::prelude` and `nethernet::session`.
+The setter prepares TURN trust before atomically installing targets and policy; handle its
+`Result`. An invalid replacement preserves the original pair. Subsequent frame-driven retries
+use that prepared policy and perform no DNS or platform-trust setup.
+`bind_addr` is a concrete numeric local address with an optional ephemeral port;
+datagram servers must have the same family. `turn_streams` holds already-resolved
+`TurnStreamTarget` values for TCP or verified TLS. Each target has its original
+TLS server name, credentials and optional explicit bind/relay family. With the
+`tls` feature, `turn_tls` selects an optional caller-provided verifier independently
+of HTTP signaling; otherwise platform trust is prepared during explicit setup.
+A pending carrier has no fabricated socket tuple. The core receives the same
+connected socket's actual addresses only after connection and TLS verification
+when used.
+HTTP joins gather Full
 candidates before encoding/signing the offer. LAN carries Trickle candidates,
-including those gathered after its initial offer. Active clients expose
-`update_turn_credentials` for password renewal under the original expiry.
+including those gathered after its initial offer. Clients expose `update_turn_credentials`
+for an unambiguous numeric endpoint. When UDP/TCP/TLS carriers share that address, use
+`selected_turn_stream` to observe the original selected stream and
+`update_turn_stream_credentials` with that exact tuple. Direct, UDP and unselected paths have
+no selected stream. Renewal changes the same allocation, preserving its original username,
+absolute credential expiry and authenticated lease rules; local success does not acknowledge
+a remote Refresh response. The address-only API continues to reject ambiguity.
 
-Outbound Bevy clients poll their nonblocking UDP socket and pure connection on
+Outbound Bevy clients poll their nonblocking UDP/TCP/TLS sockets and pure connection on
 `update`, without a socket thread or Tokio dependency. Call updates regularly;
 pausing frames also pauses transport progress. Each client owns an exclusive UDP
-socket, including its TURN allocation tuples. The server adapter retains its
-existing shared-socket worker and command/event queues; this does not multiplex
-multiple relay allocations onto a shared TURN tuple. Outbound work reads at most
-64 datagrams and drains at most 1024 core outputs per update. Transport delivery
+socket, including its TURN allocation tuples. This does not multiplex multiple
+relay allocations onto a shared TURN tuple. Outbound work reads at most
+64 combined datagram/stream input steps and drains at most 1024 core outputs per
+update. Each stream retains one bounded RTC frame for input and one original
+partial output with its byte offset, plus the existing TLS buffers. A blocked
+selected stream withholds new application admission; unused carriers cannot block
+usable paths and retire individually if a second output cannot be staged.
+Transport delivery
 and application delivery each retain at most 1024 messages and 16 MiB; exceeding a
 receive budget closes the client explicitly. On transport failure, both existing
 delivery stages retain their accepted messages for retrospective reads; neither
@@ -392,6 +407,18 @@ and return `WouldBlock` before admitting more work when the drain budget is full
 Cancellation drops the socket owner after finite best-effort relay release.
 Initial HTTP hostname resolution/platform TLS setup are synchronous explicit
 setup; frame retries reuse their prepared target and trust configuration.
+
+The accepting Bevy LAN and HTTP adapters use one shared UDP worker and a bounded
+command channel. `set_session_limits(ServerLimits { .. })` controls the host-wide
+session, retained packet and retained byte limits; `set_pending_limits` separately
+controls unanswered offers. Payloads stay charged until application receive, and
+retired sessions keep their admission slots until worker cleanup and lifecycle
+consumption finish. Lowering limits preserves the accepted prefix. Worker admission
+does not block the Bevy frame: the original answer waits in its existing session
+entry until that worker installs the same core. Only actual transport readiness
+grants an established send capability. A full command channel returns `WouldBlock`
+before copying a send payload. These accepting APIs currently use host candidates;
+outbound `ClientIceConfig` does not configure accepting TURN allocations.
 
 The Tokio driver admits reliable messages into one FIFO shared with the application
 receiver. Its packet budget is twice the default receiver capacity; its byte budget

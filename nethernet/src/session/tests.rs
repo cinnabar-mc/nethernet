@@ -74,6 +74,53 @@ fn the_wait_schedules_the_establish_deadline() {
     assert!(wait.unwrap() <= Duration::from_millis(50));
 }
 
+/// Repeated frame ticks replace scheduling metadata without changing original RTC wire output.
+#[test]
+fn repeated_ticks_coalesce_the_current_wait_without_reordering_wire_output() {
+    let now = Instant::now();
+    let (mut session, _) = Session::new_with_ice(
+        addr(40114),
+        true,
+        1,
+        IceConfig {
+            servers: vec![IceServer::Stun(addr(40115)), IceServer::Stun(addr(40116))],
+            ..Default::default()
+        },
+        now,
+    )
+    .unwrap();
+    let original: Vec<_> = session
+        .output
+        .iter()
+        .filter_map(|output| match output {
+            SessionOutput::Send(bytes, to) => Some((bytes.clone(), *to)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        original.len() >= 2,
+        "actual STUN requests were not retained"
+    );
+    for _ in 0..crate::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY {
+        session.handle(SessionInput::Timeout(now)).unwrap();
+    }
+    let expected_wait = session
+        .poll_timeout()
+        .unwrap()
+        .saturating_duration_since(now);
+    let mut wire = Vec::new();
+    let mut waits = Vec::new();
+    while let Some(output) = session.poll() {
+        match output {
+            SessionOutput::Send(bytes, to) => wire.push((bytes, to)),
+            SessionOutput::Wait(wait) => waits.push(wait),
+            _ => panic!("gathering produced an unrelated output"),
+        }
+    }
+    assert_eq!(wire, original, "original RTC wire prefix changed");
+    assert_eq!(waits, [expected_wait], "superseded waits accumulated");
+}
+
 #[test]
 fn a_ready_session_never_fails_on_the_deadline() {
     let (mut offerer, mut answerer, now) = connected_pair();

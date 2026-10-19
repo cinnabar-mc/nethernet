@@ -278,6 +278,11 @@ impl<S: Phase> Connection<S> {
         self.session.rtt()
     }
 
+    /// Observes the original session's gathering state without advancing timers or admitting work.
+    pub fn gathering_state(&self) -> crate::session::GatheringState {
+        self.session.gathering_state()
+    }
+
     /// Observes the same selected live relay carrier without inferring a route from queued output.
     /// Pending, direct, UDP and retired relay owners return None.
     pub fn selected_turn_stream(&self) -> Option<crate::session::TurnStreamRoute> {

@@ -1,6 +1,6 @@
 //! LAN server: UDP discovery and signaling with sessions polled once per frame.
-use crate::connection::{ConnectionEvent, PoolEvent, Readiness, SessionPool};
-use crate::pending::{PendingLimits, admits_offer};
+use crate::connection::{PoolEvent, PoolUpdate, Readiness, SessionPool};
+use crate::pending::{PendingLimits, ServerLimits, admits_offer};
 use crate::socket::{bind_discovery_socket, bind_shared_socket, recv_discovery, send_discovery};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
@@ -10,10 +10,10 @@ use nethernet::prelude::{
     Answered, LanSignaler, LanSignalerConfig, LanSignalerInput, LanSignalerOutput, OfferPolicy,
     PlayerInfo, Sans, ServerData, ServerIdentity, TokenTrust,
 };
-use nethernet::protocol::constants::MAX_DATAGRAM_SIZE;
+use nethernet::protocol::constants::{MAX_BYTES, MAX_DATAGRAM_SIZE};
 use nethernet::protocol::{Signal, SignalType};
 use nethernet::session::Channel;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -92,6 +92,8 @@ struct SessionEntry {
     ready: Option<EstablishedSessionId>,
     readiness: Readiness,
     created: Instant,
+    answer: Option<Vec<Signal>>,
+    answer_deadline: Instant,
     remote_addr: Option<SocketAddr>,
     rtt: Option<Duration>,
     player: Option<Arc<PlayerInfo>>,
@@ -109,9 +111,6 @@ pub struct NetherServer {
     timeouts: Timeouts,
     pending_limits: PendingLimits,
     sessions: HashMap<NetherSessionId, SessionEntry>,
-    received: VecDeque<(NetherSessionId, Box<[u8]>)>,
-    received_unreliable: VecDeque<(NetherSessionId, Box<[u8]>)>,
-    events: VecDeque<NetherServerEvent>,
     buf: Box<[u8]>,
 }
 
@@ -139,9 +138,6 @@ impl NetherServer {
             timeouts: Timeouts::default(),
             pending_limits: PendingLimits::default(),
             sessions: HashMap::new(),
-            received: VecDeque::new(),
-            received_unreliable: VecDeque::new(),
-            events: VecDeque::new(),
             buf: vec![0u8; MAX_DATAGRAM_SIZE].into_boxed_slice(),
         })
     }
@@ -172,6 +168,11 @@ impl NetherServer {
         self.pending_limits = limits;
     }
 
+    /// Bounds all sessions and final retained payloads together; accepted prefixes are preserved.
+    pub fn set_session_limits(&mut self, limits: ServerLimits) {
+        self.pool.set_limits(limits);
+    }
+
     /// Replaces the data advertised to discovery requests.
     pub fn set_server_data(&mut self, data: ServerData) {
         let _ = self
@@ -198,6 +199,8 @@ impl NetherServer {
         self.established_entry(id)?.remote_addr
     }
 
+    /// Admits bounded local work; full capacity returns `Io(WouldBlock)` before copying payloads.
+    /// Success is not a transmission or peer acknowledgement.
     pub fn send(
         &mut self,
         id: &EstablishedSessionId,
@@ -206,6 +209,8 @@ impl NetherServer {
         self.send_on(id, Channel::Reliable, data)
     }
 
+    /// Admits bounded local work; full capacity returns `Io(WouldBlock)` before copying payloads.
+    /// Success is not a transmission or peer acknowledgement.
     pub fn send_unreliable(
         &mut self,
         id: &EstablishedSessionId,
@@ -226,16 +231,15 @@ impl NetherServer {
             ));
         }
         self.pool
-            .send(id.id.clone(), id.readiness.clone(), channel, data.into());
-        Ok(())
+            .send(id.id.clone(), id.readiness.clone(), channel, data)
     }
 
     pub fn recv(&mut self) -> Option<(NetherSessionId, Box<[u8]>)> {
-        self.received.pop_front()
+        self.pool.recv(Channel::Reliable)
     }
 
     pub fn recv_unreliable(&mut self) -> Option<(NetherSessionId, Box<[u8]>)> {
-        self.received_unreliable.pop_front()
+        self.pool.recv(Channel::Unreliable)
     }
 
     /// Consumes this local established capability; stale copies cannot close a replacement entry.
@@ -247,6 +251,9 @@ impl NetherServer {
 
     /// Borrows only the original Ready entry, never a replacement with the same peer ids.
     fn established_entry(&self, id: &EstablishedSessionId) -> Option<&SessionEntry> {
+        if id.readiness.is_retired() {
+            return None;
+        }
         let entry = self.sessions.get(&id.id)?;
         entry
             .ready
@@ -257,15 +264,29 @@ impl NetherServer {
 
     /// Internal retirement remains possible before readiness without exposing send authority.
     fn remove_session(&mut self, id: &NetherSessionId) {
-        if self.sessions.remove(id).is_some() {
-            self.pool.remove(id.clone());
-            self.events
-                .push_back(NetherServerEvent::SessionDisconnected(id.clone()));
+        if let Some(entry) = self.sessions.remove(id) {
+            self.pool.remove(id.clone(), entry.readiness);
         }
     }
 
     pub fn next_event(&mut self) -> Option<NetherServerEvent> {
-        self.events.pop_front()
+        loop {
+            let PoolEvent {
+                id,
+                event,
+                readiness,
+            } = self.pool.next_event()?;
+            match event {
+                PoolUpdate::Ready(_) => {
+                    return Some(NetherServerEvent::SessionConnected(EstablishedSessionId {
+                        id,
+                        readiness,
+                    }));
+                }
+                PoolUpdate::Failed => return Some(NetherServerEvent::SessionDisconnected(id)),
+                PoolUpdate::Rtt(_) => {}
+            }
+        }
     }
 
     pub fn update(&mut self) {
@@ -281,15 +302,9 @@ impl NetherServer {
 
         let _ = self.signaler.handle(LanSignalerInput::Update(now));
 
-        while let Some(output) = self.signaler.poll() {
-            match output {
-                LanSignalerOutput::Datagram(buf, addr) => {
-                    let _ = send_discovery(&self.socket, &buf, addr);
-                }
-                LanSignalerOutput::Signal(signal) => self.handle_signal(signal, now),
-                LanSignalerOutput::ServerDiscovered(..) | LanSignalerOutput::Wait(_) => {}
-            }
-        }
+        self.drive_signaling(now);
+        self.publish_answers(now);
+        self.drive_signaling(now);
 
         let mut events = Vec::new();
         self.pool.drive(&mut events);
@@ -308,25 +323,17 @@ impl NetherServer {
                 continue;
             }
             match event {
-                ConnectionEvent::Ready(addr) if entry.ready.is_none() => {
+                PoolUpdate::Ready(addr) if entry.ready.is_none() => {
                     let capability = EstablishedSessionId {
                         id: id.clone(),
                         readiness,
                     };
                     entry.ready = Some(capability.clone());
                     entry.remote_addr = addr;
-                    self.events
-                        .push_back(NetherServerEvent::SessionConnected(capability));
                 }
-                ConnectionEvent::Ready(_) => {}
-                ConnectionEvent::Rtt(rtt) => entry.rtt = Some(rtt),
-                ConnectionEvent::Message(Channel::Reliable, data) => {
-                    self.received.push_back((id, data))
-                }
-                ConnectionEvent::Message(Channel::Unreliable, data) => {
-                    self.received_unreliable.push_back((id, data))
-                }
-                ConnectionEvent::Failed => failed.push(id),
+                PoolUpdate::Ready(_) => {}
+                PoolUpdate::Rtt(rtt) => entry.rtt = Some(rtt),
+                PoolUpdate::Failed => failed.push(id),
             }
         }
 
@@ -340,6 +347,56 @@ impl NetherServer {
             self.timeouts.establish(),
             now,
         );
+    }
+
+    /// Drains only the original signaler's outputs, including newly committed answers.
+    fn drive_signaling(&mut self, now: Instant) {
+        while let Some(output) = self.signaler.poll() {
+            match output {
+                LanSignalerOutput::Datagram(buf, addr) => {
+                    let _ = send_discovery(&self.socket, &buf, addr);
+                }
+                LanSignalerOutput::Signal(signal) => self.handle_signal(signal, now),
+                LanSignalerOutput::ServerDiscovered(..) | LanSignalerOutput::Wait(_) => {}
+            }
+        }
+    }
+
+    /// Publishes each retained answer once, after the same worker acknowledged its original core.
+    fn publish_answers(&mut self, now: Instant) {
+        let mut failed = Vec::new();
+        for (id, entry) in &mut self.sessions {
+            if entry.answer.is_none() {
+                continue;
+            }
+            if entry.readiness.is_retired() || now >= entry.answer_deadline {
+                failed.push(id.clone());
+                continue;
+            }
+            if !entry.readiness.is_admitted() {
+                continue;
+            }
+            let signals = entry
+                .answer
+                .take()
+                .expect("the original answer remains staged");
+            if signals
+                .into_iter()
+                .try_for_each(|signal| self.signaler.handle(LanSignalerInput::Signal(signal, now)))
+                .is_err()
+            {
+                failed.push(id.clone());
+            }
+        }
+        for id in failed {
+            let refusal = Signal::error(
+                id.connection_id,
+                SignalErrorCode::IncomingConnectionIgnored,
+                id.network_id.clone(),
+            );
+            let _ = self.signaler.handle(LanSignalerInput::Signal(refusal, now));
+            self.remove_session(&id);
+        }
     }
 
     fn handle_signal(&mut self, signal: Signal, now: Instant) {
@@ -370,7 +427,8 @@ impl NetherServer {
             .iter()
             .filter(|(_, entry)| entry.ready.is_none());
         let pending = pending.map(|(id, _)| id.network_id.as_str());
-        if !admits_offer(pending, &offer.network_id, self.pending_limits) {
+        if !self.pool.admits(&id) || !admits_offer(pending, &offer.network_id, self.pending_limits)
+        {
             tracing::debug!(
                 "Refusing offer from {}: pending offers exceed the limit",
                 offer.network_id
@@ -415,11 +473,22 @@ impl NetherServer {
             }
         };
 
-        for signal in signals {
-            let _ = self.signaler.handle(LanSignalerInput::Signal(signal, now));
-        }
-
-        let Some(readiness) = self.pool.add(id.clone(), connection, local_ufrag) else {
+        let fits = signals
+            .iter()
+            .try_fold(MAX_BYTES, |remaining, signal| {
+                remaining.checked_sub(signal.to_string().len())
+            })
+            .is_some();
+        let readiness = fits
+            .then(|| self.pool.add(id.clone(), connection, local_ufrag))
+            .flatten();
+        let Some(readiness) = readiness else {
+            let refusal = Signal::error(
+                offer.connection_id,
+                SignalErrorCode::IncomingConnectionIgnored,
+                offer.network_id,
+            );
+            let _ = self.signaler.handle(LanSignalerInput::Signal(refusal, now));
             return;
         };
         self.sessions.insert(
@@ -428,6 +497,8 @@ impl NetherServer {
                 ready: None,
                 readiness,
                 created: now,
+                answer: Some(signals),
+                answer_deadline: now + self.timeouts.establish(),
                 remote_addr: None,
                 rtt: None,
                 player: player.map(Arc::new),
@@ -446,7 +517,7 @@ fn expire_unestablished(
         let keep =
             entry.ready.is_some() || now.saturating_duration_since(entry.created) < establish;
         if !keep {
-            pool.remove(id.clone());
+            pool.remove(id.clone(), entry.readiness.clone());
         }
         keep
     });
@@ -465,6 +536,8 @@ mod expiry_tests {
             }),
             readiness,
             created,
+            answer: None,
+            answer_deadline: created,
             remote_addr: None,
             rtt: None,
             player: None,
@@ -495,3 +568,6 @@ mod expiry_tests {
         assert_eq!(sessions.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod admission_tests;

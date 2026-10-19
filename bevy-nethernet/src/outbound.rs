@@ -1,6 +1,8 @@
-//! One outbound UDP transport, advanced by the caller's frame rather than a worker runtime.
+//! One outbound transport, advanced by the caller's frame rather than a worker runtime.
 use crate::connection::{ActiveConnection, ConnectionEvent};
 use crate::socket::bind_shared_socket;
+use crate::tcp_wire::ClientTls;
+mod streams;
 use bevy_platform::cell::SyncCell;
 use nethernet::connection::{Connection, ConnectionInput, IceMode};
 use nethernet::error::ProtocolError;
@@ -9,7 +11,7 @@ use nethernet::protocol::webrtc::Description;
 use nethernet::sans::Sans;
 use nethernet::session::{
     Channel, GatheringState, IceConfig, Session, SessionEvent, SessionInput, SessionOutput,
-    TurnCredentials,
+    TurnCredentials, TurnStreamTarget,
 };
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -20,17 +22,40 @@ const MAX_DATAGRAMS_PER_UPDATE: usize = 64;
 const MAX_OUTPUTS_PER_UPDATE: usize = 1024;
 const RTT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Numeric UDP binding and already-resolved STUN/TURN inputs for the next connection attempt.
+/// Numeric UDP binding, datagram policy and unopened TURN stream inputs for the next attempt.
 ///
 /// Each client owns its socket and TURN allocations. Use a concrete local interface address,
 /// with port zero for an ephemeral port. DNS and service credential acquisition belong to
 /// the application; credential expiry is the original absolute monotonic deadline.
 #[derive(Clone)]
 pub struct ClientIceConfig {
-    /// Concrete local interface, matching every configured server's IP family.
+    /// Concrete local interface, matching the configured datagram servers' IP family.
     pub bind_addr: SocketAddr,
     /// Pure-core gathering policy, finite timeout and numeric UDP servers.
     pub ice: IceConfig,
+    /// Already-resolved, unopened TCP/TLS TURN carriers; shares the original server-count bound.
+    pub turn_streams: Vec<TurnStreamTarget>,
+    /// Optional explicit verifier/root policy for TURN TLS, independently of HTTP signaling.
+    #[cfg(feature = "tls")]
+    pub turn_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+}
+
+/// Loads platform trust only during explicit setup, before frame-driven attempts and retries.
+pub(crate) fn prepare_turn_tls(config: Option<&ClientIceConfig>) -> std::io::Result<ClientTls> {
+    let mut tls = ClientTls::default();
+    #[cfg(feature = "tls")]
+    if let Some(custom) = config.and_then(|config| config.turn_tls.as_ref()) {
+        tls = ClientTls::with_config(custom.clone());
+    }
+    let targets = config.map_or(&[][..], |config| config.turn_streams.as_slice());
+    streams::Streams::validate(targets)?;
+    tls.prepare(targets.iter().any(|target| {
+        matches!(
+            target.security,
+            nethernet::session::TurnStreamSecurity::Tls { .. }
+        )
+    }))?;
+    Ok(tls)
 }
 
 enum State {
@@ -41,9 +66,11 @@ enum State {
 /// Exclusive ownership avoids sharing a TURN allocation transport tuple between sessions.
 pub(crate) struct Outbound {
     socket: UdpSocket,
+    streams: streams::Streams,
     state: SyncCell<Option<State>>,
     events: VecDeque<ConnectionEvent>,
     buffered_bytes: usize,
+    delivery_open: bool,
     reported_rtt: Option<Duration>,
     rtt_reported_at: Option<Instant>,
     buf: Box<[u8]>,
@@ -55,6 +82,18 @@ impl Outbound {
         config: Option<&ClientIceConfig>,
         establish_within: Duration,
         now: Instant,
+        tls: &ClientTls,
+    ) -> std::io::Result<Self> {
+        Self::with_role(config, establish_within, now, tls, true)
+    }
+
+    /// Constructs the same concrete owner with the actual initial ICE role.
+    fn with_role(
+        config: Option<&ClientIceConfig>,
+        establish_within: Duration,
+        now: Instant,
+        tls: &ClientTls,
+        controlling: bool,
     ) -> std::io::Result<Self> {
         if config.is_some_and(|config| {
             config
@@ -67,6 +106,13 @@ impl Outbound {
                 ErrorKind::Unsupported,
                 nethernet::session::IceError::UnsupportedCarrier,
             ));
+        }
+        if let Some(config) = config {
+            config
+                .ice
+                .validate_with_stream_targets(config.bind_addr, &config.turn_streams, now)
+                .map_err(std::io::Error::other)?;
+            streams::Streams::validate(&config.turn_streams)?;
         }
         let (socket, local) = match config {
             Some(config) => {
@@ -84,16 +130,26 @@ impl Outbound {
             None => bind_shared_socket()?,
         };
         socket.set_nonblocking(true)?;
-        let ice = config.map(|config| config.ice.clone()).unwrap_or_default();
+        let mut ice = config.map(|config| config.ice.clone()).unwrap_or_default();
+        let targets = config.map_or(&[][..], |config| config.turn_streams.as_slice());
+        let streams = streams::Streams::open(
+            targets,
+            config.map(|config| config.bind_addr.ip()),
+            tls,
+            &mut ice,
+            now,
+        )?;
         let (mut session, description) =
-            Session::new_with_ice(local, true, rand::random(), ice, now)
+            Session::new_with_ice(local, controlling, rand::random(), ice, now)
                 .map_err(std::io::Error::other)?;
         session.set_establish_deadline(establish_within);
         Ok(Self {
             socket,
+            streams,
             state: SyncCell::new(Some(State::Gathering(session, description))),
             events: VecDeque::new(),
             buffered_bytes: 0,
+            delivery_open: true,
             reported_rtt: None,
             rtt_reported_at: None,
             buf: vec![0; 65536].into_boxed_slice(),
@@ -104,6 +160,18 @@ impl Outbound {
     pub(crate) fn gathering_complete(&mut self) -> bool {
         matches!(self.state.get(), Some(State::Gathering(session, _))
             if session.gathering_state() == GatheringState::Complete)
+    }
+
+    /// Observes ACK-driven completion after either original phase, without consuming an output.
+    #[cfg(test)]
+    pub(crate) fn test_gathering_complete(&mut self) -> bool {
+        match self.state.get() {
+            Some(State::Gathering(session, _)) => {
+                session.gathering_state() == GatheringState::Complete
+            }
+            Some(State::Connected(connection)) => connection.test_gathering_complete(),
+            None => false,
+        }
     }
 
     /// Transfers the gathered session into its single connection and returns initial signals.
@@ -131,30 +199,44 @@ impl Outbound {
     pub(crate) fn update(&mut self, now: Instant) -> Result<(), ProtocolError> {
         let mut remaining = MAX_OUTPUTS_PER_UPDATE;
         self.timeout(now)?;
-        self.flush(&mut remaining)?;
-        for _ in 0..MAX_DATAGRAMS_PER_UPDATE {
-            if remaining == 0 {
+        self.flush(&mut remaining, now)?;
+        let mut reads = MAX_DATAGRAMS_PER_UPDATE;
+        while reads > 0 && remaining > 0 {
+            let mut progressed = false;
+            if let Some(input) = self.streams.poll(now) {
+                reads -= 1;
+                progressed = true;
+                self.stream_input(input, now);
+                self.flush(&mut remaining, now)?;
+            }
+            if reads == 0 || remaining == 0 {
                 break;
             }
-            let (len, from) = match self.socket.recv_from(&mut self.buf) {
-                Ok(packet) => packet,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            match self.socket.recv_from(&mut self.buf) {
+                Ok((len, from)) => {
+                    reads -= 1;
+                    progressed = true;
+                    let packet = self.buf[..len].into();
+                    let result = match self.state.get() {
+                        Some(State::Gathering(session, _)) => {
+                            session.handle(SessionInput::Packet(packet, from, now))
+                        }
+                        Some(State::Connected(connection)) => {
+                            connection.handle(ConnectionInput::Packet(packet, from, now))
+                        }
+                        None => return Ok(()),
+                    };
+                    if result.is_err() {
+                        tracing::debug!("discarding a rejected session datagram");
+                    }
+                    self.flush(&mut remaining, now)?;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error.into()),
-            };
-            let packet = self.buf[..len].into();
-            let result = match self.state.get() {
-                Some(State::Gathering(session, _)) => {
-                    session.handle(SessionInput::Packet(packet, from, now))
-                }
-                Some(State::Connected(connection)) => {
-                    connection.handle(ConnectionInput::Packet(packet, from, now))
-                }
-                None => return Ok(()),
-            };
-            if result.is_err() {
-                tracing::debug!("discarding a rejected session datagram");
             }
-            self.flush(&mut remaining)?;
+            if !progressed {
+                break;
+            }
         }
         if let Some(State::Connected(connection)) = self.state.get()
             && let Some(rtt) = connection.rtt()
@@ -172,16 +254,36 @@ impl Outbound {
 
     /// Feeds the owning core's deadline without introducing a second timer engine.
     fn timeout(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        match self.state.get() {
+        let result = match self.state.get() {
             Some(State::Gathering(session, _)) => session.handle(SessionInput::Timeout(now)),
             Some(State::Connected(connection)) => connection.handle(ConnectionInput::Timeout(now)),
             None => Err(ProtocolError::Other("connection closed".into())),
+        };
+        result.and(self.check_output_capacity(now))
+    }
+
+    /// Bounds the original core FIFO even while a selected carrier prevents output polling.
+    fn check_output_capacity(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        let usage = match self.state.get() {
+            Some(State::Gathering(session, _)) => session.pending_output_usage(),
+            Some(State::Connected(connection)) => connection.pending_output_usage(),
+            None => return Ok(()),
+        };
+        if usage.entries > MAX_RECEIVED_MESSAGES || usage.bytes > MAX_RECEIVED_BYTES {
+            self.close(now);
+            return Err(ProtocolError::Other(RECEIVE_LIMIT_REACHED.into()));
         }
+        Ok(())
     }
 
     /// Drains core output; nonblocking UDP congestion drops a datagram for protocol retransmission.
-    fn flush(&mut self, remaining: &mut usize) -> Result<(), ProtocolError> {
+    fn flush(&mut self, remaining: &mut usize, now: Instant) -> Result<(), ProtocolError> {
+        self.check_output_capacity(now)?;
         while *remaining > 0 {
+            let selected = self.selected_turn_stream();
+            if !self.streams.flush(selected) {
+                return Ok(());
+            }
             let output = match self.state.get() {
                 Some(State::Gathering(session, _)) => session.poll(),
                 Some(State::Connected(connection)) => connection.poll(),
@@ -195,14 +297,21 @@ impl Outbound {
                 SessionOutput::Send(data, to) => match self.socket.send_to(&data, to) {
                     Ok(_) => {}
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error.into()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::BrokenPipe | ErrorKind::NotConnected
+                        ) =>
+                    {
+                        return Err(error.into());
+                    }
+                    Err(error) => {
+                        // One unreachable candidate must not retire another usable ICE pair.
+                        tracing::debug!(%error, %to, "UDP candidate datagram was not sent");
+                    }
                 },
-                SessionOutput::SendStream(..) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::Unsupported,
-                        nethernet::session::IceError::UnsupportedCarrier,
-                    )
-                    .into());
+                SessionOutput::SendStream(data, route) => {
+                    self.streams.stage(data, route)?;
                 }
                 SessionOutput::Event(SessionEvent::Ready) => {
                     let addr = match self.state.get() {
@@ -223,16 +332,63 @@ impl Outbound {
         Ok(())
     }
 
+    /// Applies only the exact carrier's event; an unused failed target cannot fail another route.
+    fn stream_input(&mut self, input: streams::Input, now: Instant) {
+        let activation = match &input {
+            streams::Input::Activated(_, route) => Some(*route),
+            _ => None,
+        };
+        let result = match (self.state.get(), input) {
+            (_, streams::Input::Progress) => return,
+            (Some(State::Gathering(session, _)), streams::Input::Activated(id, route)) => {
+                session.handle(SessionInput::ActivateTurnStream(id, route, now))
+            }
+            (Some(State::Gathering(session, _)), streams::Input::Packet(data, route)) => {
+                session.handle(SessionInput::StreamPacket(data.into(), route, now))
+            }
+            (Some(State::Gathering(session, _)), streams::Input::Closed(id)) => {
+                session.handle(SessionInput::StreamClosed(id, now))
+            }
+            (Some(State::Connected(connection)), streams::Input::Activated(id, route)) => {
+                connection.handle(ConnectionInput::ActivateTurnStream(id, route, now))
+            }
+            (Some(State::Connected(connection)), streams::Input::Packet(data, route)) => {
+                connection.handle(ConnectionInput::StreamPacket(data.into(), route, now))
+            }
+            (Some(State::Connected(connection)), streams::Input::Closed(id)) => {
+                connection.handle(ConnectionInput::StreamClosed(id, now))
+            }
+            (None, _) => return,
+        };
+        if result.is_err() {
+            if let Some(route) = activation {
+                self.streams.retire(route);
+            }
+            tracing::debug!("discarding rejected input on its original TURN carrier");
+        }
+    }
+
+    /// Reads the original selected relay owner without treating an unused candidate as selected.
+    pub(crate) fn selected_turn_stream(&mut self) -> Option<nethernet::session::TurnStreamRoute> {
+        match self.state.get() {
+            Some(State::Gathering(session, _)) => session.selected_turn_stream(),
+            Some(State::Connected(connection)) => connection.selected_turn_stream(),
+            None => None,
+        }
+    }
+
     /// Bounds transport delivery separately from the application receive queues.
     fn push_event(&mut self, event: ConnectionEvent) -> Result<(), ProtocolError> {
         let bytes = match &event {
             ConnectionEvent::Message(_, data) => data.len(),
             _ => 0,
         };
-        if self.events.len() >= MAX_RECEIVED_MESSAGES
+        if !self.delivery_open
+            || self.events.len() >= MAX_RECEIVED_MESSAGES
             || bytes > MAX_RECEIVED_BYTES.saturating_sub(self.buffered_bytes)
         {
-            return Err(ProtocolError::Other("client receive limit reached".into()));
+            self.delivery_open = false;
+            return Err(ProtocolError::Other(RECEIVE_LIMIT_REACHED.into()));
         }
         self.buffered_bytes += bytes;
         self.events.push_back(event);
@@ -265,9 +421,9 @@ impl Outbound {
 
     /// Moves the original bounded delivery allocation out before finite transport retirement.
     pub(crate) fn retire(mut self) -> VecDeque<ConnectionEvent> {
+        self.close(Instant::now());
         let events = std::mem::take(&mut self.events);
         self.buffered_bytes = 0;
-        self.close(Instant::now());
         events
     }
 
@@ -289,8 +445,7 @@ impl Outbound {
             _ => Err(ProtocolError::Other("offer not created".into())),
         };
         let mut remaining = MAX_OUTPUTS_PER_UPDATE;
-        self.flush(&mut remaining)?;
-        result
+        result.and(self.flush(&mut remaining, now))
     }
 
     /// The active attempt id; callers fence identity validation and deadline changes before admission.
@@ -313,8 +468,9 @@ impl Outbound {
         }
         let mut remaining = MAX_OUTPUTS_PER_UPDATE;
         self.timeout(now)?;
-        self.flush(&mut remaining)?;
-        if remaining == 0 {
+        self.flush(&mut remaining, now)?;
+        let selected = self.selected_turn_stream();
+        if remaining == 0 || !self.streams.flush(selected) {
             return Err(std::io::Error::from(ErrorKind::WouldBlock).into());
         }
         let result = match self.state.get() {
@@ -323,18 +479,17 @@ impl Outbound {
             }
             _ => Err(ProtocolError::Other("not connected".into())),
         };
-        self.flush(&mut remaining)?;
-        result
+        result.and(self.flush(&mut remaining, now))
     }
 
-    /// Password renewal preserves the allocation username and original absolute credential expiry.
+    /// Renews the same live allocation with fresh credentials under its acknowledged lease.
     pub(crate) fn update_turn_credentials(
         &mut self,
         server: SocketAddr,
         credentials: TurnCredentials,
         now: Instant,
     ) -> Result<(), ProtocolError> {
-        match self.state.get() {
+        let result = match self.state.get() {
             Some(State::Gathering(session, _)) => {
                 session.update_turn_credentials(server, credentials, now)
             }
@@ -342,41 +497,68 @@ impl Outbound {
                 connection.update_turn_credentials(server, credentials, now)
             }
             None => Err(ProtocolError::Other("connection closed".into())),
-        }
+        };
+        result.and(self.check_output_capacity(now))
     }
 
-    /// Stops all timers, discards application work and attempts finite best-effort relay release.
+    /// Renews only the original allocation bound to this verified stream tuple.
+    pub(crate) fn update_turn_stream_credentials(
+        &mut self,
+        route: nethernet::session::TurnStreamRoute,
+        credentials: TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        let result = match self.state.get() {
+            Some(State::Gathering(session, _)) => {
+                session.update_turn_stream_credentials(route, credentials, now)
+            }
+            Some(State::Connected(connection)) => {
+                connection.update_turn_stream_credentials(route, credentials, now)
+            }
+            None => Err(ProtocolError::Other("connection closed".into())),
+        };
+        result.and(self.check_output_capacity(now))
+    }
+
+    /// Retains the original accepted prefix and attempts only finite best-effort relay release.
     fn close(&mut self, now: Instant) {
+        self.streams.flush(None);
+        let mut remaining = MAX_OUTPUTS_PER_UPDATE;
         if let Some(state) = self.state.get().take() {
             match state {
                 State::Gathering(session, _) => {
                     let (mut retired, _result) = session.close(now);
-                    for _ in 0..MAX_OUTPUTS_PER_UPDATE {
-                        match retired.poll() {
-                            Some(SessionOutput::Send(data, to)) => {
-                                let _ = self.socket.send_to(&data, to);
-                            }
-                            Some(_) => {}
-                            None => break,
-                        }
+                    while let Some(output) = retired.poll() {
+                        self.retired_output(output, &mut remaining);
                     }
                 }
                 State::Connected(connection) => {
                     let (mut retired, _result) = connection.close(now);
-                    for _ in 0..MAX_OUTPUTS_PER_UPDATE {
-                        match retired.poll() {
-                            Some(SessionOutput::Send(data, to)) => {
-                                let _ = self.socket.send_to(&data, to);
-                            }
-                            Some(_) => {}
-                            None => break,
-                        }
+                    while let Some(output) = retired.poll() {
+                        self.retired_output(output, &mut remaining);
                     }
                 }
             }
         }
-        self.events.clear();
-        self.buffered_bytes = 0;
+        self.streams.finish();
+    }
+
+    /// Drains the same retired core into its existing bounded delivery owner without reopening a rejected prefix.
+    fn retired_output(&mut self, output: SessionOutput, remaining: &mut usize) {
+        match output {
+            SessionOutput::Message(channel, data) => {
+                let _ = self.push_event(ConnectionEvent::Message(channel, data.into_boxed_slice()));
+            }
+            SessionOutput::Send(data, to) if *remaining > 0 => {
+                *remaining -= 1;
+                let _ = self.socket.send_to(&data, to);
+            }
+            SessionOutput::SendStream(data, route) if *remaining > 0 => {
+                *remaining -= 1;
+                let _ = self.streams.stage(data, route);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -388,6 +570,7 @@ impl Drop for Outbound {
 
 const MAX_RECEIVED_MESSAGES: usize = 1024;
 const MAX_RECEIVED_BYTES: usize = 16 * 1024 * 1024;
+const RECEIVE_LIMIT_REACHED: &str = "client receive limit reached";
 
 /// Bounded application delivery shared by both outbound clients.
 #[derive(Default)]
@@ -447,6 +630,8 @@ impl Received {
     }
 }
 
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 

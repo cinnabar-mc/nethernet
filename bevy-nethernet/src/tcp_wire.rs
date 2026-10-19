@@ -1,10 +1,13 @@
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
+
+mod client;
+pub(crate) use client::ClientTls;
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
 
-const READ_CHUNK: usize = 4096;
+pub(crate) const READ_CHUNK: usize = 4096;
 #[cfg(feature = "tls")]
 const MAX_READS_PER_TICK: usize = 16;
 
@@ -45,13 +48,50 @@ pub(crate) struct TlsWire {
 }
 
 impl Wire {
-    /// Polls a nonblocking connect without attempting application or TLS writes.
-    pub(crate) fn poll_connect(&self) -> std::io::Result<bool> {
-        let stream = match self {
+    /// Borrows the original socket without duplicating its connection or TLS owner.
+    pub(crate) fn socket(&self) -> &TcpStream {
+        match self {
             Self::Plain(stream) => stream,
             #[cfg(feature = "tls")]
             Self::Tls(tls) => &tls.stream,
-        };
+        }
+    }
+
+    /// Reads only this actual socket's assigned source tuple after connection completes.
+    pub(crate) fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket().local_addr()
+    }
+
+    /// Confirms the original numeric destination once the same socket is connected.
+    pub(crate) fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket().peer_addr()
+    }
+
+    /// Requires actual TLS verification and its original handshake write prefix, not TCP alone.
+    pub(crate) fn handshake_ready(&self) -> bool {
+        match self {
+            Self::Plain(_) => true,
+            #[cfg(feature = "tls")]
+            Self::Tls(tls) => tls
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.is_handshaking() && !session.wants_write()),
+        }
+    }
+
+    /// Bounds the existing TLS plaintext output owner for callers that retain a single frame.
+    pub(crate) fn limit_output(&mut self, _limit: usize) {
+        #[cfg(feature = "tls")]
+        if let Self::Tls(tls) = self
+            && let Some(session) = &mut tls.session
+        {
+            session.set_buffer_limit(Some(_limit));
+        }
+    }
+
+    /// Polls a nonblocking connect without attempting application or TLS writes.
+    pub(crate) fn poll_connect(&self) -> std::io::Result<bool> {
+        let stream = self.socket();
         if let Some(error) = stream.take_error()? {
             return Err(error);
         }
@@ -138,6 +178,24 @@ impl Wire {
         }
     }
 
+    /// Fills only the caller's remaining frame space. Received with zero bytes is TLS progress.
+    pub(crate) fn read_limited(&mut self, into: &mut [u8]) -> Result<(Inbound, usize), WireError> {
+        let limit = into.len().min(READ_CHUNK);
+        if limit == 0 {
+            return Ok((Inbound::Idle, 0));
+        }
+        match self {
+            Self::Plain(stream) => match stream.read(&mut into[..limit]) {
+                Ok(0) => Ok((Inbound::Closed, 0)),
+                Ok(size) => Ok((Inbound::Received, size)),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => Ok((Inbound::Idle, 0)),
+                Err(error) => Err(error.into()),
+            },
+            #[cfg(feature = "tls")]
+            Self::Tls(tls) => tls.read_limited(&mut into[..limit]),
+        }
+    }
+
     pub(crate) fn write(&mut self, data: &[u8]) -> Result<usize, WireError> {
         match self {
             Self::Plain(stream) => Ok(stream.write(data)?),
@@ -173,6 +231,42 @@ impl Wire {
 
 #[cfg(feature = "tls")]
 impl TlsWire {
+    /// Drives the same rustls session with bounded encrypted reads and one bounded plaintext read.
+    fn read_limited(&mut self, into: &mut [u8]) -> Result<(Inbound, usize), WireError> {
+        let session = self.session.as_mut().ok_or(WireError::TlsNotStarted)?;
+        let mut progressed = false;
+        for _ in 0..MAX_READS_PER_TICK {
+            match session.reader().read(into) {
+                Ok(0) => return Ok((Inbound::Closed, 0)),
+                Ok(size) => return Ok((Inbound::Received, size)),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+            if !session.wants_read() {
+                break;
+            }
+            match session.read_tls(&mut (&mut self.stream).take(READ_CHUNK as u64)) {
+                Ok(0) => return Ok((Inbound::Closed, 0)),
+                Ok(_) => progressed = true,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.into()),
+            }
+            if let Err(error) = session.process_new_packets() {
+                let _ = Self::flush_session(session, &mut self.stream);
+                return Err(error.into());
+            }
+        }
+        Self::flush_session(session, &mut self.stream)?;
+        Ok((
+            if progressed {
+                Inbound::Received
+            } else {
+                Inbound::Idle
+            },
+            0,
+        ))
+    }
+
     fn read(&mut self, into: &mut Vec<u8>) -> Result<Inbound, WireError> {
         let Some(session) = self.session.as_mut() else {
             return Wire::read_raw(&mut self.stream, into);

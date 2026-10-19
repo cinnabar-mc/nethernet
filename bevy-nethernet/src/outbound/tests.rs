@@ -1,6 +1,6 @@
 use super::*;
 #[path = "../../../nethernet/tests/support/turn.rs"]
-mod turn;
+pub(super) mod turn;
 use nethernet::protocol::SignalType;
 use nethernet::protocol::webrtc::candidate::parse_ice_candidate;
 use nethernet::session::{IcePolicy, IceServer};
@@ -24,7 +24,7 @@ fn turn_update(socket: &UdpSocket, server: &mut TurnPeer) {
 }
 
 /// Preserves actual Ready/data/failure outputs while advancing one frame owner.
-fn advance(
+pub(super) fn advance(
     transport: &mut Outbound,
     now: Instant,
     ready: &mut bool,
@@ -52,6 +52,9 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
         let deadline = now + establish_within;
         let config = ClientIceConfig {
             bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            turn_streams: Vec::new(),
+            #[cfg(feature = "tls")]
+            turn_tls: None,
             ice: IceConfig {
                 servers: vec![IceServer::Turn(
                     server.addr,
@@ -66,8 +69,10 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
                 ..Default::default()
             },
         };
-        let mut client = Outbound::new(Some(&config), establish_within, now).unwrap();
-        let mut answerer = Outbound::new(Some(&config), establish_within, now).unwrap();
+        let mut client =
+            Outbound::new(Some(&config), establish_within, now, &ClientTls::default()).unwrap();
+        let mut answerer =
+            Outbound::new(Some(&config), establish_within, now, &ClientTls::default()).unwrap();
         assert_ne!(
             client.socket.local_addr().unwrap(),
             answerer.socket.local_addr().unwrap()
@@ -199,7 +204,7 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
 }
 
 #[test]
-fn absolute_credential_expiry_stops_frame_gathering_and_delivery_bounds_count_bytes() {
+fn credential_admission_expiry_preserves_acknowledged_leases_and_delivery_bounds() {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     socket.set_nonblocking(true).unwrap();
     let mut server = TurnPeer::new(socket.local_addr().unwrap());
@@ -207,6 +212,9 @@ fn absolute_credential_expiry_stops_frame_gathering_and_delivery_bounds_count_by
     let expiry = start + Duration::from_secs(2);
     let config = ClientIceConfig {
         bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        turn_streams: Vec::new(),
+        #[cfg(feature = "tls")]
+        turn_tls: None,
         ice: IceConfig {
             servers: vec![IceServer::Turn(
                 server.addr,
@@ -216,7 +224,13 @@ fn absolute_credential_expiry_stops_frame_gathering_and_delivery_bounds_count_by
             ..Default::default()
         },
     };
-    let mut transport = Outbound::new(Some(&config), Duration::from_secs(10), start).unwrap();
+    let mut transport = Outbound::new(
+        Some(&config),
+        Duration::from_secs(10),
+        start,
+        &ClientTls::default(),
+    )
+    .unwrap();
     while Instant::now() < expiry {
         transport.update(Instant::now()).unwrap();
         turn_update(&socket, &mut server);
@@ -230,31 +244,59 @@ fn absolute_credential_expiry_stops_frame_gathering_and_delivery_bounds_count_by
     let (_, candidates) = Connection::parse_offer(&offers[0]).unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].candidate_type(), CandidateType::Relay);
+    assert!(
+        Outbound::new(
+            Some(&config),
+            Duration::from_secs(10),
+            expiry,
+            &ClientTls::default(),
+        )
+        .is_err(),
+        "expired original credentials admitted a new allocation"
+    );
     transport.update(expiry).unwrap();
-    assert!(
-        transport
-            .update_turn_credentials(
-                server.addr,
-                TurnCredentials::new(
-                    USER.into(),
-                    PASSWORD.into(),
-                    expiry + Duration::from_secs(60)
-                )
-                .unwrap(),
-                expiry
+    transport
+        .update_turn_credentials(
+            server.addr,
+            TurnCredentials::new(
+                USER.into(),
+                PASSWORD.into(),
+                expiry + Duration::from_secs(60),
             )
-            .is_err(),
-        "renewal revived an expired allocation"
-    );
-    assert!(
-        transport
-            .send(Channel::Reliable, b"expired", expiry)
-            .is_err()
-    );
-    turn_update(&socket, &mut server);
+            .unwrap(),
+            expiry,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server.refreshes == 0 && Instant::now() < deadline {
+        transport.update(expiry).unwrap();
+        turn_update(&socket, &mut server);
+        transport.update(expiry).unwrap();
+        std::thread::yield_now();
+    }
+    let refreshes = server.refreshes;
+    let live_lease = server.last_refresh_lifetime;
+    let allocations = server.allocation_count();
+    transport.close(expiry);
+    while server.allocation_count() != 0 && Instant::now() < deadline {
+        turn_update(&socket, &mut server);
+        std::thread::yield_now();
+    }
+    let retired_allocations = server.allocation_count();
+    drop(transport);
+    drop(socket);
     assert_eq!(
-        server.refreshes, 0,
-        "expired credentials were used to sign maintenance"
+        refreshes, 1,
+        "fresh credentials did not refresh the original lease"
+    );
+    assert!(live_lease.is_some_and(|lifetime| !lifetime.is_zero()));
+    assert_eq!(
+        allocations, 1,
+        "renewal replaced the acknowledged allocation"
+    );
+    assert_eq!(
+        retired_allocations, 0,
+        "the original allocation was not retired"
     );
     let mut received = Received::default();
     received

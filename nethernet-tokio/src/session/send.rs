@@ -156,12 +156,7 @@ fn check_open(close: &CancellationToken, deadline: Option<Instant>) -> Result<()
 
 /// Uses the original per-channel limits for both ordinary sends and reserved commits.
 fn check_size(channel: Channel, size: usize) -> Result<()> {
-    let maximum = match channel {
-        Channel::Reliable => {
-            nethernet::protocol::constants::MAX_MESSAGE_SIZE * usize::from(u8::MAX)
-        }
-        Channel::Unreliable => nethernet::protocol::constants::MAX_MESSAGE_SIZE.saturating_sub(1),
-    };
+    let maximum = channel.max_message_size();
     if size > maximum {
         return Err(nethernet::error::ProtocolError::MessageSizeExceeded(size).into());
     }

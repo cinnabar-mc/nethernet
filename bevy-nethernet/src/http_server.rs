@@ -1,8 +1,8 @@
 //! HTTP signaling server polled once per frame, with sessions over a shared UDP socket.
-use crate::connection::{ConnectionEvent, PoolEvent, Readiness, SessionPool};
+use crate::connection::{PoolEvent, PoolUpdate, Readiness, SessionPool};
 use crate::http_stream::{Drain, HttpStream, ServerTls, Shutdown};
 use crate::http_wire;
-use crate::pending::{PendingLimits, admits_offer};
+use crate::pending::{PendingLimits, ServerLimits, admits_offer};
 use crate::server::{EstablishedSessionId, NetherSessionId};
 use crate::socket::bind_shared_socket;
 use crate::tcp_wire::Inbound;
@@ -16,7 +16,7 @@ use nethernet::prelude::{
     RejectReason, Sans, ServerData, ServerIdentity, TokenTrust,
 };
 use nethernet::session::Channel;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
@@ -87,6 +87,8 @@ struct SessionEntry {
     ready: Option<EstablishedSessionId>,
     readiness: Readiness,
     created: Instant,
+    answer: Option<String>,
+    answer_deadline: Instant,
     remote_addr: Option<SocketAddr>,
     rtt: Option<Duration>,
     player: Option<Arc<PlayerInfo>>,
@@ -111,9 +113,6 @@ pub struct NetherHttpServer {
     next_conn_id: u64,
     connections: HashMap<u64, TcpConn>,
     sessions: HashMap<NetherSessionId, SessionEntry>,
-    received: VecDeque<(NetherSessionId, Box<[u8]>)>,
-    received_unreliable: VecDeque<(NetherSessionId, Box<[u8]>)>,
-    events: VecDeque<NetherHttpServerEvent>,
 }
 
 impl NetherHttpServer {
@@ -147,9 +146,6 @@ impl NetherHttpServer {
             next_conn_id: 0,
             connections: HashMap::new(),
             sessions: HashMap::new(),
-            received: VecDeque::new(),
-            received_unreliable: VecDeque::new(),
-            events: VecDeque::new(),
         })
     }
 
@@ -184,6 +180,11 @@ impl NetherHttpServer {
 
     pub fn set_pending_limits(&mut self, limits: PendingLimits) {
         self.pending_limits = limits;
+    }
+
+    /// Bounds all sessions and final retained payloads together; accepted prefixes are preserved.
+    pub fn set_session_limits(&mut self, limits: ServerLimits) {
+        self.pool.set_limits(limits);
     }
 
     /// Adds candidates from the request's source address when an offer has no routable host candidate.
@@ -227,6 +228,8 @@ impl NetherHttpServer {
         self.established_entry(id)?.remote_addr
     }
 
+    /// Admits bounded local work; full capacity returns `Io(WouldBlock)` before copying payloads.
+    /// Success is not a transmission or peer acknowledgement.
     pub fn send(
         &mut self,
         id: &EstablishedSessionId,
@@ -235,6 +238,8 @@ impl NetherHttpServer {
         self.send_on(id, Channel::Reliable, data)
     }
 
+    /// Admits bounded local work; full capacity returns `Io(WouldBlock)` before copying payloads.
+    /// Success is not a transmission or peer acknowledgement.
     pub fn send_unreliable(
         &mut self,
         id: &EstablishedSessionId,
@@ -255,16 +260,15 @@ impl NetherHttpServer {
             ));
         }
         self.pool
-            .send(id.id.clone(), id.readiness.clone(), channel, data.into());
-        Ok(())
+            .send(id.id.clone(), id.readiness.clone(), channel, data)
     }
 
     pub fn recv(&mut self) -> Option<(NetherSessionId, Box<[u8]>)> {
-        self.received.pop_front()
+        self.pool.recv(Channel::Reliable)
     }
 
     pub fn recv_unreliable(&mut self) -> Option<(NetherSessionId, Box<[u8]>)> {
-        self.received_unreliable.pop_front()
+        self.pool.recv(Channel::Unreliable)
     }
 
     /// Consumes this local established capability, never a replacement's descriptive id.
@@ -276,6 +280,9 @@ impl NetherHttpServer {
 
     /// Matches the exact original Ready entry before metadata or application send access.
     fn established_entry(&self, id: &EstablishedSessionId) -> Option<&SessionEntry> {
+        if id.readiness.is_retired() {
+            return None;
+        }
         let entry = self.sessions.get(&id.id)?;
         entry
             .ready
@@ -286,15 +293,28 @@ impl NetherHttpServer {
 
     /// Keeps pending retirement internal and separate from established send authority.
     fn remove_session(&mut self, id: &NetherSessionId) {
-        if self.sessions.remove(id).is_some() {
-            self.pool.remove(id.clone());
-            self.events
-                .push_back(NetherHttpServerEvent::SessionDisconnected(id.clone()));
+        if let Some(entry) = self.sessions.remove(id) {
+            self.pool.remove(id.clone(), entry.readiness);
         }
     }
 
     pub fn next_event(&mut self) -> Option<NetherHttpServerEvent> {
-        self.events.pop_front()
+        loop {
+            let PoolEvent {
+                id,
+                event,
+                readiness,
+            } = self.pool.next_event()?;
+            match event {
+                PoolUpdate::Ready(_) => {
+                    return Some(NetherHttpServerEvent::SessionConnected(
+                        EstablishedSessionId { id, readiness },
+                    ));
+                }
+                PoolUpdate::Failed => return Some(NetherHttpServerEvent::SessionDisconnected(id)),
+                PoolUpdate::Rtt(_) => {}
+            }
+        }
     }
 
     pub fn update(&mut self) {
@@ -305,9 +325,9 @@ impl NetherHttpServer {
 
         let _ = self.signaler.handle(HttpSignalerInput::Update(now));
 
-        while let Some(output) = self.signaler.poll() {
-            self.handle_output(output, now);
-        }
+        self.drive_signaling(now);
+        self.publish_answers(now);
+        self.drive_signaling(now);
 
         self.drive_sessions();
 
@@ -323,9 +343,59 @@ impl NetherHttpServer {
             let _ = self.signaler.handle(HttpSignalerInput::Closed(id));
         }
         let establish = self.timeouts.establish();
-        self.sessions.retain(|_, entry| {
-            entry.ready.is_some() || now.saturating_duration_since(entry.created) < establish
+        self.sessions.retain(|id, entry| {
+            let keep =
+                entry.ready.is_some() || now.saturating_duration_since(entry.created) < establish;
+            if !keep {
+                self.pool.remove(id.clone(), entry.readiness.clone());
+            }
+            keep
         });
+    }
+
+    /// Applies the original signaler's responses without a second response queue.
+    fn drive_signaling(&mut self, now: Instant) {
+        while let Some(output) = self.signaler.poll() {
+            self.handle_output(output, now);
+        }
+    }
+
+    /// Commits an answer only after worker admission while the original HTTP join still exists.
+    fn publish_answers(&mut self, now: Instant) {
+        let mut failed = Vec::new();
+        for (id, entry) in &mut self.sessions {
+            if entry.answer.is_none() {
+                continue;
+            }
+            if entry.readiness.is_retired() || now >= entry.answer_deadline {
+                failed.push(id.clone());
+                continue;
+            }
+            if !entry.readiness.is_admitted() {
+                continue;
+            }
+            let sdp = entry
+                .answer
+                .take()
+                .expect("the original answer remains staged");
+            if self
+                .signaler
+                .handle(HttpSignalerInput::Answer {
+                    connection_id: id.connection_id,
+                    sdp,
+                })
+                .is_err()
+            {
+                failed.push(id.clone());
+            }
+        }
+        for id in failed {
+            let _ = self.signaler.handle(HttpSignalerInput::Reject {
+                connection_id: id.connection_id,
+                reason: RejectReason::Unavailable,
+            });
+            self.remove_session(&id);
+        }
     }
 
     fn accept(&mut self, now: Instant) {
@@ -512,7 +582,12 @@ impl NetherHttpServer {
             .iter()
             .filter(|(_, entry)| entry.ready.is_none());
         let pending = pending.map(|(id, _)| id.network_id.as_str());
-        if !admits_offer(pending, &offer.network_id, self.pending_limits) {
+        let id = NetherSessionId {
+            network_id: offer.network_id.clone(),
+            connection_id: offer.connection_id,
+        };
+        if !self.pool.admits(&id) || !admits_offer(pending, &offer.network_id, self.pending_limits)
+        {
             tracing::debug!(
                 "Refusing offer from {}: pending offers exceed the limit",
                 offer.network_id
@@ -550,15 +625,14 @@ impl NetherHttpServer {
                     });
                     return;
                 };
-                let _ = self.signaler.handle(HttpSignalerInput::Answer {
-                    connection_id: offer.connection_id,
-                    sdp: answer.data,
-                });
-                let id = NetherSessionId {
-                    network_id: offer.network_id,
-                    connection_id: offer.connection_id,
-                };
-                let Some(readiness) = self.pool.add(id.clone(), connection, local_ufrag) else {
+                let readiness = (answer.data.len() <= http_wire::MAX_BODY)
+                    .then(|| self.pool.add(id.clone(), connection, local_ufrag))
+                    .flatten();
+                let Some(readiness) = readiness else {
+                    let _ = self.signaler.handle(HttpSignalerInput::Reject {
+                        connection_id: offer.connection_id,
+                        reason: RejectReason::Unavailable,
+                    });
                     return;
                 };
                 self.sessions.insert(
@@ -567,6 +641,8 @@ impl NetherHttpServer {
                         ready: None,
                         readiness,
                         created: now,
+                        answer: Some(answer.data),
+                        answer_deadline: now + self.timeouts.establish(),
                         remote_addr: None,
                         rtt: None,
                         player: player.map(Arc::new).or(signaled_player),
@@ -602,25 +678,17 @@ impl NetherHttpServer {
                 continue;
             }
             match event {
-                ConnectionEvent::Ready(addr) if entry.ready.is_none() => {
+                PoolUpdate::Ready(addr) if entry.ready.is_none() => {
                     let capability = EstablishedSessionId {
                         id: id.clone(),
                         readiness,
                     };
                     entry.ready = Some(capability.clone());
                     entry.remote_addr = addr;
-                    self.events
-                        .push_back(NetherHttpServerEvent::SessionConnected(capability));
                 }
-                ConnectionEvent::Ready(_) => {}
-                ConnectionEvent::Rtt(rtt) => entry.rtt = Some(rtt),
-                ConnectionEvent::Message(Channel::Reliable, data) => {
-                    self.received.push_back((id, data))
-                }
-                ConnectionEvent::Message(Channel::Unreliable, data) => {
-                    self.received_unreliable.push_back((id, data))
-                }
-                ConnectionEvent::Failed => failed.push(id),
+                PoolUpdate::Ready(_) => {}
+                PoolUpdate::Rtt(rtt) => entry.rtt = Some(rtt),
+                PoolUpdate::Failed => failed.push(id),
             }
         }
 

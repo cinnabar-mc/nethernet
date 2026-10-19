@@ -1,8 +1,6 @@
-use crate::http_client::JoinError;
 use crate::tcp_wire::{Inbound, Wire, WireError};
-use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use std::io::ErrorKind;
-use std::net::{SocketAddr, TcpStream};
+use std::net::TcpStream;
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
@@ -38,6 +36,13 @@ impl HttpStream {
             outbound: Vec::new(),
             written: 0,
         }
+    }
+
+    /// Retains the same HTTP request until the actual nonblocking connect completes.
+    pub(crate) fn connecting(wire: Wire) -> Self {
+        let mut stream = Self::new(wire);
+        stream.connecting = true;
+        stream
     }
 
     pub(crate) fn queue(&mut self, bytes: &[u8]) {
@@ -119,35 +124,6 @@ impl HttpStream {
     pub(crate) fn establish(&mut self) -> Result<Inbound, WireError> {
         Ok(Inbound::Idle)
     }
-
-    fn connect_socket(addr: SocketAddr) -> std::io::Result<TcpStream> {
-        let socket = Socket::new(
-            Domain::for_address(addr),
-            Type::STREAM,
-            Some(SocketProtocol::TCP),
-        )?;
-        socket.set_nonblocking(true)?;
-        match socket.connect(&addr.into()) {
-            Ok(()) => {}
-            Err(e) if Self::connect_in_progress(&e) => {}
-            Err(e) => return Err(e),
-        }
-        Ok(socket.into())
-    }
-
-    fn connect_in_progress(e: &std::io::Error) -> bool {
-        if e.kind() == ErrorKind::WouldBlock {
-            return true;
-        }
-        #[cfg(unix)]
-        {
-            e.raw_os_error() == Some(libc::EINPROGRESS)
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
-    }
 }
 
 #[derive(Clone, Default)]
@@ -173,86 +149,10 @@ impl ServerTls {
     }
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct ClientTls {
-    #[cfg(feature = "tls")]
-    config: Option<Arc<rustls::ClientConfig>>,
-}
-
-impl ClientTls {
-    #[cfg(feature = "tls")]
-    pub(crate) fn with_config(config: Arc<rustls::ClientConfig>) -> Self {
-        Self {
-            config: Some(config),
-        }
-    }
-
-    /// Prepares platform trust during explicit setup, before delayed gathering moves the dial into a frame.
-    pub(crate) fn prepare(&mut self, secure: bool) -> std::io::Result<()> {
-        if !secure {
-            return Ok(());
-        }
-        #[cfg(feature = "tls")]
-        {
-            if self.config.is_none() {
-                self.config = Some(Self::platform_config().map_err(JoinError::from)?);
-            }
-            Ok(())
-        }
-        #[cfg(not(feature = "tls"))]
-        {
-            Err(JoinError::TlsUnavailable.into())
-        }
-    }
-
-    pub(crate) fn dial(
-        &self,
-        secure: bool,
-        host: &str,
-        addr: SocketAddr,
-    ) -> std::io::Result<HttpStream> {
-        let wire = match secure {
-            true => self.secure_wire(host, addr)?,
-            false => Wire::plain(HttpStream::connect_socket(addr)?),
-        };
-        let mut stream = HttpStream::new(wire);
-        stream.connecting = true;
-        Ok(stream)
-    }
-
-    #[cfg(feature = "tls")]
-    fn secure_wire(&self, host: &str, addr: SocketAddr) -> std::io::Result<Wire> {
-        let config = match &self.config {
-            Some(config) => config.clone(),
-            None => Self::platform_config().map_err(JoinError::from)?,
-        };
-        let name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|_| JoinError::InvalidServerName)?;
-        let wire = Wire::tls_client(HttpStream::connect_socket(addr)?, config, name)
-            .map_err(JoinError::from)?;
-        Ok(wire)
-    }
-
-    #[cfg(not(feature = "tls"))]
-    fn secure_wire(&self, _host: &str, _addr: SocketAddr) -> std::io::Result<Wire> {
-        Err(JoinError::TlsUnavailable.into())
-    }
-
-    #[cfg(feature = "tls")]
-    fn platform_config() -> Result<Arc<rustls::ClientConfig>, rustls::Error> {
-        use rustls_platform_verifier::BuilderVerifierExt;
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
-            .with_platform_verifier()?
-            .with_no_client_auth();
-        Ok(Arc::new(config))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
     use std::io::{Read, Write};
     use std::net::TcpListener;
 

@@ -20,22 +20,27 @@ fn http_offer_is_signed_after_relay_gathering_and_disconnect_releases_the_alloca
     let mut turn = TurnPeer::new(udp.local_addr().unwrap());
     let mut client = NetherHttpClient::new();
     client.set_identity(ServerIdentity::generate("frame-client", SystemTime::now()).unwrap());
-    client.set_ice_config(Some(ClientIceConfig {
-        bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        ice: IceConfig {
-            servers: vec![IceServer::Turn(
-                turn.addr,
-                TurnCredentials::new(
-                    USER.into(),
-                    PASSWORD.into(),
-                    Instant::now() + Duration::from_secs(1200),
-                )
-                .unwrap(),
-            )],
-            policy: IcePolicy::RelayOnly,
-            ..Default::default()
-        },
-    }));
+    client
+        .set_ice_config(Some(ClientIceConfig {
+            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            turn_streams: Vec::new(),
+            #[cfg(feature = "tls")]
+            turn_tls: None,
+            ice: IceConfig {
+                servers: vec![IceServer::Turn(
+                    turn.addr,
+                    TurnCredentials::new(
+                        USER.into(),
+                        PASSWORD.into(),
+                        Instant::now() + Duration::from_secs(1200),
+                    )
+                    .unwrap(),
+                )],
+                policy: IcePolicy::RelayOnly,
+                ..Default::default()
+            },
+        }))
+        .unwrap();
     client
         .connect(
             "configured-frame-client".into(),

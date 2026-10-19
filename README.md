@@ -318,13 +318,16 @@ let config = nethernet_tokio::ConnectionConfig {
     client_ice: Some(nethernet_tokio::ClientIceConfig {
         ice: nethernet::session::IceConfig { servers, ..Default::default() },
         bind_addr: Some(local_bind_address),
+        turn_streams: Vec::new(),
+        turn_tls: None,
     }),
     ..Default::default()
 };
 ```
 
 The accepting adapter uses `ConnectionConfig::server_ice` with
-`ServerIceConfig { ice, bind_addr }`. Its bind address is explicit, including the
+`ServerIceConfig { ice, bind_addr, turn_streams: Vec::new(), turn_tls: None }`.
+Its bind address is explicit, including the
 outer UDP family; the same pure configuration, bounded endpoints and absolute
 TURN credential expiry apply. Full mode gathers before encoding/signing its
 answer. Trickle mode continues gathering during initial answer delivery, but
@@ -358,8 +361,11 @@ sends later candidates through the retained signaling owner. Runtime session
 handles accept credential rotation through `update_turn_credentials`. Cancelling
 negotiation or dropping the driver stops its state and attempts relay release.
 
-This path supports UDP STUN and TURN with IPv4 relay allocations over IPv4 or
-IPv6 outer UDP. Explicit IPv6 relay allocation and TURN TCP/TLS remain incomplete.
+Tokio supports UDP STUN/TURN and TURN over TCP or verified TLS. Relay address
+family is independent of the carrier family. `resolve_ice_targets` returns UDP
+servers and unopened stream targets; pass those targets through `turn_streams`.
+`turn_tls` preserves an explicit caller TLS policy or uses verified platform roots.
+The Bevy adapter below currently accepts UDP servers.
 The Bevy LAN and HTTP clients accept `set_ice_config(Some(ClientIceConfig {
     bind_addr: local_interface,
     ice: IceConfig { servers, ..Default::default() },

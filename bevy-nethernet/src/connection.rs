@@ -116,6 +116,17 @@ impl ActiveConnection {
         }
     }
 
+    /// Identifies only the same core's actual selected stream for local output backpressure.
+    pub(crate) fn selected_turn_stream(&self) -> Option<nethernet::session::TurnStreamRoute> {
+        match self {
+            Self::Connecting(core) => core
+                .as_ref()
+                .expect("pending core remains owned")
+                .selected_turn_stream(),
+            Self::Established(core) => core.selected_turn_stream(),
+        }
+    }
+
     /// Reports the existing association measurement without changing ownership.
     pub(crate) fn rtt(&self) -> Option<Duration> {
         match self {

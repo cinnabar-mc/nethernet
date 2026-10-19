@@ -6,6 +6,8 @@ use crate::outbound::{ClientIceConfig, Outbound, State, prepare_turn_tls};
 use nethernet::connection::{Connection, IceMode};
 use nethernet::session::{Channel, IcePolicy, TurnAddressFamily, TurnCredentials};
 use rtc::ice::candidate::CandidateType;
+use rtc::stun::attributes::{ATTR_PADDING, RawAttribute};
+use rtc::stun::message::{BINDING_REQUEST, Message, TransactionId};
 use rtc_turn::proto::{
     chandata::ChannelData,
     channum::{ChannelNumber, MIN_CHANNEL_NUMBER},
@@ -45,6 +47,9 @@ impl Peer {
     fn new(security: Security, ipv6: bool) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
+        socket2::SockRef::from(&listener)
+            .set_recv_buffer_size(1024)
+            .unwrap();
         let mut turn = TurnPeer::new(listener.local_addr().unwrap());
         turn.ipv6_relay = ipv6;
         Self {
@@ -171,7 +176,7 @@ fn config(peer: &Peer, family: Option<TurnAddressFamily>) -> ClientIceConfig {
 }
 
 /// Completes real gathering, SCTP readiness, both original channels and physical retirement.
-fn secured_pair(mut peer: Peer, config: ClientIceConfig) {
+fn secured_pair(mut peer: Peer, config: ClientIceConfig, selected_pressure: bool) {
     let now = Instant::now();
     let within = Duration::from_secs(10);
     let cutoff = now + within;
@@ -206,8 +211,13 @@ fn secured_pair(mut peer: Peer, config: ClientIceConfig) {
         .unwrap()
         .remove(0);
     let (remote, candidates) = Connection::parse_offer(&offer).unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].candidate_type(), CandidateType::Relay);
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|candidate| candidate.candidate_type() == CandidateType::Relay)
+            .count(),
+        1
+    );
     let Some(State::Gathering(session, description)) = answerer.state.get().take() else {
         panic!("original answerer is not gathering");
     };
@@ -245,6 +255,80 @@ fn secured_pair(mut peer: Peer, config: ClientIceConfig) {
     assert!(
         client_ready && answerer_ready,
         "actual two-channel readiness never arrived"
+    );
+    let route = client.streams.carriers[0].route.unwrap();
+    assert_eq!(
+        client.selected_turn_stream(),
+        selected_pressure.then_some(route)
+    );
+    socket2::SockRef::from(client.streams.carriers[0].wire.as_ref().unwrap().socket())
+        .set_send_buffer_size(1024)
+        .unwrap();
+    let mut padding = Message::new();
+    padding
+        .build(&[
+            Box::new(TransactionId::new()),
+            Box::new(BINDING_REQUEST),
+            Box::new(RawAttribute {
+                typ: ATTR_PADDING,
+                value: vec![0; 60 * 1024],
+                ..Default::default()
+            }),
+        ])
+        .unwrap();
+    for _ in 0..nethernet::session::MAX_ICE_SERVERS {
+        client.streams.stage(padding.raw.clone(), route).unwrap();
+        if client.streams.carriers[0].pending.is_some() {
+            break;
+        }
+    }
+    assert!(
+        client.streams.carriers[0].pending.is_some(),
+        "actual selected/unused socket pressure was not reached"
+    );
+    let admission = client.send(Channel::Reliable, b"pressure admission", Instant::now());
+    if selected_pressure {
+        assert!(
+            matches!(admission, Err(ProtocolError::Io(ref error)) if error.kind() == ErrorKind::WouldBlock)
+        );
+        assert!(
+            matches!(client.streams.carriers[0].phase, Phase::Active),
+            "selected carrier was retired by normal output pressure"
+        );
+    } else {
+        admission.unwrap();
+        while Instant::now() < cutoff && answerer_messages.is_empty() {
+            // The blocked unused TCP carrier receives no reader progress here; UDP must still work.
+            let now = Instant::now();
+            advance(&mut client, now, &mut client_ready, &mut client_messages);
+            advance(
+                &mut answerer,
+                now,
+                &mut answerer_ready,
+                &mut answerer_messages,
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            answerer_messages.pop(),
+            Some((Channel::Reliable, Box::from(&b"pressure admission"[..])))
+        );
+    }
+    while Instant::now() < cutoff && client.streams.carriers[0].pending.is_some() {
+        peer.update();
+        let now = Instant::now();
+        advance(&mut client, now, &mut client_ready, &mut client_messages);
+        advance(
+            &mut answerer,
+            now,
+            &mut answerer_ready,
+            &mut answerer_messages,
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        client.streams.carriers[0].pending.is_none(),
+        "original frame did not resume after actual peer reads"
     );
     let payload = vec![0x51; 50 * 1024];
     client
@@ -309,7 +393,15 @@ fn secured_pair(mut peer: Peer, config: ClientIceConfig) {
 fn frame_driven_tcp_turn_secures_both_channels_with_an_independent_ipv6_relay() {
     let peer = Peer::new(Security::Plain, true);
     let config = config(&peer, Some(TurnAddressFamily::Ipv6));
-    secured_pair(peer, config);
+    secured_pair(peer, config, true);
+}
+
+#[test]
+fn an_unused_blocked_turn_carrier_does_not_stop_actual_selected_udp_data() {
+    let peer = Peer::new(Security::Plain, false);
+    let mut config = config(&peer, None);
+    config.ice.policy = IcePolicy::All;
+    secured_pair(peer, config, false);
 }
 
 #[test]
@@ -369,25 +461,26 @@ fn actual_partial_turn_frame_resumes_at_its_original_offset() {
     };
     encoded.encode();
     let original = encoded.raw;
-    let (mut completed, mut pending) = (0, None);
+    let mut completed = 0;
     // No peer reads: the real socket must expose backpressure within this finite wire allowance.
     for _ in 0..nethernet::session::MAX_ICE_SERVERS {
-        let mut frame = Pending::new(original.clone(), route);
-        if streams.write(&mut frame).unwrap() {
+        streams.stage(original.clone(), route).unwrap();
+        if streams.carriers[0].pending.is_none() {
             completed += 1;
         } else {
-            pending = Some(frame);
             break;
         }
     }
-    let blocked = pending.is_some();
-    let mut partial = pending
+    let blocked = streams.carriers[0].pending.is_some();
+    let mut partial = streams.carriers[0]
+        .pending
         .as_ref()
         .is_some_and(|frame| frame.written > 0 && frame.written < frame.bytes.len());
     let expected = completed + usize::from(blocked);
     let (mut received, mut identical) = (0, true);
     let mut decoder = TurnStreamDecoder::new();
-    while Instant::now() < cutoff && (pending.is_some() || received < expected) {
+    while Instant::now() < cutoff && (streams.carriers[0].pending.is_some() || received < expected)
+    {
         let mut bytes = [0; READ_CHUNK];
         match accepted.read(&mut bytes) {
             Ok(0) => break,
@@ -399,16 +492,14 @@ fn actual_partial_turn_frame_resumes_at_its_original_offset() {
             received += 1;
             identical &= frame == original;
         }
-        if let Some(frame) = &mut pending {
-            let finished = streams.write(frame).unwrap();
+        streams.flush(Some(route));
+        if let Some(frame) = &streams.carriers[0].pending {
             partial |= frame.written > 0 && frame.written < frame.bytes.len();
-            if finished {
-                pending = None;
-            }
         }
         std::thread::yield_now();
     }
-    streams.finish(pending.as_ref());
+    let finished = streams.carriers[0].pending.is_none();
+    streams.finish();
     drop(accepted);
     drop(listener);
     assert!(
@@ -416,10 +507,7 @@ fn actual_partial_turn_frame_resumes_at_its_original_offset() {
         "the real socket never applied bounded write backpressure"
     );
     assert!(partial, "no actual partial byte offset was exercised");
-    assert!(
-        pending.is_none(),
-        "the original partial frame did not finish"
-    );
+    assert!(finished, "the original partial frame did not finish");
     assert_eq!(received, expected);
     assert!(
         identical,
@@ -438,7 +526,7 @@ fn frame_driven_verified_tls_turn_secures_both_channels_and_closes_the_same_sock
     config.turn_streams[0].security = TurnStreamSecurity::Tls {
         server_name: "localhost".into(),
     };
-    secured_pair(peer, config);
+    secured_pair(peer, config, true);
 }
 
 #[cfg(feature = "tls")]

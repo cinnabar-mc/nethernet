@@ -25,6 +25,7 @@ struct Carrier {
     decoder: TurnStreamDecoder,
     phase: Phase,
     deadline: Instant,
+    pending: Option<Pending>,
 }
 
 pub(super) enum Input {
@@ -35,7 +36,7 @@ pub(super) enum Input {
 }
 
 /// One original polled core output, retained at its exact accepted byte offset.
-pub(super) struct Pending {
+struct Pending {
     route: TurnStreamRoute,
     bytes: Vec<u8>,
     written: usize,
@@ -43,16 +44,12 @@ pub(super) struct Pending {
 
 impl Pending {
     /// Takes the original signed frame without rebuilding its wire bytes.
-    pub(super) fn new(bytes: Vec<u8>, route: TurnStreamRoute) -> Self {
+    fn new(bytes: Vec<u8>, route: TurnStreamRoute) -> Self {
         Self {
             route,
             bytes,
             written: 0,
         }
-    }
-
-    pub(super) fn route(&self) -> TurnStreamRoute {
-        self.route
     }
 }
 
@@ -114,6 +111,7 @@ impl Streams {
                 decoder: TurnStreamDecoder::new(),
                 phase: Phase::Connecting,
                 deadline: target.admission_deadline(deadline),
+                pending: None,
             });
         }
         Ok(streams)
@@ -137,14 +135,93 @@ impl Streams {
         None
     }
 
-    /// Continues only the original frame's partial write and its TLS output prefix.
-    pub(super) fn write(&mut self, pending: &mut Pending) -> Result<bool, WireError> {
+    /// Advances each original partial frame; only the selected route withholds core output.
+    pub(super) fn flush(&mut self, selected: Option<TurnStreamRoute>) -> bool {
+        for carrier in &mut self.carriers {
+            carrier.flush_output();
+        }
+        !self.carriers.iter().any(|carrier| {
+            carrier.route.is_some()
+                && carrier.route == selected
+                && (carrier.pending.is_some() || matches!(carrier.phase, Phase::Retiring))
+        })
+    }
+
+    /// Takes one original core output without adding a second staging slot on a carrier.
+    /// The caller stops polling core output while its selected carrier is blocked.
+    pub(super) fn stage(&mut self, bytes: Vec<u8>, route: TurnStreamRoute) -> io::Result<()> {
+        if bytes.len() > MAX_TURN_STREAM_FRAME_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "TURN frame exceeds limit",
+            ));
+        }
         let carrier = self
             .carriers
             .iter_mut()
-            .find(|carrier| carrier.route == Some(pending.route))
-            .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "TURN carrier is absent"))?;
-        let wire = carrier
+            .find(|carrier| carrier.route == Some(route))
+            .ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "TURN output has no owned carrier")
+            })?;
+        if !matches!(carrier.phase, Phase::Active) {
+            return Ok(());
+        }
+        carrier.flush_output();
+        if !matches!(carrier.phase, Phase::Active) {
+            return Ok(());
+        }
+        if carrier.pending.is_some() {
+            // A busy unused candidate cannot hold a usable selected path behind a second frame.
+            carrier.retire();
+            return Ok(());
+        }
+        carrier.pending = Some(Pending::new(bytes, route));
+        carrier.flush_output();
+        Ok(())
+    }
+
+    /// Seals only the original failed carrier, once, before the core receives its closure.
+    pub(super) fn retire(&mut self, route: TurnStreamRoute) -> bool {
+        self.carriers
+            .iter_mut()
+            .find(|carrier| carrier.route == Some(route))
+            .is_some_and(Carrier::retire)
+    }
+
+    /// Closes without interleaving TLS shutdown into an unfinished original application frame.
+    pub(super) fn finish(&mut self) {
+        for carrier in &mut self.carriers {
+            if carrier.pending.is_none()
+                && let Some(wire) = &mut carrier.wire
+            {
+                let _ = wire.finish();
+            }
+            carrier.retire();
+            carrier.decoder = TurnStreamDecoder::new();
+            carrier.phase = Phase::Closed;
+        }
+    }
+}
+
+impl Carrier {
+    /// Resumes the same frame and byte offset, never replaying already-accepted TLS plaintext.
+    fn flush_output(&mut self) {
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        match self.write(&mut pending) {
+            Ok(true) => {}
+            Ok(false) => self.pending = Some(pending),
+            Err(_) => {
+                self.retire();
+            }
+        }
+    }
+
+    /// Writes only this carrier's original retained bytes through its existing TLS output.
+    fn write(&mut self, pending: &mut Pending) -> Result<bool, WireError> {
+        debug_assert_eq!(self.route, Some(pending.route));
+        let wire = self
             .wire
             .as_mut()
             .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "TURN carrier is closed"))?;
@@ -165,44 +242,6 @@ impl Streams {
         Ok(pending.written == pending.bytes.len() && !wire.has_pending_output())
     }
 
-    /// Confirms output belongs to an actual carrier installed on this original attempt.
-    pub(super) fn contains(&self, route: TurnStreamRoute) -> bool {
-        self.carriers
-            .iter()
-            .any(|carrier| carrier.route == Some(route))
-    }
-
-    /// Withholds new application sends while accepted input drains before carrier failure.
-    pub(super) fn retiring(&self) -> bool {
-        self.carriers
-            .iter()
-            .any(|carrier| matches!(carrier.phase, Phase::Retiring))
-    }
-
-    /// Seals only the original failed carrier, once, before the core receives its closure.
-    pub(super) fn retire(&mut self, route: TurnStreamRoute) -> bool {
-        self.carriers
-            .iter_mut()
-            .find(|carrier| carrier.route == Some(route))
-            .is_some_and(Carrier::retire)
-    }
-
-    /// Closes without interleaving TLS shutdown into an unfinished original application frame.
-    pub(super) fn finish(&mut self, pending: Option<&Pending>) {
-        for carrier in &mut self.carriers {
-            if pending.is_none_or(|pending| Some(pending.route) != carrier.route)
-                && let Some(wire) = &mut carrier.wire
-            {
-                let _ = wire.finish();
-            }
-            carrier.retire();
-            carrier.decoder = TurnStreamDecoder::new();
-            carrier.phase = Phase::Closed;
-        }
-    }
-}
-
-impl Carrier {
     /// Drives real connect/verification before once-only activation, then bounded RTC framing.
     fn poll(&mut self, now: Instant) -> Result<Option<Input>, WireError> {
         if matches!(self.phase, Phase::Closed) {
@@ -283,6 +322,7 @@ impl Carrier {
             return false;
         }
         self.wire = None;
+        self.pending = None;
         if !matches!(self.phase, Phase::Active) {
             self.decoder = TurnStreamDecoder::new();
         }

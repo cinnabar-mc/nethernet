@@ -22,14 +22,14 @@ const MAX_DATAGRAMS_PER_UPDATE: usize = 64;
 const MAX_OUTPUTS_PER_UPDATE: usize = 1024;
 const RTT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Numeric UDP binding and already-resolved STUN/TURN inputs for the next connection attempt.
+/// Numeric UDP binding, datagram policy and unopened TURN stream inputs for the next attempt.
 ///
 /// Each client owns its socket and TURN allocations. Use a concrete local interface address,
 /// with port zero for an ephemeral port. DNS and service credential acquisition belong to
 /// the application; credential expiry is the original absolute monotonic deadline.
 #[derive(Clone)]
 pub struct ClientIceConfig {
-    /// Concrete local interface, matching every configured server's IP family.
+    /// Concrete local interface, matching the configured datagram servers' IP family.
     pub bind_addr: SocketAddr,
     /// Pure-core gathering policy, finite timeout and numeric UDP servers.
     pub ice: IceConfig,

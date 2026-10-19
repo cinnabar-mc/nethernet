@@ -328,25 +328,36 @@ sends later candidates through the retained signaling owner. Runtime session
 handles accept credential rotation through `update_turn_credentials`. Cancelling
 negotiation or dropping the driver stops its state and attempts relay release.
 
-This path supports UDP STUN and TURN with IPv4 relay allocations over IPv4 or
-IPv6 outer UDP. Explicit IPv6 relay allocation and TURN TCP/TLS remain incomplete.
-The Bevy LAN and HTTP clients accept `set_ice_config(Some(ClientIceConfig {
-    bind_addr: local_interface,
-    ice: IceConfig { servers, ..Default::default() },
-}))` using types from `bevy_nethernet::prelude` and `nethernet::session`.
-`local_interface` is a concrete numeric local address with an optional ephemeral
-port; all server endpoints must have the same family. HTTP joins gather Full
+The outer TURN carrier is independent of the requested UDP relay family. TCP/TLS
+carriers below still allocate UDP relays; they do not implement RFC 6062 TCP allocations.
+The Bevy LAN and HTTP clients accept `ClientIceConfig` through `set_ice_config`,
+using types from `bevy_nethernet::prelude` and `nethernet::session`.
+`bind_addr` is a concrete numeric local address with an optional ephemeral port;
+datagram servers must have the same family. `turn_streams` holds already-resolved
+`TurnStreamTarget` values for TCP or verified TLS. Each target has its original
+TLS server name, credentials and optional explicit bind/relay family. With the
+`tls` feature, `turn_tls` selects an optional caller-provided verifier independently
+of HTTP signaling; otherwise platform trust is prepared during explicit setup.
+A pending carrier has no fabricated socket tuple. The core receives the same
+connected socket's actual addresses only after connection and TLS verification
+when used.
+HTTP joins gather Full
 candidates before encoding/signing the offer. LAN carries Trickle candidates,
 including those gathered after its initial offer. Active clients expose
 `update_turn_credentials` for password renewal under the original expiry.
 
-Outbound Bevy clients poll their nonblocking UDP socket and pure connection on
+Outbound Bevy clients poll their nonblocking UDP/TCP/TLS sockets and pure connection on
 `update`, without a socket thread or Tokio dependency. Call updates regularly;
 pausing frames also pauses transport progress. Each client owns an exclusive UDP
 socket, including its TURN allocation tuples. The server adapter retains its
 existing shared-socket worker and command/event queues; this does not multiplex
 multiple relay allocations onto a shared TURN tuple. Outbound work reads at most
-64 datagrams and drains at most 1024 core outputs per update. Transport delivery
+64 combined datagram/stream input steps and drains at most 1024 core outputs per
+update. Each stream retains one bounded RTC frame for input and one original
+partial output with its byte offset, plus the existing TLS buffers. A blocked
+selected stream withholds new application admission; unused carriers cannot block
+usable paths and retire individually if a second output cannot be staged.
+Transport delivery
 and application delivery each retain at most 1024 messages and 16 MiB; exceeding a
 receive budget closes the client explicitly. On transport failure, both existing
 delivery stages retain their accepted messages for retrospective reads; neither

@@ -531,6 +531,83 @@ fn frame_driven_verified_tls_turn_secures_both_channels_and_closes_the_same_sock
 
 #[cfg(feature = "tls")]
 #[test]
+fn a_pending_tls_carrier_preserves_tcp_gathering_and_its_original_cutoff() {
+    let stalled = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    stalled.set_nonblocking(true).unwrap();
+    let (_, verifier) = tls_support::self_signed_pair();
+    let mut peer = Peer::new(Security::Plain, false);
+    let mut config = config(&peer, None);
+    config.turn_tls = Some(verifier);
+    let mut pending = config.turn_streams[0].clone();
+    pending.remote = stalled.local_addr().unwrap();
+    pending.security = TurnStreamSecurity::Tls {
+        server_name: "localhost".into(),
+    };
+    config.turn_streams.insert(0, pending);
+    let start = Instant::now();
+    let cutoff = start + Duration::from_secs(5);
+    let original = start + config.ice.gather_timeout;
+    let tls = prepare_turn_tls(Some(&config)).unwrap();
+    let mut client = Outbound::new(Some(&config), Duration::from_secs(30), start, &tls).unwrap();
+    let mut accepted = None;
+    while Instant::now() < cutoff {
+        peer.update();
+        client.update(start).unwrap();
+        if accepted.is_none() {
+            match stalled.accept() {
+                Ok((socket, _)) => {
+                    socket.set_nonblocking(true).unwrap();
+                    accepted = Some(socket);
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        }
+        if accepted.is_some()
+            && peer.turn.allocation_count() == 1
+            && matches!(client.streams.carriers[0].phase, Phase::Handshaking)
+        {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let progressed = peer.turn.allocation_count() == 1;
+    let was_pending = !client.gathering_complete()
+        && matches!(client.streams.carriers[0].phase, Phase::Handshaking);
+    client.update(original).unwrap();
+    let completed = client.gathering_complete();
+    let pending_closed = client.streams.carriers[0].wire.is_none();
+    let preserved = peer.turn.allocation_count();
+    client.close(original);
+    while Instant::now() < cutoff && peer.turn.allocation_count() != 0 {
+        peer.update();
+        std::thread::yield_now();
+    }
+    let released = peer.turn.allocation_count();
+    drop(accepted);
+    drop(stalled);
+    drop(peer);
+    assert!(
+        progressed,
+        "a TLS handshake waiting for input starved the independent TCP allocation"
+    );
+    assert!(
+        was_pending,
+        "the actual TLS handshake was not pending under the original gather owner"
+    );
+    assert!(
+        completed && pending_closed,
+        "the original cutoff did not retire the stalled carrier"
+    );
+    assert_eq!(
+        preserved, 1,
+        "the unused TLS cutoff discarded a healthy TCP allocation"
+    );
+    assert_eq!(released, 0);
+}
+
+#[cfg(feature = "tls")]
+#[test]
 fn wrong_turn_tls_name_or_root_never_activates_an_allocation() {
     for wrong_name in [true, false] {
         let (server, verifier) = tls_support::self_signed_pair();

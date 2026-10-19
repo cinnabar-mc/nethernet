@@ -25,28 +25,32 @@ fn gathering(now: Instant) -> (Outbound, UdpSocket) {
     (owner, peer)
 }
 
-/// An original unpolled timer FIFO cannot escape the edge's finite budget between frames.
+/// Repeated frame timers retain one schedule without retiring a healthy original gathering owner.
 #[test]
-fn pending_core_output_retires_before_another_frame_can_bypass_its_bound() {
+fn repeated_frame_timers_remain_bounded_without_retiring_the_original_owner() {
     let now = Instant::now();
     let (mut owner, peer) = gathering(now);
     let Some(State::Gathering(core, _)) = owner.state.get() else {
         panic!("the original gathering owner disappeared");
     };
+    let original = core.pending_output_usage();
     for _ in 0..=MAX_RECEIVED_MESSAGES {
-        core.handle(SessionInput::Timeout(now)).unwrap();
+        owner.timeout(now).unwrap();
     }
-    let peak = core.pending_output_usage().entries;
+    let Some(State::Gathering(core, _)) = owner.state.get() else {
+        panic!("repeated frame timers retired the original owner");
+    };
+    let retained = core.pending_output_usage();
     let outcome = owner.update(now);
     let retired = owner.state.get().is_none();
     drop(owner);
     drop(peer);
-    assert!(peak > MAX_RECEIVED_MESSAGES);
+    assert_eq!(retained, original, "obsolete scheduling work accumulated");
     assert!(
-        outcome.is_err(),
-        "unpolled original output bypassed its finite bound"
+        outcome.is_ok(),
+        "healthy scheduling reached the output bound"
     );
-    assert!(retired, "the original over-capacity core remained live");
+    assert!(!retired, "the original healthy core was retired");
 }
 
 /// A rejected final delivery permanently seals later successors even when consumption frees capacity.

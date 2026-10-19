@@ -622,6 +622,9 @@ impl<S: Phase> Session<S> {
     }
 
     fn push_wait(&mut self, now: Instant) {
+        // Only the current schedule matters; retained wire/data/event order stays unchanged.
+        self.output
+            .retain(|output| !matches!(output, SessionOutput::Wait(_)));
         if let Some(deadline) = self.poll_timeout() {
             self.output
                 .push_back(SessionOutput::Wait(deadline.saturating_duration_since(now)));

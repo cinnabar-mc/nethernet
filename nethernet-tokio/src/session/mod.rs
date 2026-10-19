@@ -318,6 +318,7 @@ impl Session<Connecting> {
             let mut rtt = None;
             let mut player: Option<Arc<PlayerInfo>> = None;
             let mut host: Option<String> = None;
+            let mut reliable_open = true;
 
             let mut candidates_enabled = signaling
                 .as_ref()
@@ -460,10 +461,12 @@ impl Session<Connecting> {
                             break 'drive Terminal::Eof;
                         }
                         SessionOutput::Message(Channel::Reliable, data) => {
-                            match packet_tx.push(Bytes::from(data)) {
-                                Ok(()) => {}
-                                Err(AdmissionError::Full) => break 'drive Terminal::Capacity,
-                                Err(AdmissionError::Closed) => break 'drive Terminal::Transport,
+                            if let Err(error) = packet_tx.push(Bytes::from(data)) {
+                                reliable_open = false;
+                                break 'drive match error {
+                                    AdmissionError::Full => Terminal::Capacity,
+                                    AdmissionError::Closed => Terminal::Transport,
+                                };
                             }
                         }
                         SessionOutput::Message(Channel::Unreliable, data) => {
@@ -498,8 +501,14 @@ impl Session<Connecting> {
                     .publish(rtt.filter(|sample| !sample.is_zero()));
             };
             rtt_observation.0.retire();
-            let terminal =
-                drain_retired_prefix(connection, io, &packet_tx, &unreliable_tx, terminal);
+            let terminal = drain_retired_prefix(
+                connection,
+                io,
+                &packet_tx,
+                &unreliable_tx,
+                terminal,
+                reliable_open,
+            );
             packet_tx.finish(terminal);
             unreliable_tx.finish(terminal);
             close_token.cancel();
@@ -522,11 +531,11 @@ fn drain_retired_prefix(
     reliable: &Producer,
     unreliable: &Producer,
     mut terminal: Terminal,
+    mut reliable_open: bool,
 ) -> Terminal {
     let Some(mut retired) = connection.retire(transport_now()) else {
         return terminal;
     };
-    let mut reliable_open = true;
     while let Some(output) = retired.poll() {
         match output {
             SessionOutput::Message(Channel::Reliable, data) if reliable_open => {

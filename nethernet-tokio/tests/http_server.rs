@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use nethernet::prelude::{HttpSignalerConfig, IpRangeSet, ServerIdentity, TokenTrust};
 
+#[path = "support/signing.rs"]
+mod signing;
+
 const NETWORK_ID: &str = "1234";
 
 fn server_config() -> HttpServerConfig {
@@ -80,6 +83,55 @@ fn http_forbidden(result: &Result<NetherClient, NetherError>) -> bool {
     )
     .to_string();
     matches!(result, Err(NetherError::Other(message)) if *message == expected)
+}
+
+/// The original signed HTTP association exposes only its actually checked answer key after Ready.
+#[tokio::test]
+async fn http_ready_retains_the_verified_server_key_without_promoting_unchecked_identity() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let identity = signing::identity("verified-http-server");
+        let (url, mut listener) = serve_with_connection(
+            server_config(),
+            ConnectionConfig {
+                identity: Some(Arc::new(identity.clone())),
+                ..Default::default()
+            },
+        )
+        .await;
+        for trust in [Some(signing::trust(&identity)), None] {
+            let verified = trust.is_some();
+            let mut client = NetherClient::connect_with(
+                HttpSignaling::new("verified-key-client".into()).unwrap(),
+                url.clone(),
+                ConnectionConfig {
+                    server_trust: trust,
+                    attempts: 1,
+                    ..client_config()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                client.server_public_key(),
+                verified.then_some(identity.verifying_key()),
+                "Ready must preserve the exact verified key and leave unchecked identity absent"
+            );
+            let peer = listener.accept().await.unwrap();
+            peer.session
+                .send(Bytes::from_static(b"verified original HTTP peer"))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.recv().await.unwrap().unwrap(),
+                "verified original HTTP peer"
+            );
+            drop(client.close());
+            drop(peer.close());
+        }
+        listener.close().await.unwrap();
+    })
+    .await
+    .expect("finite signed HTTP key handoff stalled");
 }
 
 #[tokio::test]

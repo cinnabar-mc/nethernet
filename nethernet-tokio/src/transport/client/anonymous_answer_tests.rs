@@ -80,8 +80,9 @@ async fn association(answer: Answer, allow: bool) -> Result<()> {
         let (caller, mut client_service) = CallerSignaling::new("client".into(), "server".into(), signaling).unwrap();
         let (accepting, mut server_service) = CallerServerSignaling::new("server".into(), CallerServerSignalingConfig { signaling, ..Default::default() }).unwrap();
         let local_key = Arc::new(ServerIdentity::generate("client.fixture.invalid", SystemTime::now()).unwrap());
+        let server_key = Arc::new(ServerIdentity::generate("server.fixture.invalid", SystemTime::now()).unwrap());
         let mut server = NetherServer::bind_with(accepting, ConnectionConfig {
-            identity: if matches!(answer, Answer::Missing) { None } else { Some(Arc::new(ServerIdentity::generate("server.fixture.invalid", SystemTime::now()).unwrap())) },
+            identity: if matches!(answer, Answer::Missing) { None } else { Some(server_key.clone()) },
             allow_unsigned_answers: matches!(answer, Answer::Missing),
             token_trust: Some(TokenTrust::Any),
             server_ice: Some(ServerIceConfig { ice: Default::default(), bind_addr: bind }),
@@ -100,6 +101,8 @@ async fn association(answer: Answer, allow: bool) -> Result<()> {
             }).await;
             let result = match connected {
                 Ok(mut client) => {
+                    let expected = if matches!(answer, Answer::Missing) { None } else { Some(server_key.verifying_key()) };
+                    assert_eq!(client.server_public_key(), expected, "the actual answer key did not survive the Ready handoff");
                     let accepted = server.accept().await;
                     match accepted {
                         Ok(mut peer) => {

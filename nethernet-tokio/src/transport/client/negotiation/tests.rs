@@ -119,7 +119,7 @@ async fn peer_checks_before_handoff(mode: IceMode, answer_before_check: bool) {
     if !answer_before_check {
         driver.try_deliver("peer", &answers[0].to_string()).unwrap();
     }
-    negotiation
+    let _ = negotiation
         .await
         .expect("negotiation could not finish after the receipt and answer arrived");
     let (client, mut client_reliable, _client_unreliable, client_ready) =

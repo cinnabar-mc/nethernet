@@ -13,6 +13,7 @@ use nethernet::connection::{Connection, ConnectionInput};
 use nethernet::identity::TokenTrust;
 use nethernet::sans::Sans;
 use nethernet::session::{SessionEvent, SessionOutput};
+use p384::ecdsa::VerifyingKey;
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime};
 use tokio::net::UdpSocket;
@@ -32,7 +33,7 @@ pub(super) async fn exchange<St>(
     allow_anonymous: bool,
     within: Duration,
     deadline: Instant,
-) -> std::result::Result<(), (Option<SignalErrorCode>, NetherError)>
+) -> std::result::Result<Option<VerifyingKey>, (Option<SignalErrorCode>, NetherError)>
 where
     St: Stream<Item = Signal> + Send + Unpin + ?Sized,
 {
@@ -41,7 +42,7 @@ where
         let mut wake = Instant::now();
         let mut queued: VecDeque<_> = initial.into();
         let mut outgoing: Option<BoxFuture<'static, Result<()>>> = None;
-        let mut answer: Option<Signal> = None;
+        let mut answer: Option<(Signal, Option<VerifyingKey>)> = None;
         loop {
             while let Some(output) = connection.poll() {
                 match output {
@@ -53,11 +54,11 @@ where
             }
             if queued.is_empty() && outgoing.is_none() {
                 if let Some(signal) = connection.poll_local_signal() { queued.push_back(signal); }
-                else if let Some(answer) = answer {
+                else if let Some((answer, key)) = answer {
                     // Apply the answer only at handoff, so Ready/data cannot be consumed by this pre-session driver.
                     connection.handle(ConnectionInput::Signal(answer, transport_now()))
                         .map_err(|error| (Some(SignalErrorCode::FailedToSetRemoteDescription), NetherError::from(error)))?;
-                    return Ok(());
+                    return Ok(key);
                 }
             }
             if outgoing.is_none() && let Some(signal) = queued.pop_front() {
@@ -78,8 +79,8 @@ where
                     if signal.connection_id != connection_id || signal.network_id != remote_network_id { continue; }
                     match signal.signal_type {
                         SignalType::Answer => {
-                            check_answer(&signal, trust, allow_anonymous, SystemTime::now())?;
-                            if answer.is_none() { answer = Some(signal); }
+                            let key = check_answer(&signal, trust, allow_anonymous, SystemTime::now())?;
+                            if answer.is_none() { answer = Some((signal, key)); }
                         }
                         SignalType::Candidate => connection.handle(ConnectionInput::Signal(signal, transport_now()))
                             .map_err(|error| (Some(SignalErrorCode::Ice), NetherError::from(error)))?,

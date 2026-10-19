@@ -55,6 +55,17 @@ pub(crate) enum ActiveConnection {
 }
 
 impl ActiveConnection {
+    /// Reads only the original phase owner's retained output, before the frame admits more work.
+    pub(crate) fn pending_output_usage(&self) -> nethernet::session::OutputUsage {
+        match self {
+            Self::Connecting(core) => core
+                .as_ref()
+                .expect("pending core remains owned")
+                .pending_output_usage(),
+            Self::Established(core) => core.pending_output_usage(),
+        }
+    }
+
     /// Adopts the original pending allocation without creating another transport.
     pub(crate) fn new(core: Connection<Connecting>) -> Self {
         Self::Connecting(Some(core))

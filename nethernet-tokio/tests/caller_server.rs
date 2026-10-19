@@ -19,7 +19,7 @@ fn signed(identity: &ServerIdentity) -> ConnectionConfig {
     ConnectionConfig {
         identity: Some(Arc::new(identity.clone())),
         attempts: 1,
-        client_ice: Some(ClientIceConfig {
+        client_ice: Some(ClientIceConfig { turn_streams: Vec::new(), turn_tls: None,
             ice: Default::default(),
             bind_addr: Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)),
         }),
@@ -38,7 +38,7 @@ async fn caller_server_keeps_peer_isolation_and_accepted_lifetime_on_listener_cl
         }).unwrap();
         let mut listener = NetherServer::bind_with(server, ConnectionConfig {
             token_trust: Some(signing::trust(&client_identity)),
-            server_ice: Some(ServerIceConfig { ice: Default::default(), bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0) }),
+            server_ice: Some(ServerIceConfig { turn_streams: Vec::new(), turn_tls: None, ice: Default::default(), bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0) }),
             ..signed(&server_identity)
         }).await.unwrap();
         let client_config = CallerSignalingConfig { ice_mode: IceMode::Full, ..Default::default() };

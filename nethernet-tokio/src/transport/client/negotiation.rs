@@ -5,6 +5,7 @@ use crate::protocol::{Signal, SignalType};
 use crate::session::guard::transport_now;
 use crate::session::outgoing::signal_send;
 use crate::signaling::ClientSignaling;
+use crate::transport::ice_io::IceIo;
 use futures::{
     Stream, StreamExt,
     future::{BoxFuture, pending},
@@ -16,13 +17,14 @@ use nethernet::session::{SessionEvent, SessionOutput};
 use p384::ecdsa::VerifyingKey;
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime};
+#[cfg(test)]
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
 /// Keeps a single service send in flight while gathering and incoming signals continue to progress.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn exchange<St>(
-    socket: &UdpSocket,
+    io: &mut IceIo,
     connection: &mut Connection,
     incoming: &mut St,
     signaling: &ClientSignaling,
@@ -38,22 +40,22 @@ where
     St: Stream<Item = Signal> + Send + Unpin + ?Sized,
 {
     let result = tokio::time::timeout_at(deadline, async {
-        let mut buffer = vec![0; 65536];
         let mut wake = Instant::now();
         let mut queued: VecDeque<_> = initial.into();
         let mut outgoing: Option<BoxFuture<'static, Result<()>>> = None;
         let mut answer: Option<(Signal, Option<VerifyingKey>)> = None;
         loop {
-            while let Some(output) = connection.poll() {
+            while !io.blocked() {
+                let Some(output) = connection.poll() else { break; };
                 match output {
-                    SessionOutput::Send(data, to) => { socket.send_to(&data, to).await.map_err(|error| (None, NetherError::from(error)))?; }
-                    SessionOutput::SendStream(..) => return Err((Some(SignalErrorCode::Ice), NetherError::Protocol(nethernet::session::IceError::UnsupportedCarrier.into()))),
+                    SessionOutput::Send(data, to) => { io.send_datagram(&data, to).await.map_err(|error| (None, NetherError::from(error)))?; }
+                    SessionOutput::SendStream(data, route) => io.send_stream(data, route).map_err(|error| (Some(SignalErrorCode::Ice), error))?,
                     SessionOutput::Wait(wait) => { wake = Instant::now() + wait; }
                     SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => return Err((Some(SignalErrorCode::Ice), NetherError::ConnectionClosed)),
                     _ => {}
                 }
             }
-            if queued.is_empty() && outgoing.is_none() {
+            if !io.blocked() && queued.is_empty() && outgoing.is_none() {
                 if let Some(signal) = connection.poll_local_signal() { queued.push_back(signal); }
                 else if let Some((answer, key)) = answer {
                     // Apply the answer only at handoff, so Ready/data cannot be consumed by this pre-session driver.
@@ -89,10 +91,11 @@ where
                         SignalType::Offer => return Err((Some(SignalErrorCode::IncomingConnectionIgnored), NetherError::Other("received offer while dialing".to_owned()))),
                     }
                 }
-                packet = socket.recv_from(&mut buffer) => {
-                    let (size, from) = packet.map_err(|error| (None, NetherError::from(error)))?;
-                    connection.handle(ConnectionInput::Packet(buffer[..size].into(), from, transport_now()))
-                        .map_err(|error| (Some(SignalErrorCode::Ice), NetherError::from(error)))?;
+                event = io.next() => {
+                    let event = event.map_err(|error| (None, error))?;
+                    if let Some(input) = event.connection(transport_now()) {
+                        connection.handle(input).map_err(|error| (Some(SignalErrorCode::Ice), NetherError::from(error)))?;
+                    }
                 }
             }
         }

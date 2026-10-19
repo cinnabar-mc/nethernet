@@ -31,7 +31,7 @@ async fn configured_client_gathers_while_offering_and_releases_turn_on_cancellat
         .unwrap();
         let now = tokio::time::Instant::now().into_std();
         let config = ConnectionConfig {
-            client_ice: Some(ClientIceConfig {
+            client_ice: Some(ClientIceConfig { turn_streams: Vec::new(), turn_tls: None,
                 ice: IceConfig {
                     servers: vec![IceServer::Turn(
                         server.addr,

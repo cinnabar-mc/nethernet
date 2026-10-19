@@ -207,6 +207,19 @@ impl ActiveConnection {
         }
     }
 
+    /// Borrows the actual core state after the public update consumed its authenticated ACK.
+    #[cfg(test)]
+    pub(crate) fn test_gathering_complete(&self) -> bool {
+        let state = match self {
+            Self::Connecting(core) => core
+                .as_ref()
+                .expect("pending core remains owned")
+                .gathering_state(),
+            Self::Established(core) => core.gathering_state(),
+        };
+        state == nethernet::session::GatheringState::Complete
+    }
+
     /// Applies credential rotation to the original allocation and absolute expiry owner.
     pub(crate) fn update_turn_credentials(
         &mut self,
@@ -220,6 +233,22 @@ impl ActiveConnection {
                 .expect("pending core remains owned")
                 .update_turn_credentials(server, credentials, now),
             Self::Established(core) => core.update_turn_credentials(server, credentials, now),
+        }
+    }
+
+    /// Preserves exact stream-route selection through the original connecting/established owner.
+    pub(crate) fn update_turn_stream_credentials(
+        &mut self,
+        route: nethernet::session::TurnStreamRoute,
+        credentials: nethernet::session::TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        match self {
+            Self::Connecting(core) => core
+                .as_mut()
+                .expect("pending core remains owned")
+                .update_turn_stream_credentials(route, credentials, now),
+            Self::Established(core) => core.update_turn_stream_credentials(route, credentials, now),
         }
     }
 

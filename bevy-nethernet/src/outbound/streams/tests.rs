@@ -652,3 +652,5 @@ fn wrong_turn_tls_name_or_root_never_activates_an_allocation() {
 
 #[cfg(feature = "tls")]
 mod reconfiguration;
+
+mod renewal;

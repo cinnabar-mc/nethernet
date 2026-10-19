@@ -162,6 +162,18 @@ impl Outbound {
             if session.gathering_state() == GatheringState::Complete)
     }
 
+    /// Observes ACK-driven completion after either original phase, without consuming an output.
+    #[cfg(test)]
+    pub(crate) fn test_gathering_complete(&mut self) -> bool {
+        match self.state.get() {
+            Some(State::Gathering(session, _)) => {
+                session.gathering_state() == GatheringState::Complete
+            }
+            Some(State::Connected(connection)) => connection.test_gathering_complete(),
+            None => false,
+        }
+    }
+
     /// Transfers the gathered session into its single connection and returns initial signals.
     pub(crate) fn connect(
         &mut self,
@@ -357,7 +369,7 @@ impl Outbound {
     }
 
     /// Reads the original selected relay owner without treating an unused candidate as selected.
-    fn selected_turn_stream(&mut self) -> Option<nethernet::session::TurnStreamRoute> {
+    pub(crate) fn selected_turn_stream(&mut self) -> Option<nethernet::session::TurnStreamRoute> {
         match self.state.get() {
             Some(State::Gathering(session, _)) => session.selected_turn_stream(),
             Some(State::Connected(connection)) => connection.selected_turn_stream(),
@@ -483,6 +495,25 @@ impl Outbound {
             }
             Some(State::Connected(connection)) => {
                 connection.update_turn_credentials(server, credentials, now)
+            }
+            None => Err(ProtocolError::Other("connection closed".into())),
+        };
+        result.and(self.check_output_capacity(now))
+    }
+
+    /// Renews only the original allocation bound to this verified stream tuple.
+    pub(crate) fn update_turn_stream_credentials(
+        &mut self,
+        route: nethernet::session::TurnStreamRoute,
+        credentials: TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        let result = match self.state.get() {
+            Some(State::Gathering(session, _)) => {
+                session.update_turn_stream_credentials(route, credentials, now)
+            }
+            Some(State::Connected(connection)) => {
+                connection.update_turn_stream_credentials(route, credentials, now)
             }
             None => Err(ProtocolError::Other("connection closed".into())),
         };

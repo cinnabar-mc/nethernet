@@ -13,7 +13,7 @@ use nethernet::prelude::{
 };
 use nethernet::protocol::constants::{LAN_DISCOVERY_PORT, MAX_DATAGRAM_SIZE};
 use nethernet::protocol::{Signal, SignalType};
-use nethernet::session::{Channel, TurnCredentials};
+use nethernet::session::{Channel, TurnCredentials, TurnStreamRoute};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime};
@@ -135,8 +135,13 @@ impl NetherClient {
 
     /// Configures numeric UDP STUN/TURN for subsequent attempts. LAN signaling sends candidates incrementally.
     /// `None` preserves host-only operation; each attempt owns an exclusive UDP socket.
-    pub fn set_ice_config(&mut self, config: Option<ClientIceConfig>) {
+    /// Prepares its TURN TLS policy before replacing the targets; failure preserves the old pair.
+    /// This explicit setup may load platform trust. Frame-driven attempts perform no TLS setup.
+    pub fn set_ice_config(&mut self, config: Option<ClientIceConfig>) -> std::io::Result<()> {
+        let turn_tls = prepare_turn_tls(config.as_ref())?;
         self.ice_config = config;
+        self.turn_tls = turn_tls;
+        Ok(())
     }
 
     /// Renews an active allocation's password with the original absolute monotonic expiry.
@@ -149,6 +154,26 @@ impl NetherClient {
         self.transport_mut()
             .ok_or_else(|| nethernet::error::ProtocolError::Other("not connected".into()))?
             .update_turn_credentials(server, credentials, Instant::now())
+    }
+
+    /// The original selected stream tuple; direct, UDP, unselected and retired paths return `None`.
+    /// This observation neither drives I/O nor grants sending capability.
+    pub fn selected_turn_stream(&mut self) -> Option<TurnStreamRoute> {
+        self.transport_mut()
+            .and_then(Outbound::selected_turn_stream)
+    }
+
+    /// Renews only the allocation on this exact actual stream, including colocated UDP/TCP/TLS.
+    /// The core preserves its original username, credential expiry and authenticated lease rules.
+    /// Success is local Refresh admission; it does not acknowledge the server response.
+    pub fn update_turn_stream_credentials(
+        &mut self,
+        route: TurnStreamRoute,
+        credentials: TurnCredentials,
+    ) -> Result<(), nethernet::error::ProtocolError> {
+        self.transport_mut()
+            .ok_or_else(|| nethernet::error::ProtocolError::Other("not connected".into()))?
+            .update_turn_stream_credentials(route, credentials, Instant::now())
     }
 
     /// How the server's answer is authenticated; `None`, the default, accepts any answer.
@@ -189,7 +214,6 @@ impl NetherClient {
         self.target = target_network_id;
         self.attempts_left = self.attempts.max(1);
         let now = Instant::now();
-        self.turn_tls = prepare_turn_tls(self.ice_config.as_ref())?;
         self.begin_attempt(now)
     }
 
@@ -423,6 +447,13 @@ impl NetherClient {
             }
         }
     }
+    /// Lets actual wire controls observe core ACK completion after the original public update.
+    #[cfg(test)]
+    pub(crate) fn test_gathering_complete(&mut self) -> bool {
+        self.transport_mut()
+            .is_some_and(Outbound::test_gathering_complete)
+    }
+
     /// Drives the same exclusive socket in either phase; only the ready entry exposes send publicly.
     fn transport_mut(&mut self) -> Option<&mut Outbound> {
         match &mut self.established {

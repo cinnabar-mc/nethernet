@@ -363,8 +363,11 @@ negotiation or dropping the driver stops its state and attempts relay release.
 
 The outer TURN carrier is independent of the requested UDP relay family. TCP/TLS
 carriers below still allocate UDP relays; they do not implement RFC 6062 TCP allocations.
-The Bevy LAN and HTTP clients accept `ClientIceConfig` through `set_ice_config`,
-using types from `bevy_nethernet::prelude` and `nethernet::session`.
+The Bevy LAN and HTTP clients accept `ClientIceConfig` through the fallible
+`set_ice_config`, using types from `bevy_nethernet::prelude` and `nethernet::session`.
+The setter prepares TURN trust before atomically installing targets and policy; handle its
+`Result`. An invalid replacement preserves the original pair. Subsequent frame-driven retries
+use that prepared policy and perform no DNS or platform-trust setup.
 `bind_addr` is a concrete numeric local address with an optional ephemeral port;
 datagram servers must have the same family. `turn_streams` holds already-resolved
 `TurnStreamTarget` values for TCP or verified TLS. Each target has its original
@@ -376,8 +379,13 @@ connected socket's actual addresses only after connection and TLS verification
 when used.
 HTTP joins gather Full
 candidates before encoding/signing the offer. LAN carries Trickle candidates,
-including those gathered after its initial offer. Active clients expose
-`update_turn_credentials` for password renewal under the original expiry.
+including those gathered after its initial offer. Clients expose `update_turn_credentials`
+for an unambiguous numeric endpoint. When UDP/TCP/TLS carriers share that address, use
+`selected_turn_stream` to observe the original selected stream and
+`update_turn_stream_credentials` with that exact tuple. Direct, UDP and unselected paths have
+no selected stream. Renewal changes the same allocation, preserving its original username,
+absolute credential expiry and authenticated lease rules; local success does not acknowledge
+a remote Refresh response. The address-only API continues to reject ambiguity.
 
 Outbound Bevy clients poll their nonblocking UDP/TCP/TLS sockets and pure connection on
 `update`, without a socket thread or Tokio dependency. Call updates regularly;

@@ -57,7 +57,7 @@ fn http_reconfiguration(tls_before: bool) {
     let (mut old, mut new, first, next) = replacement(tls_before);
     let mut client = NetherHttpClient::new();
     client.set_timeouts(initial_timeouts());
-    client.set_ice_config(Some(first));
+    client.set_ice_config(Some(first)).unwrap();
     client
         .connect(
             "reconfiguration".into(),
@@ -65,7 +65,16 @@ fn http_reconfiguration(tls_before: bool) {
         )
         .unwrap();
     // connect captured the old due cutoff and trust. Only explicit reconfiguration can replace trust.
-    client.set_ice_config(Some(next));
+    let mut invalid = next.clone();
+    invalid.turn_streams[0].remote = old.listener.local_addr().unwrap();
+    invalid.turn_streams[0].security = TurnStreamSecurity::Tls {
+        server_name: "invalid\nname".into(),
+    };
+    client.set_ice_config(Some(next)).unwrap();
+    assert!(
+        client.set_ice_config(Some(invalid)).is_err(),
+        "invalid replacement must preserve the original target/trust pair"
+    );
     client.set_timeouts(replacement_timeouts());
     let cutoff = Instant::now() + Duration::from_secs(5);
     while Instant::now() < cutoff && new.turn.allocation_count() == 0 {
@@ -113,9 +122,18 @@ fn lan_reconfiguration(tls_before: bool) {
     }
     let (mut old, mut new, first, next) = replacement(tls_before);
     client.set_timeouts(initial_timeouts());
-    client.set_ice_config(Some(first));
+    client.set_ice_config(Some(first)).unwrap();
     client.connect(1).unwrap();
-    client.set_ice_config(Some(next));
+    let mut invalid = next.clone();
+    invalid.turn_streams[0].remote = old.listener.local_addr().unwrap();
+    invalid.turn_streams[0].security = TurnStreamSecurity::Tls {
+        server_name: "invalid\nname".into(),
+    };
+    client.set_ice_config(Some(next)).unwrap();
+    assert!(
+        client.set_ice_config(Some(invalid)).is_err(),
+        "invalid replacement must preserve the original target/trust pair"
+    );
     client.set_timeouts(replacement_timeouts());
     let cutoff = Instant::now() + Duration::from_secs(5);
     while Instant::now() < cutoff && new.turn.allocation_count() == 0 {

@@ -385,6 +385,7 @@ fn drive<K: Eq + Hash + Clone>(
                         }
                         let _ = socket.send_to(&data, to);
                     }
+                    SessionOutput::SendStream(..) => failed.push(id.clone()),
                     SessionOutput::Event(SessionEvent::Ready) => {
                         let ready = ConnectionEvent::Ready(entry.connection.remote_addr());
                         if events
@@ -788,6 +789,9 @@ mod routing_tests {
                                 peer.router.note_sent(to, &0);
                             }
                             socket.send_to(&data, to).unwrap();
+                        }
+                        SessionOutput::SendStream(..) => {
+                            panic!("host-only pool emitted stream traffic")
                         }
                         SessionOutput::Event(SessionEvent::Ready) => peer.ready = true,
                         SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {

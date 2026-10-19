@@ -1,6 +1,8 @@
-//! ICE checks and resolved UDP STUN/TURN gathering composed from RTC sans-I/O owners.
+//! ICE checks and exact STUN/TURN carrier routes composed from RTC sans-I/O owners.
 mod config;
+mod route;
 mod server;
+use super::SessionOutput;
 use crate::error::ProtocolError;
 use crate::protocol::webrtc::certificate;
 use bytes::BytesMut;
@@ -8,6 +10,7 @@ pub use config::{
     GatheringState, IceConfig, IceError, IcePolicy, IceServer, MAX_ICE_SERVERS,
     MAX_TURN_CREDENTIAL_BYTES, TurnCredentials,
 };
+pub use route::{MAX_TURN_STREAM_FRAME_BYTES, TurnAddressFamily, TurnStreamRoute};
 use rtc::ice::agent::agent_config::AgentConfig;
 use rtc::ice::agent::{Agent, Credentials, Event};
 use rtc::ice::candidate::candidate_host::CandidateHostConfig;
@@ -16,7 +19,7 @@ use rtc::ice::candidate::candidate_server_reflexive::CandidateServerReflexiveCon
 use rtc::ice::candidate::{Candidate, CandidateConfig, CandidateType};
 use rtc::ice::network_type::NetworkType;
 use rtc::sansio::Protocol;
-use rtc::shared::TaggedBytesMut;
+use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use server::{Server, ServerEvent, context};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -204,7 +207,11 @@ impl IceLayer {
             return Err(IceError::Configuration.into());
         }
         self.advance_servers(now)?;
-        if let Some(server) = self.servers.iter_mut().find(|server| server.addr == from) {
+        if let Some(server) = self
+            .servers
+            .iter_mut()
+            .find(|server| server.addr == from && server.stream.is_none())
+        {
             server.handle_read(TaggedBytesMut {
                 now,
                 transport: context(self.local_addr, from),
@@ -219,6 +226,68 @@ impl IceLayer {
             })?;
         }
         Ok(())
+    }
+
+    /// Activates only the configured actual TCP tuple after its edge has verified the carrier.
+    pub fn activate_stream(
+        &mut self,
+        route: TurnStreamRoute,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        self.advance_servers(now)?;
+        self.servers
+            .iter_mut()
+            .find(|server| server.stream == Some(route))
+            .ok_or(IceError::Configuration)?
+            .activate(route, now)
+    }
+
+    /// A complete TURN frame belongs to its exact configured TCP tuple, independently of UDP sources.
+    pub fn handle_stream_read(
+        &mut self,
+        data: &[u8],
+        route: TurnStreamRoute,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        if data.len() > MAX_TURN_STREAM_FRAME_BYTES {
+            return Err(IceError::Configuration.into());
+        }
+        self.advance_servers(now)?;
+        self.servers
+            .iter_mut()
+            .find(|server| server.stream == Some(route))
+            .ok_or(IceError::Configuration)?
+            .handle_read(TaggedBytesMut {
+                now,
+                transport: TransportContext {
+                    local_addr: route.local(),
+                    peer_addr: route.remote(),
+                    transport_protocol: TransportProtocol::TCP,
+                    ecn: None,
+                },
+                message: BytesMut::from(data),
+            })?;
+        self.drain_servers()
+    }
+
+    /// Retires this exact carrier, keeping other gathering and established routes intact.
+    pub fn close_stream(
+        &mut self,
+        route: TurnStreamRoute,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        self.advance_servers(now)?;
+        self.servers
+            .iter_mut()
+            .find(|server| server.stream == Some(route))
+            .ok_or(IceError::Configuration)?
+            .retire();
+        self.writes.retain(|packet| {
+            !(packet.transport.transport_protocol == TransportProtocol::TCP
+                && packet.transport.local_addr == route.local()
+                && packet.transport.peer_addr == route.remote())
+        });
+        self.drain_servers()
     }
 
     /// Sends STUN to the ICE engine and admits media only from a checked pair.
@@ -291,13 +360,25 @@ impl IceLayer {
         })
     }
 
-    /// Drains ICE checks through their candidate routes, then RTC's outer UDP transmits.
-    pub fn poll_write(&mut self) -> Result<Option<(Vec<u8>, SocketAddr)>, ProtocolError> {
+    /// Drains ICE checks through their candidate routes without erasing RTC's actual outer carrier.
+    pub fn poll_write(&mut self) -> Result<Option<SessionOutput>, ProtocolError> {
         self.collect_writes()?;
-        Ok(self
-            .writes
+        self.writes
             .pop_front()
-            .map(|msg| (msg.message.to_vec(), msg.transport.peer_addr)))
+            .map(|msg| {
+                let data = msg.message.to_vec();
+                match msg.transport.transport_protocol {
+                    TransportProtocol::UDP => {
+                        Ok(SessionOutput::Send(data, msg.transport.peer_addr))
+                    }
+                    TransportProtocol::TCP => Ok(SessionOutput::SendStream(
+                        data,
+                        TurnStreamRoute::new(msg.transport.local_addr, msg.transport.peer_addr)?,
+                    )),
+                    _ => Err(IceError::Configuration.into()),
+                }
+            })
+            .transpose()
     }
 
     /// Captures queued transaction metadata before any later credential rotation.
@@ -381,13 +462,17 @@ impl IceLayer {
                             CandidateType::Relay => CandidateRelayConfig {
                                 base_config,
                                 rel_addr: self.servers[index]
-                                    .reflexive
-                                    .unwrap_or(self.local_addr)
+                                    .stream
+                                    .map(TurnStreamRoute::local)
+                                    .or(self.servers[index].reflexive)
+                                    .unwrap_or(self.servers[index].local)
                                     .ip()
                                     .to_string(),
                                 rel_port: self.servers[index]
-                                    .reflexive
-                                    .unwrap_or(self.local_addr)
+                                    .stream
+                                    .map(TurnStreamRoute::local)
+                                    .or(self.servers[index].reflexive)
+                                    .unwrap_or(self.servers[index].local)
                                     .port(),
                                 url: None,
                             }
@@ -487,23 +572,49 @@ impl IceLayer {
         credentials: TurnCredentials,
         now: Instant,
     ) -> Result<(), ProtocolError> {
-        self.servers
+        let mut matches = self
+            .servers
             .iter()
-            .find(|server| server.addr == addr)
-            .ok_or(IceError::Configuration)?
-            .validate_replacement(&credentials, now)?;
+            .enumerate()
+            .filter(|(_, server)| server.addr == addr);
+        let index = matches.next().ok_or(IceError::Configuration)?.0;
+        if matches.next().is_some() {
+            return Err(IceError::Configuration.into());
+        }
+        self.update_credentials_at(index, credentials, now)
+    }
+
+    /// Selects the original stream allocation when multiple carriers use one remote address.
+    pub fn update_stream_credentials(
+        &mut self,
+        route: TurnStreamRoute,
+        credentials: TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        let index = self
+            .servers
+            .iter()
+            .position(|server| server.stream == Some(route))
+            .ok_or(IceError::Configuration)?;
+        self.update_credentials_at(index, credentials, now)
+    }
+
+    /// Preserves original validation and request-key capture before changing one selected owner.
+    fn update_credentials_at(
+        &mut self,
+        index: usize,
+        credentials: TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        self.servers[index].validate_replacement(&credentials, now)?;
         self.expire(now);
         // Capture any queued request's old integrity key before a credential rotation.
         self.collect_writes()?;
-        self.servers
-            .iter_mut()
-            .find(|server| server.addr == addr)
-            .ok_or(IceError::Configuration)?
-            .update_credentials(credentials, now)?;
+        self.servers[index].update_credentials(credentials, now)?;
         Ok(())
     }
 
-    /// Releases allocations once; drain best-effort UDP sends before dropping the session.
+    /// Releases allocations once; drain best-effort output on each original carrier before dropping.
     pub fn close(&mut self, now: Instant) {
         if self.gathering == GatheringState::Closed {
             return;

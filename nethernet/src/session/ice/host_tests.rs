@@ -30,12 +30,18 @@ fn two_agents_connect_over_loopback() {
     for _ in 0..2000 {
         let mut progressed = false;
 
-        while let Some((data, to)) = a.poll_write().unwrap() {
+        while let Some(output) = a.poll_write().unwrap() {
+            let SessionOutput::Send(data, to) = output else {
+                panic!("host-only ICE emitted a stream packet")
+            };
             progressed = true;
             assert_eq!(to, addr(40001));
             b.handle_read(&data, addr(40000), now).unwrap();
         }
-        while let Some((data, to)) = b.poll_write().unwrap() {
+        while let Some(output) = b.poll_write().unwrap() {
+            let SessionOutput::Send(data, to) = output else {
+                panic!("host-only ICE emitted a stream packet")
+            };
             progressed = true;
             assert_eq!(to, addr(40000));
             a.handle_read(&data, addr(40001), now).unwrap();

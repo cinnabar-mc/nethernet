@@ -384,6 +384,7 @@ impl Session<Connecting> {
                                 tracing::debug!("send_to error: {e}");
                             }
                         }
+                        SessionOutput::SendStream(..) => break 'drive Terminal::Transport,
                         SessionOutput::Event(SessionEvent::Ready) => {
                             remote_addr = connection.remote_addr();
                             if let Some(tx) = ready_tx.take() {

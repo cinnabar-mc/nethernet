@@ -18,6 +18,7 @@ pub(crate) async fn gather(
             while let Some(output) = session.poll() {
                 match output {
                     SessionOutput::Send(data, to) => { socket.send_to(&data, to).await?; }
+                    SessionOutput::SendStream(..) => return Err(NetherError::Protocol(nethernet::session::IceError::UnsupportedCarrier.into())),
                     SessionOutput::Wait(wait) => { wake = Instant::now() + wait; }
                     SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => return Err(NetherError::ConnectionClosed),
                     _ => {}

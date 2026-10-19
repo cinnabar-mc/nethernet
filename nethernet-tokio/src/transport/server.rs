@@ -46,6 +46,16 @@ impl NetherServer {
         signaling: impl Into<ServerSignaling>,
         mut config: ConnectionConfig,
     ) -> Result<Self> {
+        if config.server_ice.as_ref().is_some_and(|ice| {
+            ice.ice
+                .servers
+                .iter()
+                .any(|server| server.stream_route().is_some())
+        }) {
+            return Err(NetherError::Protocol(
+                nethernet::session::IceError::UnsupportedCarrier.into(),
+            ));
+        }
         let signaling: ServerSignaling = signaling.into();
         if signaling.requires_identity()
             && config.identity.is_none()

@@ -334,10 +334,31 @@ impl<S: Phase> Connection<S> {
         self.session
             .update_turn_credentials(server, credentials, now)
     }
+
+    /// Rotates the exact stream allocation while preserving the original transaction owner.
+    pub fn update_turn_stream_credentials(
+        &mut self,
+        route: crate::session::TurnStreamRoute,
+        credentials: crate::session::TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError>
+    where
+        S: Live,
+    {
+        self.session
+            .update_turn_stream_credentials(route, credentials, now)
+    }
 }
 
 pub enum ConnectionInput {
     Packet(Box<[u8]>, SocketAddr, Instant),
+
+    /// The original stream is connected and its TLS policy, when applicable, has verified.
+    ActivateTurnStream(crate::session::TurnStreamRoute, Instant),
+    /// One complete TURN frame from the original bound stream tuple.
+    StreamPacket(Box<[u8]>, crate::session::TurnStreamRoute, Instant),
+    /// The original stream ended; its allocation cannot be moved to another carrier.
+    StreamClosed(crate::session::TurnStreamRoute, Instant),
 
     Timeout(Instant),
 
@@ -365,6 +386,15 @@ impl<S: Live> Sans for Connection<S> {
         match msg {
             ConnectionInput::Packet(data, from, now) => {
                 self.session.handle(SessionInput::Packet(data, from, now))
+            }
+            ConnectionInput::ActivateTurnStream(route, now) => self
+                .session
+                .handle(SessionInput::ActivateTurnStream(route, now)),
+            ConnectionInput::StreamPacket(data, route, now) => self
+                .session
+                .handle(SessionInput::StreamPacket(data, route, now)),
+            ConnectionInput::StreamClosed(route, now) => {
+                self.session.handle(SessionInput::StreamClosed(route, now))
             }
             ConnectionInput::Timeout(now) => self.session.handle(SessionInput::Timeout(now)),
             ConnectionInput::Signal(signal, now) => self.handle_signal(&signal, now),
@@ -488,6 +518,9 @@ mod tests {
                     }
                     SessionOutput::Message(..) => {}
                     SessionOutput::Wait(_) => {}
+                    SessionOutput::SendStream(..) => {
+                        panic!("host-only connection emitted stream traffic")
+                    }
                 }
             }
             for (data, to) in outbox {
@@ -508,6 +541,9 @@ mod tests {
                     }
                     SessionOutput::Message(..) => {}
                     SessionOutput::Wait(_) => {}
+                    SessionOutput::SendStream(..) => {
+                        panic!("host-only connection emitted stream traffic")
+                    }
                 }
             }
             for (data, to) in outbox {

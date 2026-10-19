@@ -15,7 +15,8 @@ pub use dtls::ResolvedRole;
 use ice::IceLayer;
 pub use ice::{
     GatheringState, IceConfig, IceError, IcePolicy, IceServer, MAX_ICE_SERVERS,
-    MAX_TURN_CREDENTIAL_BYTES, TurnCredentials,
+    MAX_TURN_CREDENTIAL_BYTES, MAX_TURN_STREAM_FRAME_BYTES, TurnAddressFamily, TurnCredentials,
+    TurnStreamRoute,
 };
 use rtc::datachannel::message::Message as DcepMessage;
 use rtc::ice::candidate::Candidate;
@@ -51,6 +52,8 @@ pub enum SessionEvent {
 
 pub enum SessionOutput {
     Send(Vec<u8>, SocketAddr),
+    /// Original RTC bytes for this exact caller-owned TCP/TLS stream, preserving partial-write ownership.
+    SendStream(Vec<u8>, TurnStreamRoute),
     Event(SessionEvent),
     Message(Channel, Vec<u8>),
     /// Feed `Timeout` no later than this long from now.
@@ -59,6 +62,15 @@ pub enum SessionOutput {
 
 pub enum SessionInput {
     Packet(Box<[u8]>, SocketAddr, Instant),
+
+    /// Starts allocation only after the caller connected and, for TLS, verified this actual carrier.
+    ActivateTurnStream(TurnStreamRoute, Instant),
+
+    /// One complete RTC-framed TURN message from the exact activated stream.
+    StreamPacket(Box<[u8]>, TurnStreamRoute, Instant),
+
+    /// The original stream ended; retire only its allocation and pending transaction owners.
+    StreamClosed(TurnStreamRoute, Instant),
 
     /// Transports start once the description or a later candidate supplies a remote address.
     RemoteDescription(Description, Vec<Candidate>, Instant),
@@ -97,7 +109,7 @@ impl Channels {
     }
 }
 
-/// ICE, DTLS and SCTP stacks bound to one local address, with one reliable and one unreliable channel.
+/// ICE, DTLS and SCTP over one host UDP binding and its configured relay carriers, with two data channels.
 /// Connecting may drain accepted messages but cannot send application data.
 ///
 /// ```compile_fail
@@ -152,7 +164,7 @@ impl Session<Connecting> {
         Self::from_ice(is_controlling, session_id, ice)
     }
 
-    /// Creates a session with resolved UDP STUN/TURN servers. Drain its initial sends and waits immediately.
+    /// Creates a session with resolved STUN/TURN routes. Drain its initial sends and waits immediately.
     /// Full ICE callers wait for `GatheringState::Complete` before encoding SDP; trickle callers poll candidates.
     pub fn new_with_ice(
         local_addr: SocketAddr,
@@ -308,6 +320,26 @@ impl<S: Phase> Session<S> {
         Ok(())
     }
 
+    /// Rotates only the allocation bound to this actual stream tuple, without address ambiguity.
+    pub fn update_turn_stream_credentials(
+        &mut self,
+        route: TurnStreamRoute,
+        credentials: TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError>
+    where
+        S: Live,
+    {
+        let result = self.ice.update_stream_credentials(route, credentials, now);
+        if self.ice.selected_route_failed() {
+            self.fail(now)?;
+        }
+        result?;
+        self.pump(now)?;
+        self.push_wait(now);
+        Ok(())
+    }
+
     /// Cancels gathering, checks and relay timers immediately. Drain best-effort deallocation sends before dropping.
     pub fn close(mut self, now: Instant) -> (Session<Retired>, Result<(), ProtocolError>)
     where
@@ -340,8 +372,8 @@ impl<S: Phase> Session<S> {
         self.dtls = None;
         self.sctp = None;
         self.establish_started = None;
-        while let Some((data, to)) = self.ice.poll_write()? {
-            self.output.push_back(SessionOutput::Send(data, to));
+        while let Some(output) = self.ice.poll_write()? {
+            self.output.push_back(output);
         }
         Ok(())
     }
@@ -458,6 +490,11 @@ impl<S: Phase> Session<S> {
         now: Instant,
     ) -> Result<(), ProtocolError> {
         self.ice.handle_read(data, from, now)?;
+        self.drain_ice_read(now)
+    }
+
+    /// Delivers effective UDP data through the original selected ICE/DTLS path for either carrier.
+    fn drain_ice_read(&mut self, now: Instant) -> Result<(), ProtocolError> {
         self.pump(now)?;
         while let Some(packet) = self.ice.poll_read() {
             if self.dtls.is_none() {
@@ -515,8 +552,8 @@ impl<S: Phase> Session<S> {
                     self.ice.send_selected(data, to, now)?;
                 }
             }
-            while let Some((data, to)) = self.ice.poll_write()? {
-                final_output.push_back(SessionOutput::Send(data, to));
+            while let Some(output) = self.ice.poll_write()? {
+                final_output.push_back(output);
             }
             Ok(())
         })();
@@ -611,8 +648,8 @@ impl<S: Phase> Session<S> {
         if self.ice.selected_route_failed() {
             self.fail(now)?;
         }
-        while let Some((data, to)) = self.ice.poll_write()? {
-            self.output.push_back(SessionOutput::Send(data, to));
+        while let Some(output) = self.ice.poll_write()? {
+            self.output.push_back(output);
         }
         while let Some(event) = self.ice.poll_event() {
             if let rtc::ice::agent::Event::ConnectionStateChange(state) = event
@@ -743,6 +780,9 @@ impl<S: Live> Sans for Session<S> {
     fn handle(&mut self, msg: SessionInput) -> Result<(), ProtocolError> {
         let now = match &msg {
             SessionInput::Packet(_, _, now)
+            | SessionInput::ActivateTurnStream(_, now)
+            | SessionInput::StreamPacket(_, _, now)
+            | SessionInput::StreamClosed(_, now)
             | SessionInput::RemoteDescription(_, _, now)
             | SessionInput::RemoteCandidate(_, now)
             | SessionInput::Timeout(now) => *now,
@@ -750,12 +790,34 @@ impl<S: Live> Sans for Session<S> {
         self.expire_before_input(now)?;
         if self.ice.gathering_state() == GatheringState::Closed {
             return match msg {
-                SessionInput::Packet(..) | SessionInput::Timeout(..) => Ok(()),
+                SessionInput::Packet(..)
+                | SessionInput::StreamPacket(..)
+                | SessionInput::StreamClosed(..)
+                | SessionInput::Timeout(..) => Ok(()),
                 _ => Err(IceError::Closed.into()),
             };
         }
         match msg {
             SessionInput::Packet(data, from, now) => self.handle_packet(&data, from, now),
+            SessionInput::ActivateTurnStream(route, now) => {
+                self.ice.activate_stream(route, now)?;
+                self.pump(now)?;
+                self.push_wait(now);
+                Ok(())
+            }
+            SessionInput::StreamPacket(data, route, now) => {
+                self.ice.handle_stream_read(&data, route, now)?;
+                self.drain_ice_read(now)
+            }
+            SessionInput::StreamClosed(route, now) => {
+                self.ice.close_stream(route, now)?;
+                self.output.retain(
+                    |output| !matches!(output, SessionOutput::SendStream(_, old) if *old == route),
+                );
+                self.pump(now)?;
+                self.push_wait(now);
+                Ok(())
+            }
             SessionInput::RemoteDescription(remote, candidates, now) => {
                 self.set_remote_description(&remote, candidates, now)
             }

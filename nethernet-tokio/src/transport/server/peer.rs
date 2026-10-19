@@ -182,6 +182,17 @@ impl Peer {
 
     /// Reads metadata and dispatches the answer without extending the core's established deadline.
     async fn answer(&self, offer: Signal, lease: Arc<ServerLease>) -> OfferResult<Answered> {
+        if self.config.server_ice.as_ref().is_some_and(|ice| {
+            ice.ice
+                .servers
+                .iter()
+                .any(|server| server.stream_route().is_some())
+        }) {
+            return Err((
+                None,
+                NetherError::Protocol(nethernet::session::IceError::UnsupportedCarrier.into()),
+            ));
+        }
         if matches!(&self.signaling, ServerSignaling::Caller(_))
             && self.config.token_trust.is_none()
         {

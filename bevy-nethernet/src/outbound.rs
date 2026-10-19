@@ -56,6 +56,18 @@ impl Outbound {
         establish_within: Duration,
         now: Instant,
     ) -> std::io::Result<Self> {
+        if config.is_some_and(|config| {
+            config
+                .ice
+                .servers
+                .iter()
+                .any(|server| server.stream_route().is_some())
+        }) {
+            return Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                nethernet::session::IceError::UnsupportedCarrier,
+            ));
+        }
         let (socket, local) = match config {
             Some(config) => {
                 let ip = config.bind_addr.ip();
@@ -185,6 +197,13 @@ impl Outbound {
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                     Err(error) => return Err(error.into()),
                 },
+                SessionOutput::SendStream(..) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::Unsupported,
+                        nethernet::session::IceError::UnsupportedCarrier,
+                    )
+                    .into());
+                }
                 SessionOutput::Event(SessionEvent::Ready) => {
                     let addr = match self.state.get() {
                         Some(State::Connected(connection)) => connection.remote_addr(),

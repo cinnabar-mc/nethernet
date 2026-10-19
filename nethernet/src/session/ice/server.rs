@@ -1,5 +1,6 @@
-//! One RTC transaction owner per UDP server; relay handles are borrowed only for an operation.
+//! One RTC transaction owner per exact carrier; relay handles are borrowed only for an operation.
 use super::config::{IceError, IceServer, MAX_REMOTE_CANDIDATES, TurnCredentials};
+use super::route::{TurnAddressFamily, TurnStreamRoute};
 use crate::error::ProtocolError;
 use crate::protocol::webrtc::certificate;
 use bytes::BytesMut;
@@ -18,9 +19,9 @@ use rtc::stun::message::{
 };
 use rtc::stun::textattrs::Realm;
 use rtc::stun::xoraddr::XorMappedAddress;
-use rtc::turn::client::{Client, ClientConfig, Event};
-use rtc::turn::proto::lifetime::Lifetime;
-use rtc::turn::proto::peeraddr::PeerAddress;
+use rtc_turn::client::{Client, ClientConfig, Event};
+use rtc_turn::proto::lifetime::Lifetime;
+use rtc_turn::proto::peeraddr::PeerAddress;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -54,6 +55,9 @@ struct TrackedRequest {
 
 pub(super) struct Server {
     pub addr: SocketAddr,
+    pub local: SocketAddr,
+    pub stream: Option<TurnStreamRoute>,
+    family: Option<TurnAddressFamily>,
     pub relay: Option<SocketAddr>,
     pub reflexive: Option<SocketAddr>,
     client: Option<Client>,
@@ -76,12 +80,24 @@ pub(super) struct Server {
 }
 
 impl Server {
-    /// Starts one Binding and, for TURN, one allocation using numeric endpoints only.
+    /// Starts UDP transactions immediately; an actual stream tuple retains its allocation until activation.
     pub fn new(local: SocketAddr, config: IceServer, now: Instant) -> Result<Self, ProtocolError> {
         let addr = config.addr();
-        let initial_credentials = match config {
-            IceServer::Stun(_) => None,
-            IceServer::Turn(_, credentials) => Some(credentials),
+        let stream = config.stream_route();
+        let local = stream.map_or(local, TurnStreamRoute::local);
+        let (initial_credentials, family) = match config {
+            IceServer::Stun(_) => (None, None),
+            IceServer::Turn(_, credentials) => (Some(credentials), None),
+            IceServer::TurnWithFamily {
+                credentials,
+                family,
+                ..
+            }
+            | IceServer::TurnStream {
+                credentials,
+                family,
+                ..
+            } => (Some(credentials), Some(family)),
         };
         let allocation_username = initial_credentials
             .as_ref()
@@ -90,41 +106,15 @@ impl Server {
         let credential_expiry = initial_credentials
             .as_ref()
             .map(|credentials| credentials.valid_until);
-        let (username, password) = initial_credentials
-            .as_ref()
-            .map(|credentials| (credentials.username.clone(), credentials.password.clone()))
-            .unwrap_or_default();
-        let mut client = Client::new(
-            ClientConfig {
-                stun_serv_addr: addr.to_string(),
-                turn_serv_addr: if allocating {
-                    addr.to_string()
-                } else {
-                    String::new()
-                },
-                local_addr: local,
-                transport_protocol: TransportProtocol::UDP,
-                username,
-                password,
-                ..Default::default()
-            },
-            certificate::crypto_provider()?,
-        )
-        .map_err(|_| IceError::Server)?;
-        let binding = Some(
-            client
-                .send_binding_request(now)
-                .map_err(|_| IceError::Server)?,
-        );
-        if allocating {
-            client.allocate(now).map_err(|_| IceError::Server)?;
-        }
-        Ok(Self {
+        let mut server = Self {
             addr,
+            local,
+            stream,
+            family,
             relay: None,
             reflexive: None,
-            client: Some(client),
-            binding,
+            client: None,
+            binding: None,
             allocating,
             credential_expiry,
             username: allocation_username,
@@ -139,7 +129,74 @@ impl Server {
             pending: VecDeque::new(),
             pending_bytes: 0,
             events: VecDeque::new(),
-        })
+        };
+        if stream.is_none() {
+            server.start(now)?;
+        }
+        Ok(server)
+    }
+
+    /// Creates the original RTC owner only after this exact stream's verified edge activation.
+    pub fn activate(&mut self, route: TurnStreamRoute, now: Instant) -> Result<(), ProtocolError> {
+        self.expire(now);
+        if self.stream != Some(route) || self.client.is_some() {
+            return Err(IceError::Configuration.into());
+        }
+        if !self.allocating || self.initial_credentials.is_none() {
+            return Err(IceError::Closed.into());
+        }
+        let result = self.start(now);
+        if result.is_err() {
+            self.retire();
+        }
+        result
+    }
+
+    /// Preserves the dependency's request, authentication and reliable-carrier transaction ownership.
+    fn start(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        let (username, password) = self
+            .initial_credentials
+            .as_ref()
+            .map(|credentials| (credentials.username.clone(), credentials.password.clone()))
+            .unwrap_or_default();
+        let mut client = Client::new(
+            ClientConfig {
+                stun_serv_addr: self.addr.to_string(),
+                turn_serv_addr: if self.allocating {
+                    self.addr.to_string()
+                } else {
+                    String::new()
+                },
+                local_addr: self.local,
+                transport_protocol: if self.stream.is_some() {
+                    TransportProtocol::TCP
+                } else {
+                    TransportProtocol::UDP
+                },
+                requested_address_family: self.family.map(TurnAddressFamily::requested),
+                username,
+                password,
+                ..Default::default()
+            },
+            certificate::crypto_provider()?,
+        )
+        .map_err(|_| IceError::Server)?;
+        // A TCP mapping cannot be advertised as a UDP server-reflexive candidate.
+        let binding = if self.stream.is_none() {
+            Some(
+                client
+                    .send_binding_request(now)
+                    .map_err(|_| IceError::Server)?,
+            )
+        } else {
+            None
+        };
+        if self.allocating {
+            client.allocate(now).map_err(|_| IceError::Server)?;
+        }
+        self.binding = binding;
+        self.client = Some(client);
+        Ok(())
     }
 
     /// Whether both initial gathering operations have reached a terminal result.
@@ -325,7 +382,9 @@ impl Server {
                         self.credential_expiry = None;
                         self.events
                             .push_back(ServerEvent::Candidate(CandidateType::Relay, addr));
-                        if let Some(reflexive) = self.reflexive {
+                        if let Some(reflexive) = self.reflexive
+                            && self.stream.is_none()
+                        {
                             self.events.push_back(ServerEvent::Candidate(
                                 CandidateType::ServerReflexive,
                                 reflexive,
@@ -650,7 +709,6 @@ impl Server {
 
     /// The nearest dependency retransmission, refresh, allocation or credential deadline.
     pub fn poll_timeout(&mut self) -> Option<Instant> {
-        self.client.as_ref()?;
         [
             self.credential_expiry,
             self.allocation_expiry,
@@ -688,7 +746,7 @@ impl Server {
     }
 
     /// Clears secrets, transactions and data together; no background work survives retirement.
-    fn retire(&mut self) {
+    pub(super) fn retire(&mut self) {
         self.client = None;
         self.relay = None;
         self.binding = None;
@@ -719,7 +777,7 @@ pub(super) fn context(local_addr: SocketAddr, peer_addr: SocketAddr) -> Transpor
     }
 }
 
-/// Reads only bounded UDP framing metadata; no dependency message Debug or server text is exposed.
+/// Reads bounded STUN metadata; no dependency message Debug or server text is exposed.
 fn decode_stun(data: &[u8]) -> Option<Message> {
     if !is_stun_message(data) {
         return None;

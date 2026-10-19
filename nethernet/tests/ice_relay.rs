@@ -999,3 +999,5 @@ fn owned_turn_transactions_ignore_wrong_methods_and_reflected_requests() {
             .expect("a wrong-method response consumed the real authenticated refresh transaction");
     }
 }
+
+mod allocation_lifetime;

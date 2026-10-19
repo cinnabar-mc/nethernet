@@ -576,7 +576,7 @@ mod tests {
             ..Default::default()
         };
         let failure = tokio::time::timeout(
-            Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
             NetherClient::negotiate(&signaling, "peer", 1, config),
         )
         .await

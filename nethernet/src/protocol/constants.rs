@@ -31,6 +31,9 @@ pub const UNRELIABLE_CHANNEL: &str = "UnreliableDataChannel";
 
 pub const DEFAULT_PACKET_CHANNEL_CAPACITY: usize = 1024;
 
+/// Bounded adapter commands waiting for their original transport owner.
+pub const DEFAULT_COMMAND_CHANNEL_CAPACITY: usize = 16;
+
 /// Offers a server answers before any of them establishes.
 pub const DEFAULT_MAX_PENDING: usize = 64;
 

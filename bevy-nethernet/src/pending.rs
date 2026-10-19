@@ -1,4 +1,7 @@
-use nethernet::protocol::constants::{DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_NETWORK_ID};
+use nethernet::protocol::constants::{
+    DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_NETWORK_ID, DEFAULT_PACKET_CHANNEL_CAPACITY,
+    MAX_MESSAGE_SIZE,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PendingLimits {
@@ -43,5 +46,27 @@ mod tests {
         assert!(!admits_offer(["1", "1"], "1", limits));
         assert!(admits_offer(["1", "1"], "2", limits));
         assert!(!admits_offer(["1", "1", "2"], "3", limits));
+    }
+}
+
+/// Host-wide capacity retained by a shared accepting pool and its public consumers.
+/// Accepted payloads survive lowering these limits; new admission waits for available capacity.
+#[derive(Clone, Copy, Debug)]
+pub struct ServerLimits {
+    /// Negotiating or established sessions, including undrained lifecycle records.
+    pub max_sessions: usize,
+    /// Reliable and unreliable messages retained together until public receive consumes them.
+    pub max_received_packets: usize,
+    /// Combined retained payload bytes across all sessions and both channels.
+    pub max_received_bytes: usize,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_sessions: DEFAULT_MAX_PENDING,
+            max_received_packets: DEFAULT_PACKET_CHANNEL_CAPACITY,
+            max_received_bytes: DEFAULT_PACKET_CHANNEL_CAPACITY * MAX_MESSAGE_SIZE,
+        }
     }
 }

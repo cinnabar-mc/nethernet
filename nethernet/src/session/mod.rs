@@ -6,7 +6,9 @@ mod sctp;
 
 use crate::error::ProtocolError;
 use crate::phase::{Connecting, Established, Live, Phase, Retired};
-use crate::protocol::constants::{LOCAL_SCTP_MAX_MESSAGE_SIZE, SCTP_MAX_MESSAGE_SIZE};
+use crate::protocol::constants::{
+    LOCAL_SCTP_MAX_MESSAGE_SIZE, MAX_MESSAGE_SIZE, SCTP_MAX_MESSAGE_SIZE,
+};
 use crate::protocol::message::{Message as Framing, MessageSegment};
 use crate::protocol::webrtc::{Description, DtlsRole, certificate};
 use crate::sans::Sans;
@@ -38,6 +40,16 @@ const DEFAULT_ESTABLISH_DEADLINE: Duration = Duration::from_secs(10);
 pub enum Channel {
     Reliable,
     Unreliable,
+}
+
+impl Channel {
+    /// Maximum logical payload accepted by the original NetherNet segmentation format.
+    pub const fn max_message_size(self) -> usize {
+        match self {
+            Self::Reliable => MAX_MESSAGE_SIZE * u8::MAX as usize,
+            Self::Unreliable => MAX_MESSAGE_SIZE.saturating_sub(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

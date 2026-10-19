@@ -22,7 +22,7 @@ pub mod prelude {
         NetherHttpServer, NetherHttpServerEvent, NetherHttpServerPlugin, NetherHttpServerSet,
     };
     pub use crate::outbound::{ClientIceConfig, EstablishedClient};
-    pub use crate::pending::PendingLimits;
+    pub use crate::pending::{PendingLimits, ServerLimits};
     pub use crate::server::{
         EstablishedSessionId, NetherServer, NetherServerEvent, NetherServerPlugin, NetherServerSet,
         NetherSessionId,

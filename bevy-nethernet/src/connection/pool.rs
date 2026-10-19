@@ -1,34 +1,43 @@
-use super::{ActiveConnection, ConnectionEvent, PoolEvent, Readiness};
-use async_channel::{Receiver, Sender, TryRecvError};
+#[cfg(test)]
+use super::PoolUpdate;
+use super::delivery::Delivery;
+use super::{ActiveConnection, PoolEvent, Readiness};
+use crate::pending::ServerLimits;
+use async_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use nethernet::connection::{Connection, ConnectionInput};
+use nethernet::error::ProtocolError;
 use nethernet::protocol::Signal;
-use nethernet::sans::Sans;
+use nethernet::protocol::constants::{
+    DEFAULT_COMMAND_CHANNEL_CAPACITY, DEFAULT_PACKET_CHANNEL_CAPACITY,
+};
 use nethernet::session::{Channel, SessionEvent, SessionOutput};
 use nethernet::util::stun;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
 const MAX_IDLE: Duration = Duration::from_secs(1);
-
 const RTT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
+type SharedDelivery<K> = Arc<Mutex<Delivery<K>>>;
+
 enum Command<K> {
-    Add(K, Box<Connection>, String, Sender<Readiness>),
-    Signal(K, Signal),
+    Add(K, Box<Connection>, String, Readiness, Sender<()>),
+    Signal(K, Readiness, Signal),
     Send(K, Readiness, Channel, Box<[u8]>),
-    Remove(K),
 }
 
-pub(crate) struct SessionPool<K> {
+pub(crate) struct SessionPool<K: Clone + Eq> {
     commands: Sender<Command<K>>,
-    events: Receiver<PoolEvent<K>>,
+    delivery: SharedDelivery<K>,
     #[cfg(test)]
     worker: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    removed: Option<Arc<Mutex<Vec<K>>>>,
 }
 
 impl<K> SessionPool<K>
@@ -36,21 +45,22 @@ where
     K: Eq + Hash + Clone + Send + 'static,
 {
     pub(crate) fn new(socket: UdpSocket) -> Self {
-        let (command_tx, command_rx) = async_channel::unbounded();
-        let (event_tx, event_rx) = async_channel::unbounded();
-
+        let (command_tx, command_rx) = async_channel::bounded(DEFAULT_COMMAND_CHANNEL_CAPACITY);
+        let delivery = Arc::new(Mutex::new(Delivery::new()));
+        let worker_delivery = delivery.clone();
         let worker = std::thread::Builder::new()
             .name("nethernet-session-pool".to_string())
-            .spawn(move || drive(socket, command_rx, event_tx))
+            .spawn(move || drive(socket, command_rx, worker_delivery))
             .expect("failed to spawn the session pool's thread");
         #[cfg(not(test))]
         let _ = worker;
-
         Self {
             commands: command_tx,
-            events: event_rx,
+            delivery,
             #[cfg(test)]
             worker: Some(worker),
+            #[cfg(test)]
+            removed: None,
         }
     }
 
@@ -63,64 +73,193 @@ where
         }
     }
 
+    /// Observes cleanup calls in the existing pure expiry test; it owns no actual core.
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, impl Fn() -> Vec<K>) {
+        let (commands, _) = async_channel::bounded(DEFAULT_COMMAND_CHANNEL_CAPACITY);
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let observed = removed.clone();
+        (
+            Self {
+                commands,
+                delivery: Arc::new(Mutex::new(Delivery::new())),
+                worker: None,
+                removed: Some(removed),
+            },
+            move || std::mem::take(&mut *observed.lock().unwrap()),
+        )
+    }
+
+    /// New limits gate admission without evicting the original accepted prefix.
+    pub(crate) fn set_limits(&mut self, limits: ServerLimits) {
+        self.delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_limits(limits);
+    }
+
+    /// Performs the same reservation preflight before an incoming offer allocates an answer.
+    pub(crate) fn admits(&self, id: &K) -> bool {
+        self.delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .admits(id)
+    }
+
+    /// Reserves final ownership before the original worker can acknowledge this allocation.
     pub(crate) fn add(
         &mut self,
         id: K,
         connection: Connection,
         local_ufrag: String,
     ) -> Option<Readiness> {
+        let readiness = self
+            .delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reserve(id.clone())?;
         let (ack_tx, ack_rx) = async_channel::bounded(1);
-        let _ = self
+        if self
             .commands
-            .try_send(Command::Add(id, Box::new(connection), local_ufrag, ack_tx));
-        ack_rx.recv_blocking().ok()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn detached() -> (Self, impl Fn() -> Vec<K>) {
-        let (command_tx, command_rx) = async_channel::unbounded();
-        let (_, event_rx) = async_channel::unbounded();
-        let removed = move || {
-            std::iter::from_fn(|| command_rx.try_recv().ok())
-                .filter_map(|command| match command {
-                    Command::Remove(id) => Some(id),
-                    _ => None,
-                })
-                .collect()
-        };
-        (
-            Self {
-                commands: command_tx,
-                events: event_rx,
-                worker: None,
-            },
-            removed,
-        )
-    }
-
-    pub(crate) fn remove(&mut self, id: K) {
-        let _ = self.commands.try_send(Command::Remove(id));
-    }
-
-    pub(crate) fn signal(&mut self, id: K, signal: &Signal) {
-        let _ = self.commands.try_send(Command::Signal(id, signal.clone()));
-    }
-
-    /// Dispatches only to the actual established core; pending state has no send method.
-    pub(crate) fn send(&mut self, id: K, readiness: Readiness, channel: Channel, data: Box<[u8]>) {
-        let _ = self
-            .commands
-            .try_send(Command::Send(id, readiness, channel, data));
-    }
-
-    pub(crate) fn drive(&mut self, events: &mut Vec<PoolEvent<K>>) {
-        loop {
-            match self.events.try_recv() {
-                Ok(event) => events.push(event),
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Closed) => return,
-            }
+            .try_send(Command::Add(
+                id,
+                Box::new(connection),
+                local_ufrag,
+                readiness.clone(),
+                ack_tx,
+            ))
+            .is_err()
+            || ack_rx.recv_blocking().is_err()
+        {
+            self.delivery
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .abandon(&readiness);
+            return None;
         }
+        Some(readiness)
+    }
+
+    /// Cleanup seals the exact allocation even when all command slots are occupied.
+    pub(crate) fn remove(&mut self, id: K, readiness: Readiness) {
+        self.delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retire(&readiness);
+        #[cfg(test)]
+        if let Some(removed) = &self.removed {
+            removed.lock().unwrap().push(id);
+        }
+        #[cfg(not(test))]
+        let _ = id;
+    }
+
+    /// Lost mandatory signaling retires only its original entry, not the shared worker.
+    pub(crate) fn signal(&mut self, id: K, signal: &Signal) {
+        let readiness = self
+            .delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .readiness(&id);
+        if let Some(readiness) = readiness
+            && self
+                .commands
+                .try_send(Command::Signal(id, readiness.clone(), signal.clone()))
+                .is_err()
+        {
+            self.delivery
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retire(&readiness);
+        }
+    }
+
+    /// Success admits bounded local work; it does not acknowledge core or remote delivery.
+    pub(crate) fn send(
+        &mut self,
+        id: K,
+        readiness: Readiness,
+        channel: Channel,
+        data: impl AsRef<[u8]>,
+    ) -> Result<(), ProtocolError> {
+        let data = data.as_ref();
+        if data.len() > channel.max_message_size() {
+            return Err(ProtocolError::MessageSizeExceeded(data.len()));
+        }
+        if !self
+            .delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&id, &readiness)
+        {
+            return Err(ProtocolError::Other("unknown session".into()));
+        }
+        if self.commands.is_closed() {
+            return Err(io::Error::from(ErrorKind::BrokenPipe).into());
+        }
+        if self.commands.is_full() {
+            return Err(io::Error::from(ErrorKind::WouldBlock).into());
+        }
+        // This exclusively borrowed sender is the pool's sole producer. Check capacity before copying.
+        self.commands
+            .try_send(Command::Send(id, readiness, channel, data.into()))
+            .map_err(|error| {
+                io::Error::from(match error {
+                    TrySendError::Full(_) => ErrorKind::WouldBlock,
+                    TrySendError::Closed(_) => ErrorKind::BrokenPipe,
+                })
+                .into()
+            })
+    }
+
+    /// Advances only a finite frame of metadata and visibility in the one final delivery owner.
+    pub(crate) fn drive(&mut self, events: &mut Vec<PoolEvent<K>>) {
+        self.delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .advance(events, DEFAULT_PACKET_CHANNEL_CAPACITY);
+    }
+
+    /// Consumes the same reserved lifecycle record observed by frame processing.
+    pub(crate) fn next_event(&mut self) -> Option<PoolEvent<K>> {
+        self.delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .next_event()
+    }
+
+    /// Observes actual final delivery in the stalled-consumer socket fixture.
+    #[cfg(test)]
+    pub(crate) fn retained_packets(&self) -> usize {
+        self.delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retained_packets()
+    }
+
+    /// Observes cleanup of the original core independently of global worker shutdown.
+    #[cfg(test)]
+    pub(crate) fn owner_has_finished(&self, readiness: &Readiness) -> bool {
+        self.delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .owner_has_finished(readiness)
+    }
+
+    /// Returns the original accepted payload and releases its global retained charge.
+    pub(crate) fn recv(&mut self, channel: Channel) -> Option<(K, Box<[u8]>)> {
+        self.delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .recv(channel)
+    }
+}
+
+impl<K: Clone + Eq> Drop for SessionPool<K> {
+    fn drop(&mut self) {
+        self.commands.close();
+        let mut delivery = self.delivery.lock().unwrap_or_else(PoisonError::into_inner);
+        delivery.seal_all();
     }
 }
 
@@ -134,15 +273,43 @@ struct Entry {
     rtt_reported_at: Option<Instant>,
 }
 
-fn drive<K: Eq + Hash + Clone>(
+struct Exit<K: Clone + Eq>(SharedDelivery<K>);
+impl<K: Clone + Eq> Drop for Exit<K> {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish_all();
+    }
+}
+
+/// Releases the original router/core before freeing its reserved delivery admission slot.
+fn retire_entry<K: Clone + Eq + Hash>(
+    id: &K,
+    entries: &mut HashMap<K, Entry>,
+    router: &mut Router<K>,
+    delivery: &SharedDelivery<K>,
+) {
+    if let Some(entry) = entries.remove(id) {
+        router.release(id, &entry.local_ufrag, entry.remote_addr);
+        let readiness = entry.readiness;
+        drop(entry.connection);
+        delivery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .owner_finished(&readiness);
+    }
+}
+
+fn drive<K: Eq + Hash + Clone + Send + 'static>(
     socket: UdpSocket,
     commands: Receiver<Command<K>>,
-    events: Sender<PoolEvent<K>>,
+    delivery: SharedDelivery<K>,
 ) {
-    let mut buf = vec![0u8; 65536];
+    let _exit = Exit(delivery.clone());
     let mut entries: HashMap<K, Entry> = HashMap::new();
-    let mut router: Router<K> = Router::default();
-
+    let mut router = Router::default();
+    let mut buf = [0; nethernet::protocol::constants::MAX_DATAGRAM_SIZE];
     loop {
         let now = Instant::now();
         let next_wait = entries
@@ -156,84 +323,111 @@ fn drive<K: Eq + Hash + Clone>(
         if socket.set_read_timeout(Some(timeout)).is_err() {
             return;
         }
-
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
                 for id in router.route(from, &buf[..len]) {
-                    if let Some(entry) = entries.get_mut(&id) {
-                        let now = Instant::now();
-                        let input = ConnectionInput::Packet(buf[..len].into(), from, now);
-                        if let Err(e) = entry.connection.handle(input) {
-                            tracing::debug!("packet handling error: {e}");
-                        }
+                    if let Some(entry) = entries.get_mut(&id)
+                        && !entry.readiness.is_retired()
+                        && let Err(error) = entry.connection.handle(ConnectionInput::Packet(
+                            buf[..len].into(),
+                            from,
+                            Instant::now(),
+                        ))
+                    {
+                        tracing::debug!("packet handling error: {error}");
                     }
                 }
             }
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(e) => tracing::debug!("recv error: {e}"),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => tracing::debug!("recv error: {error}"),
         }
-
-        loop {
+        for _ in 0..DEFAULT_COMMAND_CHANNEL_CAPACITY {
+            let now = Instant::now();
             match commands.try_recv() {
-                Ok(Command::Add(id, connection, local_ufrag, ack)) => {
+                Ok(Command::Add(id, connection, local_ufrag, readiness, ack)) => {
+                    if entries
+                        .get(&id)
+                        .is_some_and(|entry| entry.readiness.is_retired())
+                    {
+                        retire_entry(&id, &mut entries, &mut router, &delivery);
+                    }
+                    if readiness.is_retired() || entries.contains_key(&id) {
+                        delivery
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .abandon(&readiness);
+                        continue;
+                    }
                     router.register_ufrag(local_ufrag.clone(), id.clone());
-                    let readiness = Readiness::new();
                     entries.insert(
-                        id,
+                        id.clone(),
                         Entry {
                             connection: ActiveConnection::new(*connection),
                             readiness: readiness.clone(),
                             local_ufrag,
                             remote_addr: None,
-                            wait: Instant::now(),
+                            wait: now,
                             reported_rtt: None,
                             rtt_reported_at: None,
                         },
                     );
-                    let _ = ack.try_send(readiness);
-                }
-                Ok(Command::Remove(id)) => {
-                    if let Some(entry) = entries.remove(&id) {
-                        router.release(&id, &entry.local_ufrag, entry.remote_addr);
+                    if ack.try_send(()).is_err() {
+                        retire_entry(&id, &mut entries, &mut router, &delivery);
+                        delivery
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .abandon(&readiness);
                     }
                 }
-                Ok(Command::Signal(id, signal)) => {
+                Ok(Command::Signal(id, readiness, signal)) => {
                     if let Some(entry) = entries.get_mut(&id)
-                        && let Err(e) = entry
+                        && entry.readiness.matches(&readiness)
+                        && !readiness.is_retired()
+                        && let Err(error) = entry
                             .connection
                             .handle(ConnectionInput::Signal(signal, now))
                     {
-                        tracing::debug!("signal handling error: {e}");
+                        tracing::debug!("signal handling error: {error}");
                     }
                 }
                 Ok(Command::Send(id, readiness, channel, data)) => {
                     if let Some(entry) = entries.get_mut(&id)
                         && entry.readiness.matches(&readiness)
-                        && let Err(e) = entry.connection.send(channel, data.into(), now)
+                        && !readiness.is_retired()
+                        && let Err(error) = entry.connection.send(channel, data.into(), now)
                     {
-                        tracing::debug!("send error: {e}");
+                        tracing::debug!("send error: {error}");
                     }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Closed) => return,
             }
         }
-
         let now = Instant::now();
+        let per_entry = (DEFAULT_PACKET_CHANNEL_CAPACITY / entries.len().max(1)).max(1);
         let mut failed = Vec::new();
-        for (id, entry) in entries.iter_mut() {
-            if let Err(e) = entry.connection.handle(ConnectionInput::Timeout(now)) {
-                tracing::debug!("timeout handling error: {e}");
+        for (id, entry) in &mut entries {
+            if entry.readiness.is_retired() {
+                failed.push(id.clone());
+                continue;
             }
-
+            if let Err(error) = entry.connection.handle(ConnectionInput::Timeout(now)) {
+                tracing::debug!("timeout handling error: {error}");
+            }
             if entry.remote_addr.is_none()
-                && let Some(addr) = entry.connection.remote_addr()
+                && let Some(address) = entry.connection.remote_addr()
             {
-                entry.remote_addr = Some(addr);
-                router.claim_addr(addr, id);
+                entry.remote_addr = Some(address);
+                router.claim_addr(address, id);
             }
-
-            while let Some(output) = entry.connection.poll() {
+            for _ in 0..per_entry {
+                if entry.readiness.is_retired() {
+                    failed.push(id.clone());
+                    break;
+                }
+                let Some(output) = entry.connection.poll() else {
+                    break;
+                };
                 match output {
                     SessionOutput::Send(data, to) => {
                         if entry.remote_addr.is_none() {
@@ -241,40 +435,30 @@ fn drive<K: Eq + Hash + Clone>(
                         }
                         let _ = socket.send_to(&data, to);
                     }
-                    SessionOutput::SendStream(..) => failed.push(id.clone()),
-                    SessionOutput::Event(SessionEvent::Ready) => {
-                        let ready = ConnectionEvent::Ready(entry.connection.remote_addr());
-                        if events
-                            .try_send(PoolEvent {
-                                id: id.clone(),
-                                event: ready,
-                                readiness: entry.readiness.clone(),
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
+                    SessionOutput::SendStream(..)
+                    | SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
+                        failed.push(id.clone());
+                        break;
                     }
-                    SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
-                        failed.push(id.clone())
+                    SessionOutput::Event(SessionEvent::Ready) => {
+                        delivery
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .ready(&entry.readiness, entry.connection.remote_addr());
                     }
                     SessionOutput::Message(channel, data) => {
-                        let message = ConnectionEvent::Message(channel, data.into_boxed_slice());
-                        if events
-                            .try_send(PoolEvent {
-                                id: id.clone(),
-                                event: message,
-                                readiness: entry.readiness.clone(),
-                            })
-                            .is_err()
+                        if !delivery
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .message(&entry.readiness, channel, data.into_boxed_slice())
                         {
-                            return;
+                            failed.push(id.clone());
+                            break;
                         }
                     }
                     SessionOutput::Wait(wait) => entry.wait = now + wait,
                 }
             }
-
             if let Some(rtt) = entry.connection.rtt()
                 && entry.reported_rtt != Some(rtt)
                 && entry
@@ -283,33 +467,14 @@ fn drive<K: Eq + Hash + Clone>(
             {
                 entry.reported_rtt = Some(rtt);
                 entry.rtt_reported_at = Some(now);
-                if events
-                    .try_send(PoolEvent {
-                        id: id.clone(),
-                        event: ConnectionEvent::Rtt(rtt),
-                        readiness: entry.readiness.clone(),
-                    })
-                    .is_err()
-                {
-                    return;
-                }
+                delivery
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .rtt(&entry.readiness, rtt);
             }
         }
-
         for id in failed {
-            if let Some(entry) = entries.remove(&id) {
-                router.release(&id, &entry.local_ufrag, entry.remote_addr);
-                if events
-                    .try_send(PoolEvent {
-                        id,
-                        event: ConnectionEvent::Failed,
-                        readiness: entry.readiness.clone(),
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
+            retire_entry(&id, &mut entries, &mut router, &delivery);
         }
     }
 }
@@ -379,6 +544,7 @@ impl<K: Eq + Hash + Clone> Router<K> {
 mod routing_tests {
     use super::*;
     use nethernet::connection::IceMode;
+    use nethernet::sans::Sans;
     use nethernet::session::Session;
     use std::collections::VecDeque;
 
@@ -618,6 +784,7 @@ mod routing_tests {
         let mut ready = HashMap::new();
         let mut received = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
+        let explicitly_retired = std::cell::Cell::new(false);
         let mut buffer = [0; 65536];
         // Socket delivery is real; only this test's finite scheduling loop is caller-driven.
         let mut drive = |pool: &mut SessionPool<u8>,
@@ -667,14 +834,18 @@ mod routing_tests {
             } in events
             {
                 match event {
-                    ConnectionEvent::Ready(_) => {
+                    PoolUpdate::Ready(_) => {
                         ready.insert(id, readiness);
                     }
-                    ConnectionEvent::Message(_, data) => received.push((id, data.into_vec())),
-                    ConnectionEvent::Failed => panic!("shared-socket client failed"),
-                    ConnectionEvent::Rtt(_) => {}
+                    PoolUpdate::Failed if explicitly_retired.get() && id == 0 => {}
+                    PoolUpdate::Failed => panic!("shared-socket client failed"),
+                    PoolUpdate::Rtt(_) => {}
                 }
             }
+            while let Some((id, data)) = pool.recv(Channel::Reliable) {
+                received.push((id, data.into_vec()));
+            }
+            while pool.next_event().is_some() {}
             std::thread::yield_now();
         };
         while Instant::now() < deadline
@@ -685,19 +856,23 @@ mod routing_tests {
         assert_eq!(ready.len(), 2);
         assert!(peers.iter().all(|(_, peer, _)| peer.ready));
         // Actual Ready from another entry must not authorize delivery to this peer.
-        pool.send(
-            0,
-            ready.get(&1).unwrap().clone(),
-            Channel::Reliable,
-            Box::from(&b"foreign Ready"[..]),
+        assert!(
+            pool.send(
+                0,
+                ready.get(&1).unwrap().clone(),
+                Channel::Reliable,
+                &b"foreign Ready"[..],
+            )
+            .is_err()
         );
         for id in 0..2u8 {
             pool.send(
                 id,
                 ready.get(&id).unwrap().clone(),
                 Channel::Reliable,
-                vec![id; 20 * 1024].into_boxed_slice(),
-            );
+                vec![id; 20 * 1024],
+            )
+            .unwrap();
             peers[usize::from(id)]
                 .1
                 .connection
@@ -720,13 +895,15 @@ mod routing_tests {
         );
         assert_eq!(peers[0].2, vec![vec![0; 20 * 1024]]);
         assert_eq!(peers[1].2, vec![vec![1; 20 * 1024]]);
-        pool.remove(0);
+        explicitly_retired.set(true);
+        pool.remove(0, ready.get(&0).unwrap().clone());
         pool.send(
             1,
             ready.get(&1).unwrap().clone(),
             Channel::Reliable,
-            Box::from(&b"survivor"[..]),
-        );
+            &b"survivor"[..],
+        )
+        .unwrap();
         peers[1]
             .1
             .connection

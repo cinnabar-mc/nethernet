@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// Bounds retained actor commands independently of application-owned pending send futures.
-pub(crate) const COMMAND_CAPACITY: usize = 16;
+pub(crate) const COMMAND_CAPACITY: usize =
+    nethernet::protocol::constants::DEFAULT_COMMAND_CHANNEL_CAPACITY;
 
 pub(crate) enum Command {
     #[cfg(test)]

@@ -1,3 +1,4 @@
+mod delivery;
 mod pool;
 pub(crate) use pool::SessionPool;
 
@@ -8,7 +9,10 @@ use nethernet::protocol::Signal;
 use nethernet::sans::Sans;
 use nethernet::session::{Channel, SessionEvent, SessionOutput};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 pub(crate) enum ConnectionEvent {
@@ -20,23 +24,40 @@ pub(crate) enum ConnectionEvent {
 
 /// Identity of one actual pool entry, carried only by its Ready event.
 #[derive(Clone, Debug)]
-pub(crate) struct Readiness(Arc<()>);
+pub(crate) struct Readiness(Arc<AtomicBool>);
 
 impl Readiness {
     /// Creates the identity of this concrete pool allocation before its original Add acknowledgement.
     pub(crate) fn new() -> Self {
-        Self(Arc::new(()))
+        Self(Arc::new(AtomicBool::new(false)))
     }
 
     /// Matches an original entry, so reused peer ids and other pools cannot accept stale sends.
     pub(crate) fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
+    /// Seals this exact allocation without waiting for command queue capacity.
+    pub(crate) fn retire(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// A retired entry never acquires authority again, even if its descriptive id is reused.
+    pub(crate) fn is_retired(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PoolUpdate {
+    Ready(Option<SocketAddr>),
+    Rtt(Duration),
+    Failed,
 }
 
 pub(crate) struct PoolEvent<K> {
     pub id: K,
-    pub event: ConnectionEvent,
+    pub event: PoolUpdate,
     pub readiness: Readiness,
 }
 

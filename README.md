@@ -115,9 +115,9 @@ carrier preserves accepted messages before its terminal event.
 `TurnStreamTarget`s under one caller deadline, credential expiry and endpoint
 limit. TLS targets retain the original hostname for verification. Source address
 selection belongs to the connected stream; it is independent of the UDP socket.
-The existing `resolve_ice_servers` API remains UDP-only. These core and resolution
-APIs do not make the current runtime adapters accept stream reservations; they
-reject them until a caller supplies stream I/O.
+The existing `resolve_ice_servers` API remains UDP-only. The Bevy adapter supplies
+stream I/O through its configured TURN targets. The Tokio adapter currently
+rejects stream reservations until its caller supplies stream I/O.
 
 ### Usage
 

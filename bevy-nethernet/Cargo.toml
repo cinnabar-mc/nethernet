@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rtc.workspace = true
 bytes.workspace = true
 async-channel = "2.5.0"
 bevy_app = { version = "0.20.0", default-features = false }
@@ -24,7 +25,6 @@ tls = ["dep:rustls", "dep:rustls-platform-verifier"]
 
 [dev-dependencies]
 rtc-turn.workspace = true
-rtc.workspace = true
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 

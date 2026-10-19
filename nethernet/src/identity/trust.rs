@@ -149,9 +149,29 @@ pub fn verify_answer(
     trust: Option<&TokenTrust>,
     now: SystemTime,
 ) -> Result<Option<Claims>> {
-    trust
-        .map(|trust| validate_assertion(sdp, trust, now))
-        .transpose()
+    verify_answer_with_policy(sdp, trust, false, now)
+}
+
+/// Applies explicit missing-answer policy while always authenticating a present identity.
+/// Without configured trust this preserves the original unchecked-answer behavior.
+/// This verifies identity only; the connection still parses and admits the SDP description.
+///
+/// # Errors
+/// Rejects present malformed/untrusted assertions or invalid fingerprint proofs;
+/// a missing assertion is rejected unless explicitly allowed or trust is absent.
+pub fn verify_answer_with_policy(
+    sdp: &str,
+    trust: Option<&TokenTrust>,
+    allow_anonymous: bool,
+    now: SystemTime,
+) -> Result<Option<Claims>> {
+    let Some(trust) = trust else {
+        return Ok(None);
+    };
+    if allow_anonymous && crate::identity::envelope::sdp_identity_value(sdp).is_none() {
+        return Ok(None);
+    }
+    validate_assertion(sdp, trust, now).map(Some)
 }
 
 #[cfg(test)]
@@ -178,6 +198,31 @@ mod tests {
              a=fingerprint:sha-256 AB:CD\r\n",
             identity
         )
+    }
+
+    /// Normalized empty/valueless attributes are present and must never enter missing-only admission.
+    #[test]
+    fn anonymous_answer_policy_rejects_normalized_present_identity_attributes() {
+        let absent = "v=0\r\na=fingerprint:sha-256 AB:CD\r\n";
+        assert!(matches!(
+            verify_answer_with_policy(absent, Some(&TokenTrust::Any), true, NOW),
+            Ok(None)
+        ));
+        assert!(matches!(
+            verify_answer(absent, Some(&TokenTrust::Any), NOW),
+            Err(IdentityError::Missing)
+        ));
+        for attribute in ["a=identity\r\n", "a=identity \t\r\n", "a= identity:\t\r\n"] {
+            assert!(
+                verify_answer_with_policy(
+                    &format!("{absent}{attribute}"),
+                    Some(&TokenTrust::Any),
+                    true,
+                    NOW
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

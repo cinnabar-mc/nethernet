@@ -10,7 +10,7 @@ use crate::transport::{ConnectionConfig, local_bind_addr};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use nethernet::connection::{Connection as SansConnection, IceMode};
-use nethernet::identity::{TokenTrust, verify_answer};
+use nethernet::identity::{TokenTrust, verify_answer_with_policy};
 use nethernet::phase::{Connecting, Retired};
 use nethernet::session::Session as SansSession;
 use rand::Rng;
@@ -36,9 +36,10 @@ pub(crate) fn parse_error_code(data: &str) -> SignalErrorCode {
 fn check_answer(
     answer: &Signal,
     server_trust: Option<&TokenTrust>,
+    allow_anonymous: bool,
     now: SystemTime,
 ) -> std::result::Result<(), (Option<SignalErrorCode>, NetherError)> {
-    verify_answer(&answer.data, server_trust, now)
+    verify_answer_with_policy(&answer.data, server_trust, allow_anonymous, now)
         .map(|_| ())
         .map_err(|e| {
             (
@@ -284,6 +285,7 @@ impl NetherClient {
             connection_id,
             remote_network_id,
             config.server_trust.as_ref(),
+            config.allow_anonymous_answers,
             config.timeouts.negotiation,
             deadline,
         )
@@ -518,7 +520,7 @@ mod tests {
 
     #[test]
     fn without_a_server_trust_an_unsigned_answer_is_accepted() {
-        assert!(check_answer(&answer(ANSWER.to_string()), None, SystemTime::now()).is_ok());
+        assert!(check_answer(&answer(ANSWER.to_string()), None, false, SystemTime::now()).is_ok());
     }
 
     #[test]
@@ -526,6 +528,7 @@ mod tests {
         let (code, error) = check_answer(
             &answer(ANSWER.to_string()),
             Some(&TokenTrust::Any),
+            false,
             SystemTime::now(),
         )
         .unwrap_err();
@@ -542,7 +545,7 @@ mod tests {
             .augment(ANSWER, now)
             .unwrap();
 
-        assert!(check_answer(&answer(signed), Some(&TokenTrust::Any), now).is_ok());
+        assert!(check_answer(&answer(signed), Some(&TokenTrust::Any), false, now).is_ok());
     }
 
     /// Exercises a trickled offer answered with inline candidates and no candidate signal.
@@ -669,3 +672,6 @@ mod tests {
         server.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod anonymous_answer_tests;

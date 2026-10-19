@@ -44,6 +44,7 @@ async fn peer_checks_before_handoff(mode: IceMode, answer_before_check: bool) {
         1,
         "peer",
         None,
+        false,
         Duration::from_secs(5),
         Instant::now() + Duration::from_secs(5),
     ));

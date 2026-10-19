@@ -19,6 +19,7 @@ serde.workspace = true
 url.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+rustls-platform-verifier = "0.7"
 tokio-rustls.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -28,7 +29,11 @@ rustls-pemfile.workspace = true
 p384.workspace = true
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 rtc-turn.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = "0.3.23"
 serde_json = "1.0.151"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

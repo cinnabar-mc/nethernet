@@ -28,6 +28,7 @@ struct Payload<K> {
     readiness: Readiness,
     bytes: Box<[u8]>,
     visible: bool,
+    ordinal: u64,
 }
 
 /// Metadata slots are reserved with each entry; payloads remain charged until public receive.
@@ -39,6 +40,8 @@ pub(super) struct Delivery<K> {
     unreliable: VecDeque<Payload<K>>,
     packets: usize,
     bytes: usize,
+    // Admission order only; reset after both original payload queues drain.
+    next_payload: u64,
 }
 
 impl<K: Clone + Eq> Delivery<K> {
@@ -51,6 +54,7 @@ impl<K: Clone + Eq> Delivery<K> {
             unreliable: VecDeque::new(),
             packets: 0,
             bytes: 0,
+            next_payload: 0,
         }
     }
 
@@ -176,12 +180,17 @@ impl<K: Clone + Eq> Delivery<K> {
         {
             return false;
         }
+        let Some(next_payload) = self.next_payload.checked_add(1) else {
+            return false;
+        };
         let payload = Payload {
             id: entry.id.clone(),
             readiness: readiness.clone(),
             bytes,
             visible: false,
+            ordinal: self.next_payload,
         };
+        self.next_payload = next_payload;
         entry.unpublished += 1;
         self.packets += 1;
         self.bytes = total_bytes;
@@ -255,15 +264,25 @@ impl<K: Clone + Eq> Delivery<K> {
         }
     }
 
-    /// Publishes one finite frame of existing outcomes without moving retained payload bodies.
-    pub(super) fn advance(&mut self, output: &mut Vec<PoolEvent<K>>, mut budget: usize) {
+    /// Prioritizes already eligible mandatory records without overtaking their own accepted prefix.
+    fn advance_lifecycle(&mut self, output: &mut Vec<PoolEvent<K>>, budget: &mut usize) {
         for record in &mut self.lifecycle {
-            if budget == 0 {
+            if record.visible {
+                continue;
+            }
+            if *budget == 0 {
                 return;
             }
-            if !record.visible && matches!(record.event.event, PoolUpdate::Ready(_)) {
+            let eligible = match record.event.event {
+                PoolUpdate::Ready(_) => true,
+                PoolUpdate::Failed => self.entries.iter().any(|entry| {
+                    entry.readiness.matches(&record.event.readiness) && entry.unpublished == 0
+                }),
+                PoolUpdate::Rtt(_) => false,
+            };
+            if eligible {
                 record.visible = true;
-                budget -= 1;
+                *budget -= 1;
                 output.push(PoolEvent {
                     id: record.event.id.clone(),
                     event: record.event.event,
@@ -271,11 +290,38 @@ impl<K: Clone + Eq> Delivery<K> {
                 });
             }
         }
-        for payload in self.reliable.iter_mut().chain(&mut self.unreliable) {
-            if budget == 0 {
-                return;
-            }
-            if !payload.visible {
+    }
+
+    /// Publishes finite original outcomes; mandatory records and both channels retain progress.
+    pub(super) fn advance(&mut self, output: &mut Vec<PoolEvent<K>>, mut budget: usize) {
+        self.advance_lifecycle(output, &mut budget);
+        if budget == 0 {
+            return;
+        }
+        {
+            let mut reliable = self
+                .reliable
+                .iter_mut()
+                .filter(|payload| !payload.visible)
+                .peekable();
+            let mut unreliable = self
+                .unreliable
+                .iter_mut()
+                .filter(|payload| !payload.visible)
+                .peekable();
+            while budget != 0 {
+                let from_reliable = match (reliable.peek(), unreliable.peek()) {
+                    (Some(first), Some(second)) => first.ordinal < second.ordinal,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                let payload = if from_reliable {
+                    reliable.next()
+                } else {
+                    unreliable.next()
+                }
+                .expect("original unexposed payload observed");
                 payload.visible = true;
                 budget -= 1;
                 if let Some(entry) = self
@@ -287,25 +333,7 @@ impl<K: Clone + Eq> Delivery<K> {
                 }
             }
         }
-        for record in &mut self.lifecycle {
-            if budget == 0 {
-                return;
-            }
-            if !record.visible
-                && matches!(record.event.event, PoolUpdate::Failed)
-                && self.entries.iter().any(|entry| {
-                    entry.readiness.matches(&record.event.readiness) && entry.unpublished == 0
-                })
-            {
-                record.visible = true;
-                budget -= 1;
-                output.push(PoolEvent {
-                    id: record.event.id.clone(),
-                    event: record.event.event,
-                    readiness: record.event.readiness.clone(),
-                });
-            }
-        }
+        self.advance_lifecycle(output, &mut budget);
         for entry in &mut self.entries {
             if budget == 0 {
                 return;
@@ -367,6 +395,9 @@ impl<K: Clone + Eq> Delivery<K> {
         let payload = queue.pop_front()?;
         self.packets -= 1;
         self.bytes -= payload.bytes.len();
+        if self.reliable.is_empty() && self.unreliable.is_empty() {
+            self.next_payload = 0;
+        }
         Some((payload.id, payload.bytes))
     }
 

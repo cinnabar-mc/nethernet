@@ -58,18 +58,18 @@ fn rejected_delivery_does_not_reopen_during_retirement() {
         owner
             .push_event(ConnectionEvent::Message(
                 Channel::Reliable,
-                index.to_le_bytes().into(),
+                index.to_le_bytes().as_slice().into(),
             ))
             .unwrap();
     }
     let rejected = owner.push_event(ConnectionEvent::Message(
         Channel::Reliable,
-        b"rejected".into(),
+        b"rejected".as_slice().into(),
     ));
     let first = owner.poll_event();
     let successor = owner.push_event(ConnectionEvent::Message(
         Channel::Reliable,
-        b"successor".into(),
+        b"successor".as_slice().into(),
     ));
     let tail = owner.retire();
     drop(peer);

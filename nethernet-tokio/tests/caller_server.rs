@@ -158,3 +158,22 @@ async fn caller_server_rejects_unsigned_and_untrusted_offer_keys() {
     .await
     .expect("untrusted offer bypassed or stalled concrete accepting admission");
 }
+
+/// Anonymous offer admission does not replace the caller's explicit trust decision for present identities.
+#[tokio::test]
+async fn anonymous_caller_server_still_requires_offer_trust() {
+    let (server, _driver) =
+        CallerServerSignaling::new("server".into(), Default::default()).unwrap();
+    let identity = signing::identity("server");
+    assert!(matches!(
+        NetherServer::bind_with(
+            server,
+            ConnectionConfig {
+                allow_anonymous_offers: true,
+                ..signed(&identity)
+            },
+        )
+        .await,
+        Err(NetherError::InvalidState(_))
+    ));
+}

@@ -249,6 +249,13 @@ disables later caller-bridge offer admission. Existing HTTP and LAN policies
 remain unchanged. `ServerSignaling::signals()` is fallible so a duplicate caller
 listener fails synchronously before spawning transport work.
 
+Anonymous offers are disabled by default. `ConnectionConfig::allow_anonymous_offers`
+permits a missing SDP identity while retaining the required explicit `token_trust`;
+a present identity still passes token and fingerprint verification. An anonymous
+accepted offer supplies no authenticated player claims. Sans-I/O callers select
+this distinction with `OfferPolicy::with_anonymous_offers`. HTTP's independent
+signaler policy is unchanged.
+
 Use the same `SignalRequest`, original deadlines and delivery evidence as client
 bridges. Incoming `try_deliver` commits immediately; `prepare_delivery_before`
 retains a cancel-safe capacity wait and checks the original deadline at actual

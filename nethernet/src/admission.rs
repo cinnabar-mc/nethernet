@@ -1,6 +1,7 @@
 //! Server-side admission of an incoming offer: identity check, answer creation and candidate inference.
 use crate::connection::{Connection, ConnectionInput, IceMode};
 use crate::error::{ProtocolError, SignalErrorCode};
+use crate::identity::envelope::sdp_identity_value;
 use crate::identity::error::IdentityError;
 use crate::identity::{PlayerInfo, SdpIdentity, TokenTrust, validate_sdp};
 use crate::protocol::Signal;
@@ -48,6 +49,7 @@ impl AdmissionError {
 pub struct OfferPolicy<'a> {
     identity: Option<&'a dyn SdpIdentity>,
     token_trust: Option<&'a TokenTrust>,
+    allow_anonymous_offers: bool,
     infer_peer_candidates: bool,
     ice_mode: IceMode,
     establish_deadline: Option<Duration>,
@@ -58,6 +60,7 @@ impl std::fmt::Debug for OfferPolicy<'_> {
         f.debug_struct("OfferPolicy")
             .field("identity", &self.identity.is_some())
             .field("token_trust", &self.token_trust.is_some())
+            .field("allow_anonymous_offers", &self.allow_anonymous_offers)
             .field("infer_peer_candidates", &self.infer_peer_candidates)
             .field("ice_mode", &self.ice_mode)
             .field("establish_deadline", &self.establish_deadline)
@@ -70,6 +73,7 @@ impl<'a> OfferPolicy<'a> {
         Self {
             identity: None,
             token_trust: None,
+            allow_anonymous_offers: false,
             infer_peer_candidates: false,
             ice_mode,
             establish_deadline: None,
@@ -93,6 +97,13 @@ impl<'a> OfferPolicy<'a> {
         self
     }
 
+    /// Permits a missing offer identity without skipping validation of a present identity.
+    /// Applies only when token trust is configured; the default requires an identity.
+    pub fn with_anonymous_offers(mut self, allow: bool) -> Self {
+        self.allow_anonymous_offers = allow;
+        self
+    }
+
     /// Adds reflexive candidates from the signaling source address when the offer has no routable host candidate.
     pub fn with_inferred_peer_candidates(mut self, infer: bool) -> Self {
         self.infer_peer_candidates = infer;
@@ -108,18 +119,7 @@ impl<'a> OfferPolicy<'a> {
     ) -> Result<Admitted<'a>, AdmissionError> {
         let (remote_description, remote_candidates) =
             Connection::parse_offer(offer).map_err(AdmissionError::Description)?;
-        let player = match self.token_trust {
-            Some(trust) => {
-                let claims =
-                    validate_sdp(&offer.data, trust, wall).map_err(AdmissionError::Untrusted)?;
-                Some(PlayerInfo::new(
-                    claims,
-                    offer.network_id.clone(),
-                    signaled_from,
-                ))
-            }
-            None => None,
-        };
+        let player = self.authenticate(offer, signaled_from, wall)?;
         Ok(Admitted {
             policy: *self,
             offer: offer.clone(),
@@ -129,6 +129,27 @@ impl<'a> OfferPolicy<'a> {
             player,
             wall,
         })
+    }
+
+    /// Uses the same token/fingerprint owner before allocation and after asynchronous gathering.
+    fn authenticate(
+        &self,
+        offer: &Signal,
+        signaled_from: Option<SocketAddr>,
+        wall: SystemTime,
+    ) -> Result<Option<PlayerInfo>, AdmissionError> {
+        let Some(trust) = self.token_trust else {
+            return Ok(None);
+        };
+        if self.allow_anonymous_offers && sdp_identity_value(&offer.data).is_none() {
+            return Ok(None);
+        }
+        let claims = validate_sdp(&offer.data, trust, wall).map_err(AdmissionError::Untrusted)?;
+        Ok(Some(PlayerInfo::new(
+            claims,
+            offer.network_id.clone(),
+            signaled_from,
+        )))
     }
 }
 
@@ -185,14 +206,10 @@ impl Admitted<'_> {
         wall: SystemTime,
         recheck: bool,
     ) -> Result<PreparedAnswer, AdmissionError> {
-        if recheck && let Some(trust) = self.policy.token_trust {
-            let claims =
-                validate_sdp(&self.offer.data, trust, wall).map_err(AdmissionError::Untrusted)?;
-            self.player = Some(PlayerInfo::new(
-                claims,
-                self.offer.network_id.clone(),
-                self.signaled_from,
-            ));
+        if recheck {
+            self.player = self
+                .policy
+                .authenticate(&self.offer, self.signaled_from, wall)?;
         }
         if let Some(within) = self.policy.establish_deadline {
             session.set_establish_deadline(within);
@@ -440,5 +457,119 @@ mod tests {
         );
         let (_retired, result) = answered.connection.close(now);
         result.unwrap();
+    }
+
+    /// Anonymous opt-in survives the same post-gather recheck without fabricating player claims.
+    #[test]
+    fn an_anonymous_offer_can_prepare_an_answer_only_when_opted_in() {
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let trust = TokenTrust::Any;
+        let offer = loopback_offer();
+        let admitted = OfferPolicy::new(IceMode::Full)
+            .with_token_trust(&trust)
+            .with_anonymous_offers(true)
+            .admit(&offer, None, wall)
+            .unwrap();
+        assert!(admitted.player().is_none());
+        let now = Instant::now();
+        let (mut session, description) = Session::new(loopback(40311), false, 11, now).unwrap();
+        let prepared = admitted
+            .prepare_answer(&mut session, description, now, wall)
+            .unwrap();
+        let answered = prepared.finish(session, now);
+        assert!(answered.player.is_none());
+        assert_eq!(answered.signals[0].signal_type, SignalType::Answer);
+        let (_retired, result) = answered.connection.close(now);
+        result.unwrap();
+    }
+
+    /// Opting in to missing identities still authenticates present tokens and exact fingerprints.
+    #[test]
+    fn anonymous_admission_keeps_present_identity_validation() {
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let identity = ServerIdentity::generate("fixture", wall).unwrap();
+        let mut offer = loopback_offer();
+        offer.data = identity.augment(&offer.data, wall).unwrap();
+        let trust = TokenTrust::Any;
+        let policy = OfferPolicy::new(IceMode::Full)
+            .with_token_trust(&trust)
+            .with_anonymous_offers(true);
+        let admitted = policy.admit(&offer, None, wall).unwrap();
+        let player = admitted
+            .player()
+            .expect("signed offer keeps its verified player");
+        assert_eq!(player.claims.issuer(), Some("fixture"));
+        assert_eq!(player.network_id, offer.network_id);
+
+        let (description, _) = Connection::parse_offer(&offer).unwrap();
+        let mut altered = offer.clone();
+        altered.data = altered.data.replace(&description.fingerprint.1, "00");
+        assert!(matches!(
+            policy.admit(&altered, None, wall),
+            Err(AdmissionError::Untrusted(
+                IdentityError::FingerprintMismatch
+            ))
+        ));
+        let untrusted = TokenTrust::Minecraft(Default::default());
+        assert!(matches!(
+            OfferPolicy::new(IceMode::Full)
+                .with_token_trust(&untrusted)
+                .with_anonymous_offers(true)
+                .admit(&offer, None, wall),
+            Err(AdmissionError::Untrusted(_))
+        ));
+        for attribute in ["a=identity:\r\n", "a=identity\r\n"] {
+            let mut malformed = loopback_offer();
+            malformed.data = malformed.data.replacen("m=", &format!("{attribute}m="), 1);
+            assert!(matches!(
+                policy.admit(&malformed, None, wall),
+                Err(AdmissionError::Untrusted(_))
+            ));
+        }
+    }
+
+    /// Parser-normalized empty identity attributes still require authentication under anonymous opt-in.
+    #[test]
+    fn anonymous_admission_rejects_parser_normalized_empty_identity() {
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let trust = TokenTrust::Any;
+        let policy = OfferPolicy::new(IceMode::Full)
+            .with_token_trust(&trust)
+            .with_anonymous_offers(true);
+        assert!(
+            policy
+                .admit(&loopback_offer(), None, wall)
+                .unwrap()
+                .player()
+                .is_none()
+        );
+
+        for attribute in [
+            "a=identity \t\r\n",
+            "a= \tidentity\r\n",
+            "a=\tidentity: \t\r\n",
+            "a=identity\u{2003}\r\n",
+        ] {
+            let mut offer = loopback_offer();
+            offer.data = offer.data.replacen("m=", &format!("{attribute}m="), 1);
+            let parsed = rtc::sdp::description::session::SessionDescription::unmarshal(
+                &mut std::io::Cursor::new(&offer.data),
+            )
+            .unwrap();
+            let identity = parsed
+                .attributes
+                .iter()
+                .find(|value| value.key == "identity")
+                .expect("the selected SDP parser recognizes a present identity attribute");
+            assert!(identity.value.as_deref().is_none_or(str::is_empty));
+            Connection::parse_offer(&offer).unwrap();
+            assert!(
+                matches!(
+                    policy.admit(&offer, None, wall),
+                    Err(AdmissionError::Untrusted(_))
+                ),
+                "a present malformed identity must not become anonymous after SDP normalization"
+            );
+        }
     }
 }

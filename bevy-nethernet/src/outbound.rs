@@ -452,7 +452,7 @@ impl Outbound {
         result
     }
 
-    /// Password renewal preserves the allocation username and original absolute credential expiry.
+    /// Renews the same live allocation with fresh credentials under its acknowledged lease.
     pub(crate) fn update_turn_credentials(
         &mut self,
         server: SocketAddr,

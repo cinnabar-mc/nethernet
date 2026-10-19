@@ -49,13 +49,13 @@ async fn replacing_answer_identity_changes_later_offers_and_preserves_accepted_p
         let renewed = Arc::downgrade(&replacement);
         let mut server = NetherServer::bind_with(accepting, ConnectionConfig {
             identity: Some(initial), token_trust: Some(TokenTrust::Any),
-            server_ice: Some(ServerIceConfig { ice: Default::default(), bind_addr: bind }),
+            server_ice: Some(ServerIceConfig { turn_streams: Vec::new(), turn_tls: None, ice: Default::default(), bind_addr: bind }),
             max_sessions: 2, ..Default::default()
         }).await.unwrap();
         let client = ConnectionConfig {
             identity: Some(Arc::new(ServerIdentity::generate("client.fixture.invalid", SystemTime::now()).unwrap())),
             server_trust: Some(TokenTrust::Any),
-            client_ice: Some(ClientIceConfig { ice: Default::default(), bind_addr: Some(bind) }),
+            client_ice: Some(ClientIceConfig { turn_streams: Vec::new(), turn_tls: None, ice: Default::default(), bind_addr: Some(bind) }),
             ..Default::default()
         };
         let stop = CancellationToken::new();

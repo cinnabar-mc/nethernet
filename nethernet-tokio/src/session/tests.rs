@@ -736,3 +736,28 @@ async fn rtt_observation_does_not_block_synchronous_retirement() {
         "RTT observation blocked synchronous retirement"
     );
 }
+
+#[tokio::test]
+async fn direct_selected_actor_needs_no_stream_target_to_keep_its_original_transport() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let ((sender, _sender_rx), (receiver, mut reliable, _unreliable)) = connected_pair().await;
+        sender
+            .update_turn_streams_before(Vec::new(), transport_now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        sender
+            .send(Bytes::from_static(
+                b"same direct actor after no stream work",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            reliable.recv().await.unwrap().unwrap(),
+            "same direct actor after no stream work"
+        );
+        sender.sender().close().await.unwrap();
+        receiver.sender().close().await.unwrap();
+    })
+    .await
+    .expect("finite direct selected renewal control stalled");
+}

@@ -3,6 +3,8 @@ pub(crate) mod command;
 pub(crate) mod guard;
 mod observation;
 pub(crate) mod outgoing;
+#[cfg(test)]
+mod pressure_observation;
 mod receive;
 mod send;
 mod server;
@@ -16,6 +18,7 @@ pub(crate) use server::{ServerLease, ServerRetirement};
 use crate::addr::Addr;
 use crate::error::{NetherError, Result};
 use crate::signaling::ClientSignaling;
+use crate::transport::ice_io::IceIo;
 use bytes::Bytes;
 use futures::future::{BoxFuture, pending};
 use guard::{ConnectionGuard, transport_now};
@@ -32,6 +35,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+#[cfg(test)]
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -63,6 +67,8 @@ pub struct SessionSender {
     remote_addr: Addr,
     command_tx: mpsc::Sender<Command>,
     rtt: RttObservation,
+    #[cfg(test)]
+    pressure: pressure_observation::Observation,
     close_token: CancellationToken,
     _guard: Arc<TaskGuard>,
 }
@@ -129,7 +135,7 @@ pub struct AcceptedSession<S: Phase = Established> {
 impl Session<Connecting> {
     #[cfg(test)]
     pub(crate) fn spawn(
-        socket: Arc<UdpSocket>,
+        socket: impl Into<IceIo>,
         connection: SansConnection,
         local: Addr,
         remote: Addr,
@@ -144,7 +150,7 @@ impl Session<Connecting> {
 
     /// Retains the concrete signaling owner only when late outgoing candidates can be produced.
     pub(crate) fn spawn_with_signaling(
-        socket: Arc<UdpSocket>,
+        socket: impl Into<IceIo>,
         connection: SansConnection,
         local: Addr,
         remote: Addr,
@@ -173,7 +179,7 @@ impl Session<Connecting> {
     /// Moves the original server reservation into the same session/receiver lifetime.
     #[cfg(test)]
     pub(crate) fn spawn_for_server(
-        socket: Arc<UdpSocket>,
+        socket: impl Into<IceIo>,
         connection: SansConnection,
         local: Addr,
         remote: Addr,
@@ -189,7 +195,7 @@ impl Session<Connecting> {
 
     /// Drives configured accepting ICE, gating late candidates behind original answer dispatch.
     pub(crate) fn spawn_for_server_with_signaling(
-        socket: Arc<UdpSocket>,
+        socket: impl Into<IceIo>,
         connection: SansConnection,
         local: Addr,
         remote: Addr,
@@ -213,7 +219,7 @@ impl Session<Connecting> {
 
     /// Constructs one existing actor without a cancellation gap before installing its owned guard.
     fn spawn_owned(
-        socket: Arc<UdpSocket>,
+        socket: impl Into<IceIo>,
         connection: SansConnection,
         local: Addr,
         remote: Addr,
@@ -231,9 +237,11 @@ impl Session<Connecting> {
         let (ready_tx, ready_rx) = oneshot::channel();
         let close_token = CancellationToken::new();
         let rtt = RttObservation::new();
+        #[cfg(test)]
+        let pressure = pressure_observation::Observation::default();
 
         let task = Self::drive(
-            socket,
+            socket.into(),
             connection,
             command_rx,
             packet_tx,
@@ -243,6 +251,8 @@ impl Session<Connecting> {
             rtt.clone(),
             signaling,
             server.clone(),
+            #[cfg(test)]
+            pressure.clone(),
         );
 
         let guard = Arc::new(TaskGuard {
@@ -257,6 +267,8 @@ impl Session<Connecting> {
                 remote_addr: remote,
                 command_tx,
                 rtt,
+                #[cfg(test)]
+                pressure,
                 close_token,
                 _guard: guard.clone(),
             }),
@@ -281,7 +293,7 @@ impl Session<Connecting> {
 
     #[allow(clippy::too_many_arguments)]
     fn drive(
-        socket: Arc<UdpSocket>,
+        io: IceIo,
         connection: SansConnection,
         mut commands: mpsc::Receiver<Command>,
         packet_tx: Producer,
@@ -291,15 +303,15 @@ impl Session<Connecting> {
         rtt_observation: RttObservation,
         signaling: Option<CandidateSignaling>,
         server: Option<Arc<ServerLease>>,
+        #[cfg(test)] pressure: pressure_observation::Observation,
     ) -> JoinHandle<()> {
-        let mut guard = ConnectionGuard::new(connection, socket).with_server_capacity(server);
+        let mut guard = ConnectionGuard::new(connection, io).with_server_capacity(server);
         let driver_closed = close_token.clone().drop_guard();
         let rtt_publisher = RttPublisher(rtt_observation);
         tokio::spawn(async move {
             let _driver_closed = driver_closed;
             let rtt_observation = rtt_publisher;
-            let (connection, socket) = guard.parts();
-            let mut buf = vec![0u8; 65536];
+            let (connection, io) = guard.parts();
             let mut wake = transport_now();
             let mut outgoing: Option<BoxFuture<'static, Result<()>>> = None;
             let mut remote_addr = None;
@@ -311,6 +323,7 @@ impl Session<Connecting> {
                 .as_ref()
                 .is_none_or(|signaling| signaling.enabled.is_none());
             let terminal = 'drive: loop {
+                let admit_commands = !io.blocked(connection.selected_turn_stream());
                 tokio::select! {
                     biased;
 
@@ -328,20 +341,23 @@ impl Session<Connecting> {
                         outgoing = None;
                         if result.is_err() { break Terminal::Transport; }
                     },
-                    received = socket.recv_from(&mut buf) => match received {
-                        Ok((n, from)) => {
-                            let now = transport_now();
-                            let input = ConnectionInput::Packet(buf[..n].into(), from, now);
-                            if let Err(e) = connection.handle(input) {
-                                tracing::debug!("packet handling error: {e}");
+                    received = io.next() => match received {
+                        Ok(event) => {
+                            if let Some(input) = event.connection(transport_now())
+                                && let Err(error) = connection.handle(input) {
+                                tracing::debug!(%error, "transport input rejected");
                             }
                         }
-                        Err(e) => tracing::debug!("recv error: {e}"),
+                        Err(error) => tracing::debug!(%error, "UDP receive error"),
                     },
-                    command = commands.recv() => match command {
+                    command = commands.recv(), if admit_commands => match command {
                         #[cfg(test)]
                         Some(Command::QueuedCommands(reply)) => {
                             let _ = reply.send(commands.len());
+                        }
+                        #[cfg(test)]
+                        Some(Command::SelectedTurnStream(reply)) => {
+                            let _ = reply.send(connection.selected_turn_stream());
                         }
                         Some(Command::Send(channel, data, deadline, reply)) => {
                             let now = transport_now();
@@ -383,18 +399,53 @@ impl Session<Connecting> {
                             let result = connection.update_turn_credentials(server, credentials, transport_now()).map_err(NetherError::from);
                             let _ = reply.send(result);
                         }
+                        Some(Command::TurnStreamCredentials(targets, deadline, reply)) => {
+                            let now = transport_now();
+                            let result = if now >= deadline {
+                                Err(NetherError::Timeout)
+                            } else if reply.is_closed() {
+                                Err(NetherError::ConnectionClosed)
+                            } else if targets.len() > nethernet::session::MAX_ICE_SERVERS {
+                                Err(NetherError::Ice("TURN replacement target limit exceeded".into()))
+                            } else if let Some(route) = connection.selected_turn_stream() {
+                                io.selected_credentials(targets, route, now).and_then(|credentials|
+                                    connection.update_turn_stream_credentials(route, credentials, now).map_err(NetherError::from))
+                            } else { Ok(()) };
+                            let _ = reply.send(result);
+                        }
                         None => break Terminal::Eof,
                     },
                 }
 
-                while let Some(output) = connection.poll() {
+                #[cfg(test)]
+                pressure.record(
+                    connection.pending_output_usage(),
+                    io.kernel_blocked(connection.selected_turn_stream()),
+                );
+                let usage = connection.pending_output_usage();
+                if usage.entries > PACKET_CHANNEL_CAPACITY
+                    || usage.bytes > receive::MAX_ACCEPTED_BYTES
+                {
+                    break Terminal::Capacity;
+                }
+                while !io.blocked(connection.selected_turn_stream()) {
+                    let Some(output) = connection.poll() else {
+                        break;
+                    };
                     match output {
                         SessionOutput::Send(data, to) => {
-                            if let Err(e) = socket.send_to(&data, to).await {
+                            if let Err(e) = io.send_datagram(&data, to).await {
                                 tracing::debug!("send_to error: {e}");
                             }
                         }
-                        SessionOutput::SendStream(..) => break 'drive Terminal::Transport,
+                        SessionOutput::SendStream(data, route) => {
+                            if io
+                                .send_stream(data, route, connection.selected_turn_stream())
+                                .is_err()
+                            {
+                                break 'drive Terminal::Transport;
+                            }
+                        }
                         SessionOutput::Event(SessionEvent::Ready) => {
                             remote_addr = connection.remote_addr();
                             if let Some(tx) = ready_tx.take() {
@@ -424,6 +475,11 @@ impl Session<Connecting> {
                     }
                 }
 
+                #[cfg(test)]
+                pressure.record(
+                    connection.pending_output_usage(),
+                    io.kernel_blocked(connection.selected_turn_stream()),
+                );
                 if outgoing.is_none()
                     && candidates_enabled
                     && let Some(signaling) = &signaling
@@ -442,6 +498,8 @@ impl Session<Connecting> {
                     .publish(rtt.filter(|sample| !sample.is_zero()));
             };
             rtt_observation.0.retire();
+            let terminal =
+                drain_retired_prefix(connection, io, &packet_tx, &unreliable_tx, terminal);
             packet_tx.finish(terminal);
             unreliable_tx.finish(terminal);
             close_token.cancel();
@@ -455,6 +513,41 @@ impl Session<Connecting> {
             _phase: PhantomData,
         }
     }
+}
+
+/// Preserves the original accepted prefix in its existing final owner before reporting retirement.
+fn drain_retired_prefix(
+    connection: &mut guard::DrivenConnection,
+    io: &mut IceIo,
+    reliable: &Producer,
+    unreliable: &Producer,
+    mut terminal: Terminal,
+) -> Terminal {
+    let Some(mut retired) = connection.retire(transport_now()) else {
+        return terminal;
+    };
+    let mut reliable_open = true;
+    while let Some(output) = retired.poll() {
+        match output {
+            SessionOutput::Message(Channel::Reliable, data) if reliable_open => {
+                if let Err(error) = reliable.push(Bytes::from(data)) {
+                    reliable_open = false;
+                    if matches!(terminal, Terminal::Eof) {
+                        terminal = match error {
+                            AdmissionError::Full => Terminal::Capacity,
+                            AdmissionError::Closed => Terminal::Transport,
+                        };
+                    }
+                }
+            }
+            SessionOutput::Message(Channel::Reliable, _) => {}
+            SessionOutput::Message(Channel::Unreliable, data) => {
+                let _ = unreliable.push(Bytes::from(data));
+            }
+            output => io.best_effort(output),
+        }
+    }
+    terminal
 }
 
 impl<S: Phase> Session<S> {
@@ -570,6 +663,17 @@ impl Session<Established> {
     pub fn sender(&self) -> SessionSender {
         self.handle().clone()
     }
+    /// Refreshes this actor's selected stream from exactly one matching original target.
+    pub async fn update_turn_streams_before(
+        &self,
+        targets: Vec<nethernet::session::TurnStreamTarget>,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.handle()
+            .update_turn_streams_before(targets, deadline)
+            .await
+    }
+
     /// Sends through the established capability while retaining unique lifecycle ownership.
     pub async fn send(&self, data: Bytes) -> Result<()> {
         self.handle().send(data).await
@@ -625,7 +729,61 @@ impl<S: Live> AcceptedSession<S> {
     }
 }
 
+#[cfg(test)]
+impl Session<Retired> {
+    /// Joins the same original actor after the fixture has dropped its other owned capabilities.
+    pub(crate) async fn join_original_actor(self) {
+        let handle = self.into_handle();
+        let mut guard = Arc::try_unwrap(handle._guard)
+            .unwrap_or_else(|_| panic!("fixture retained another original actor capability"));
+        (&mut guard.task).await.expect("original actor panicked");
+    }
+}
+
 impl SessionSender {
+    /// Independent read-only fixture observation remains available while ordinary commands are gated.
+    #[cfg(test)]
+    pub(crate) fn pressure_observation(&self) -> pressure_observation::Observation {
+        self.pressure.clone()
+    }
+
+    /// Refreshes only the same actual selected stream, under one original admission cutoff.
+    /// Direct/UDP selection needs no stream mutation. Missing or ambiguous selected-target
+    /// replacements fail; this never reconnects. Success means local core admission, not a
+    /// remote Refresh ACK. Canceling an unadmitted wait retracts it; admitted work stays owned.
+    pub async fn update_turn_streams_before(
+        &self,
+        targets: Vec<nethernet::session::TurnStreamTarget>,
+        deadline: Instant,
+    ) -> Result<()> {
+        if targets.len() > nethernet::session::MAX_ICE_SERVERS {
+            return Err(NetherError::Ice(
+                "TURN replacement target limit exceeded".into(),
+            ));
+        }
+        let now = transport_now();
+        if now >= deadline {
+            return Err(NetherError::Timeout);
+        }
+        for target in &targets {
+            target
+                .validate(now)
+                .map_err(nethernet::error::ProtocolError::from)?;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.enqueue(
+            Command::TurnStreamCredentials(targets, deadline, reply_tx),
+            Some(deadline),
+        )
+        .await?;
+        tokio::select! {
+            biased;
+            _ = self.close_token.cancelled() => Err(NetherError::ConnectionClosed),
+            _ = tokio::time::sleep_until(deadline.into()) => Err(NetherError::Timeout),
+            result = reply_rx => result.map_err(|_| NetherError::ConnectionClosed)?,
+        }
+    }
+
     /// Replaces one TURN server's credential without opening a service client or changing its allocation.
     pub async fn update_turn_credentials(
         &self,

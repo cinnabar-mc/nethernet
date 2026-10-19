@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 /// Holds real service completion while the remote RTC peer checks the actually advertised candidate.
 async fn peer_checks_before_handoff(mode: IceMode, answer_before_check: bool) {
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let now = transport_now();
     let (client, description) = Session::new_with_ice(
@@ -35,8 +35,9 @@ async fn peer_checks_before_handoff(mode: IceMode, answer_before_check: bool) {
     .unwrap();
     let signaling = ClientSignaling::from(caller);
     let mut incoming = signaling.signals().unwrap();
+    let mut io = IceIo::from(client_socket.clone());
     let mut negotiation = Box::pin(exchange(
-        &client_socket,
+        &mut io,
         &mut client,
         &mut incoming,
         &signaling,
@@ -124,7 +125,7 @@ async fn peer_checks_before_handoff(mode: IceMode, answer_before_check: bool) {
         .expect("negotiation could not finish after the receipt and answer arrived");
     let (client, mut client_reliable, _client_unreliable, client_ready) =
         RuntimeSession::<nethernet::phase::Connecting>::spawn(
-            Arc::new(client_socket),
+            io,
             client,
             Addr::default(),
             Addr::default(),

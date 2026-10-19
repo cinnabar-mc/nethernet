@@ -284,6 +284,11 @@ impl<S: Phase> Connection<S> {
         self.session.selected_turn_stream()
     }
 
+    /// Reads usage from the same session FIFO without granting application or transport work.
+    pub fn pending_output_usage(&self) -> crate::session::OutputUsage {
+        self.session.pending_output_usage()
+    }
+
     pub fn connection_id(&self) -> u64 {
         self.connection_id
     }

@@ -80,6 +80,11 @@ pub struct ConnectionConfig {
     /// When set, an answer without a valid identity fails the dial.
     pub server_trust: Option<TokenTrust>,
 
+    /// Permits a missing server answer identity under the caller's explicit route policy.
+    /// Present identities must still pass configured token and fingerprint validation.
+    /// Defaults to false and is independent of unsigned server answer generation.
+    pub allow_anonymous_answers: bool,
+
     /// Adds candidates from the signaling source address when an offer has no routable host candidate.
     pub infer_peer_candidates: bool,
 
@@ -107,6 +112,7 @@ impl Default for ConnectionConfig {
             token_trust: None,
             allow_anonymous_offers: false,
             server_trust: None,
+            allow_anonymous_answers: false,
             infer_peer_candidates: true,
             max_pending: DEFAULT_MAX_PENDING,
             max_pending_per_network_id: DEFAULT_MAX_PENDING_PER_NETWORK_ID,
@@ -127,6 +133,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("token_trust", &self.token_trust.is_some())
             .field("allow_anonymous_offers", &self.allow_anonymous_offers)
             .field("server_trust", &self.server_trust.is_some())
+            .field("allow_anonymous_answers", &self.allow_anonymous_answers)
             .field("infer_peer_candidates", &self.infer_peer_candidates)
             .field("max_pending", &self.max_pending)
             .field(

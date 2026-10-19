@@ -669,3 +669,6 @@ mod tests {
         server.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod anonymous_answer_tests;

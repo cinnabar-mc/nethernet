@@ -66,10 +66,7 @@ impl Identity {
 
     /// Reads the first `a=identity` line, failing with `Missing` when there is none.
     pub fn from_sdp(sdp: &str) -> Result<Self> {
-        let value = sdp
-            .split(['\r', '\n'])
-            .find_map(|line| line.strip_prefix("a=identity:"))
-            .ok_or(IdentityError::Missing)?;
+        let value = sdp_identity_value(sdp).ok_or(IdentityError::Missing)?;
 
         Self::from_base64(value)
     }
@@ -87,6 +84,15 @@ impl Identity {
     pub fn to_base64(&self) -> Result<String> {
         Ok(STANDARD.encode(self.to_json()?))
     }
+}
+
+/// Preserves a present empty or valueless assertion so anonymous admission cannot hide malformed data.
+pub(crate) fn sdp_identity_value(sdp: &str) -> Option<&str> {
+    sdp.split(['\r', '\n'])
+        .find_map(|line| match line.strip_prefix("a=identity")? {
+            "" => Some(""),
+            value => value.strip_prefix(':'),
+        })
 }
 
 /// The `(algorithm, digest)` pairs of the `a=fingerprint` lines of `sdp`, in order.

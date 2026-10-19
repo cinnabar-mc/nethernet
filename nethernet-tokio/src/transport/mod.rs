@@ -71,6 +71,11 @@ pub struct ConnectionConfig {
     /// How the server authenticates offers; None skips validation.
     pub token_trust: Option<TokenTrust>,
 
+    /// Accepts offers without an identity when token trust is configured; false by default.
+    /// Present identities still undergo that trust and fingerprint validation.
+    /// Does not override an HTTP signaler's independent offer policy.
+    pub allow_anonymous_offers: bool,
+
     /// How the client authenticates the server's answer; None accepts any answer.
     /// When set, an answer without a valid identity fails the dial.
     pub server_trust: Option<TokenTrust>,
@@ -100,6 +105,7 @@ impl Default for ConnectionConfig {
             identity: None,
             allow_unsigned_answers: false,
             token_trust: None,
+            allow_anonymous_offers: false,
             server_trust: None,
             infer_peer_candidates: true,
             max_pending: DEFAULT_MAX_PENDING,
@@ -119,6 +125,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("identity", &self.identity.is_some())
             .field("allow_unsigned_answers", &self.allow_unsigned_answers)
             .field("token_trust", &self.token_trust.is_some())
+            .field("allow_anonymous_offers", &self.allow_anonymous_offers)
             .field("server_trust", &self.server_trust.is_some())
             .field("infer_peer_candidates", &self.infer_peer_candidates)
             .field("max_pending", &self.max_pending)

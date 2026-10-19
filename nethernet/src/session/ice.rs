@@ -561,6 +561,18 @@ impl IceLayer {
             .map(|(local, _)| local.base_addr())
     }
 
+    /// Observes the same selected relay owner used by routing; retired, direct and UDP paths return None.
+    pub fn selected_turn_stream(&self) -> Option<TurnStreamRoute> {
+        let (local, _) = self.agent.get_selected_candidate_pair()?;
+        if local.candidate_type() != CandidateType::Relay {
+            return None;
+        }
+        self.servers
+            .iter()
+            .find(|server| server.relay == Some(local.base_addr()))
+            .and_then(Server::stream_route)
+    }
+
     /// Detects expired or failed selected allocations instead of switching to a direct route.
     pub fn selected_route_failed(&self) -> bool {
         self.agent

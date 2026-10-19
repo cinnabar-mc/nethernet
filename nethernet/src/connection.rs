@@ -278,6 +278,12 @@ impl<S: Phase> Connection<S> {
         self.session.rtt()
     }
 
+    /// Observes the same selected live relay carrier without inferring a route from queued output.
+    /// Pending, direct, UDP and retired relay owners return None.
+    pub fn selected_turn_stream(&self) -> Option<crate::session::TurnStreamRoute> {
+        self.session.selected_turn_stream()
+    }
+
     pub fn connection_id(&self) -> u64 {
         self.connection_id
     }

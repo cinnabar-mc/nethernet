@@ -15,52 +15,6 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use turn::{PASSWORD, TurnPeer, USER};
 
-/// Earlier input validation preserves the original observable peer-construction failure.
-#[tokio::test]
-async fn configured_client_preserves_expired_credential_signal_classification() {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let (signaling, mut driver) = CallerSignaling::new(
-            "local-network".into(),
-            "authenticated-peer".into(),
-            Default::default(),
-        )
-        .unwrap();
-        let now = tokio::time::Instant::now().into_std();
-        let config = ConnectionConfig {
-            client_ice: Some(ClientIceConfig {
-                turn_streams: Vec::new(),
-                turn_tls: None,
-                bind_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-                ice: IceConfig {
-                    servers: vec![IceServer::Turn(
-                        SocketAddr::from((Ipv4Addr::LOCALHOST, 3478)),
-                        TurnCredentials::new(USER.into(), PASSWORD.into(), now).unwrap(),
-                    )],
-                    ..Default::default()
-                },
-            }),
-            ..Default::default()
-        };
-        let connecting = NetherClient::connect_with(signaling, "authenticated-peer".into(), config);
-        let service = async {
-            let request = driver.recv().await.unwrap();
-            let is_error = matches!(request.signal().signal_type, SignalType::Error);
-            let code = request.signal().data.parse::<u32>();
-            request.finish(Ok(SignalDelivery::ServiceAccepted));
-            (is_error, code)
-        };
-        let (connected, (is_error, code)) = tokio::join!(connecting, service);
-        drop(driver);
-        assert!(connected.is_err() && is_error);
-        assert_eq!(
-            code.unwrap(),
-            nethernet::error::SignalErrorCode::FailedToCreatePeerConnection as u32
-        );
-    })
-    .await
-    .expect("finite configured client rejection control stalled");
-}
-
 #[tokio::test]
 async fn configured_client_gathers_while_offering_and_releases_turn_on_cancellation() {
     for mode in [IceMode::Full, IceMode::Trickle] {

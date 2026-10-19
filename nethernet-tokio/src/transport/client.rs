@@ -547,6 +547,48 @@ mod tests {
     use super::*;
     use nethernet::identity::ServerIdentity;
 
+    /// Configured preflight retains the original failure classification before an offer exists.
+    #[tokio::test]
+    async fn configured_client_preserves_expired_credential_signal_classification() {
+        use nethernet::session::{IceConfig, IceServer, TurnCredentials};
+        let (caller, _driver) =
+            crate::CallerSignaling::new("local".into(), "peer".into(), Default::default()).unwrap();
+        let signaling = ClientSignaling::from(caller);
+        let now = transport_now();
+        let config = ConnectionConfig {
+            client_ice: Some(crate::ClientIceConfig {
+                turn_streams: Vec::new(),
+                turn_tls: None,
+                bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                ice: IceConfig {
+                    servers: vec![IceServer::Turn(
+                        "127.0.0.1:3478".parse().unwrap(),
+                        TurnCredentials::new(
+                            "original-user".into(),
+                            "original-password".into(),
+                            now,
+                        )
+                        .unwrap(),
+                    )],
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        let failure = tokio::time::timeout(
+            Duration::from_secs(5),
+            NetherClient::negotiate(&signaling, "peer", 1, config),
+        )
+        .await
+        .expect("finite configured client preflight stalled")
+        .err()
+        .expect("expired original credential constructed a session");
+        assert_eq!(
+            failure.0,
+            Some(SignalErrorCode::FailedToCreatePeerConnection)
+        );
+    }
+
     const ANSWER: &str = "v=0\r\n\
         m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
         a=fingerprint:sha-256 AB:CD\r\n";

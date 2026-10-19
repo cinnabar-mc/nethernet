@@ -122,6 +122,16 @@ impl IceIo {
                 .any(|(_, carrier)| carrier.route == Some(route) && carrier.blocked())
         })
     }
+    /// Read-only actual socket pressure observation, independent of actor command admission.
+    #[cfg(test)]
+    pub(crate) fn kernel_blocked(&self, selected: Option<TurnStreamRoute>) -> bool {
+        selected.is_some_and(|route| {
+            self.streams
+                .iter()
+                .any(|(_, carrier)| carrier.route == Some(route) && carrier.kernel_blocked())
+        })
+    }
+
     pub async fn next(&mut self) -> Result<IceEvent> {
         let deadline = self
             .streams

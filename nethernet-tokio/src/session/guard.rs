@@ -139,6 +139,15 @@ impl DrivenConnection {
         }
     }
 
+    /// Reads the original core FIFO without bypassing the actor's ownership.
+    #[cfg(test)]
+    pub fn pending_output_usage(&self) -> nethernet::session::OutputUsage {
+        match self.state.as_ref().expect("driver retains its core") {
+            ActiveConnection::Connecting(core) => core.pending_output_usage(),
+            ActiveConnection::Established(core) => core.pending_output_usage(),
+        }
+    }
+
     /// Reports the same engine-selected route without admitting transport work.
     pub fn remote_addr(&self) -> Option<SocketAddr> {
         match self.state.as_ref().expect("driver retains its core") {

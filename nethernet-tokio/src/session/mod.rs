@@ -3,6 +3,8 @@ pub(crate) mod command;
 pub(crate) mod guard;
 mod observation;
 pub(crate) mod outgoing;
+#[cfg(test)]
+mod pressure_observation;
 mod receive;
 mod send;
 mod server;
@@ -65,6 +67,8 @@ pub struct SessionSender {
     remote_addr: Addr,
     command_tx: mpsc::Sender<Command>,
     rtt: RttObservation,
+    #[cfg(test)]
+    pressure: pressure_observation::Observation,
     close_token: CancellationToken,
     _guard: Arc<TaskGuard>,
 }
@@ -233,6 +237,8 @@ impl Session<Connecting> {
         let (ready_tx, ready_rx) = oneshot::channel();
         let close_token = CancellationToken::new();
         let rtt = RttObservation::new();
+        #[cfg(test)]
+        let pressure = pressure_observation::Observation::default();
 
         let task = Self::drive(
             socket.into(),
@@ -245,6 +251,8 @@ impl Session<Connecting> {
             rtt.clone(),
             signaling,
             server.clone(),
+            #[cfg(test)]
+            pressure.clone(),
         );
 
         let guard = Arc::new(TaskGuard {
@@ -259,6 +267,8 @@ impl Session<Connecting> {
                 remote_addr: remote,
                 command_tx,
                 rtt,
+                #[cfg(test)]
+                pressure,
                 close_token,
                 _guard: guard.clone(),
             }),
@@ -293,6 +303,7 @@ impl Session<Connecting> {
         rtt_observation: RttObservation,
         signaling: Option<CandidateSignaling>,
         server: Option<Arc<ServerLease>>,
+        #[cfg(test)] pressure: pressure_observation::Observation,
     ) -> JoinHandle<()> {
         let mut guard = ConnectionGuard::new(connection, io).with_server_capacity(server);
         let driver_closed = close_token.clone().drop_guard();
@@ -406,6 +417,11 @@ impl Session<Connecting> {
                     },
                 }
 
+                #[cfg(test)]
+                pressure.record(
+                    connection.pending_output_usage(),
+                    io.kernel_blocked(connection.selected_turn_stream()),
+                );
                 while !io.blocked(connection.selected_turn_stream()) {
                     let Some(output) = connection.poll() else {
                         break;
@@ -453,6 +469,11 @@ impl Session<Connecting> {
                     }
                 }
 
+                #[cfg(test)]
+                pressure.record(
+                    connection.pending_output_usage(),
+                    io.kernel_blocked(connection.selected_turn_stream()),
+                );
                 if outgoing.is_none()
                     && candidates_enabled
                     && let Some(signaling) = &signaling
@@ -665,7 +686,24 @@ impl<S: Live> AcceptedSession<S> {
     }
 }
 
+#[cfg(test)]
+impl Session<Retired> {
+    /// Joins the same original actor after the fixture has dropped its other owned capabilities.
+    pub(crate) async fn join_original_actor(self) {
+        let handle = self.into_handle();
+        let mut guard = Arc::try_unwrap(handle._guard)
+            .unwrap_or_else(|_| panic!("fixture retained another original actor capability"));
+        (&mut guard.task).await.expect("original actor panicked");
+    }
+}
+
 impl SessionSender {
+    /// Independent read-only fixture observation remains available while ordinary commands are gated.
+    #[cfg(test)]
+    pub(crate) fn pressure_observation(&self) -> pressure_observation::Observation {
+        self.pressure.clone()
+    }
+
     /// Refreshes only the same actual selected stream, under one original admission cutoff.
     /// Direct/UDP selection needs no stream mutation. Missing or ambiguous selected-target
     /// replacements fail; this never reconnects. Success means local core admission, not a

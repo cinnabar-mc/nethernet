@@ -110,6 +110,8 @@ pub(super) struct Carrier {
     deadline: Instant,
     decoder: TurnStreamDecoder,
     write: Option<(Vec<u8>, usize)>,
+    #[cfg(test)]
+    kernel_pending: bool,
 }
 
 impl Carrier {
@@ -149,6 +151,8 @@ impl Carrier {
             deadline,
             decoder: TurnStreamDecoder::new(),
             write: None,
+            #[cfg(test)]
+            kernel_pending: false,
         })
     }
 
@@ -164,6 +168,23 @@ impl Carrier {
         }
     }
 
+    /// Sizes the same original socket before actor handoff; it does not synthesize Pending.
+    #[cfg(test)]
+    pub(super) fn set_send_buffer(&self, size: usize) {
+        let State::Active(Wire::Tcp(stream)) = &self.state else {
+            panic!("actual TCP carrier is not active");
+        };
+        socket2::SockRef::from(stream)
+            .set_send_buffer_size(size)
+            .unwrap();
+    }
+
+    /// Reports only a real selected write attempt that returned Pending with its original frame retained.
+    #[cfg(test)]
+    pub(super) fn kernel_blocked(&self) -> bool {
+        self.write.is_some() && self.kernel_pending
+    }
+
     pub fn blocked(&self) -> bool {
         self.write.is_some()
     }
@@ -177,6 +198,10 @@ impl Carrier {
         }
         if !matches!(self.state, State::Active(_)) {
             return Err(NetherError::ConnectionClosed);
+        }
+        #[cfg(test)]
+        {
+            self.kernel_pending = false;
         }
         self.write = Some((data, 0));
         Ok(())
@@ -226,7 +251,13 @@ impl Carrier {
                 self.retire();
                 false
             }
-            Poll::Pending => false,
+            Poll::Pending => {
+                #[cfg(test)]
+                {
+                    self.kernel_pending = true;
+                }
+                false
+            }
         }
     }
 
@@ -311,7 +342,12 @@ impl Carrier {
             match self.poll_write_frame(cx) {
                 Poll::Ready(Ok(())) => return Poll::Ready(Ok(CarrierEvent::Written)),
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                Poll::Pending => {}
+                Poll::Pending => {
+                    #[cfg(test)]
+                    {
+                        self.kernel_pending = true;
+                    }
+                }
             }
         }
         let State::Active(wire) = &mut self.state else {

@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod admission_tests;
 mod delivery;
 mod pool;
 pub(crate) use pool::SessionPool;
@@ -11,7 +13,7 @@ use nethernet::session::{Channel, SessionEvent, SessionOutput};
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -22,14 +24,21 @@ pub(crate) enum ConnectionEvent {
     Failed,
 }
 
-/// Identity of one actual pool entry, carried only by its Ready event.
+#[repr(u8)]
+enum Admission {
+    Pending,
+    Admitted,
+    Retired,
+}
+
+/// Identity and worker admission of one allocation; only actual Ready grants public send authority.
 #[derive(Clone, Debug)]
-pub(crate) struct Readiness(Arc<AtomicBool>);
+pub(crate) struct Readiness(Arc<AtomicU8>);
 
 impl Readiness {
     /// Creates the identity of this concrete pool allocation before its original Add acknowledgement.
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self(Arc::new(AtomicU8::new(Admission::Pending as u8)))
     }
 
     /// Matches an original entry, so reused peer ids and other pools cannot accept stale sends.
@@ -37,14 +46,31 @@ impl Readiness {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// Acknowledges installation by the original worker without reviving a retired allocation.
+    fn admit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Admission::Pending as u8,
+                Admission::Admitted as u8,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// Permits answer publication only after the same worker installed this allocation.
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Admission::Admitted as u8
+    }
+
     /// Seals this exact allocation without waiting for command queue capacity.
     pub(crate) fn retire(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.store(Admission::Retired as u8, Ordering::Release);
     }
 
     /// A retired entry never acquires authority again, even if its descriptive id is reused.
     pub(crate) fn is_retired(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.load(Ordering::Acquire) == Admission::Retired as u8
     }
 }
 

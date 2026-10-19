@@ -87,6 +87,8 @@ struct SessionEntry {
     ready: Option<EstablishedSessionId>,
     readiness: Readiness,
     created: Instant,
+    answer: Option<String>,
+    answer_deadline: Instant,
     remote_addr: Option<SocketAddr>,
     rtt: Option<Duration>,
     player: Option<Arc<PlayerInfo>>,
@@ -323,9 +325,9 @@ impl NetherHttpServer {
 
         let _ = self.signaler.handle(HttpSignalerInput::Update(now));
 
-        while let Some(output) = self.signaler.poll() {
-            self.handle_output(output, now);
-        }
+        self.drive_signaling(now);
+        self.publish_answers(now);
+        self.drive_signaling(now);
 
         self.drive_sessions();
 
@@ -349,6 +351,47 @@ impl NetherHttpServer {
             }
             keep
         });
+    }
+
+    /// Applies the original signaler's responses without a second response queue.
+    fn drive_signaling(&mut self, now: Instant) {
+        while let Some(output) = self.signaler.poll() {
+            self.handle_output(output, now);
+        }
+    }
+
+    /// Commits an answer only after worker admission while the original HTTP join still exists.
+    fn publish_answers(&mut self, now: Instant) {
+        let mut failed = Vec::new();
+        for (id, entry) in &mut self.sessions {
+            if entry.answer.is_none() {
+                continue;
+            }
+            if entry.readiness.is_retired() || now >= entry.answer_deadline {
+                failed.push(id.clone());
+                continue;
+            }
+            if !entry.readiness.is_admitted() {
+                continue;
+            }
+            let sdp = entry
+                .answer
+                .take()
+                .expect("the original answer remains staged");
+            if self
+                .signaler
+                .handle(HttpSignalerInput::Answer {
+                    connection_id: id.connection_id,
+                    sdp,
+                })
+                .is_err()
+            {
+                failed.push(id.clone());
+            }
+        }
+        for id in failed {
+            self.remove_session(&id);
+        }
     }
 
     fn accept(&mut self, now: Instant) {
@@ -578,23 +621,24 @@ impl NetherHttpServer {
                     });
                     return;
                 };
-                let Some(readiness) = self.pool.add(id.clone(), connection, local_ufrag) else {
+                let readiness = (answer.data.len() <= http_wire::MAX_BODY)
+                    .then(|| self.pool.add(id.clone(), connection, local_ufrag))
+                    .flatten();
+                let Some(readiness) = readiness else {
                     let _ = self.signaler.handle(HttpSignalerInput::Reject {
                         connection_id: offer.connection_id,
                         reason: RejectReason::Unavailable,
                     });
                     return;
                 };
-                let _ = self.signaler.handle(HttpSignalerInput::Answer {
-                    connection_id: offer.connection_id,
-                    sdp: answer.data,
-                });
                 self.sessions.insert(
                     id,
                     SessionEntry {
                         ready: None,
                         readiness,
                         created: now,
+                        answer: Some(answer.data),
+                        answer_deadline: now + self.timeouts.establish(),
                         remote_addr: None,
                         rtt: None,
                         player: player.map(Arc::new).or(signaled_player),

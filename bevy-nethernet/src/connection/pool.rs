@@ -26,7 +26,7 @@ const RTT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 type SharedDelivery<K> = Arc<Mutex<Delivery<K>>>;
 
 enum Command<K> {
-    Add(K, Box<Connection>, String, Readiness, Sender<()>),
+    Add(K, Box<Connection>, String, Readiness),
     Signal(K, Readiness, Signal),
     Send(K, Readiness, Channel, Box<[u8]>),
 }
@@ -106,7 +106,7 @@ where
             .admits(id)
     }
 
-    /// Reserves final ownership before the original worker can acknowledge this allocation.
+    /// Reserves bounded ownership without waiting for the original worker to install this allocation.
     pub(crate) fn add(
         &mut self,
         id: K,
@@ -118,19 +118,13 @@ where
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .reserve(id.clone())?;
-        let (ack_tx, ack_rx) = async_channel::bounded(1);
-        if self
-            .commands
-            .try_send(Command::Add(
-                id,
-                Box::new(connection),
-                local_ufrag,
-                readiness.clone(),
-                ack_tx,
-            ))
-            .is_err()
-            || ack_rx.recv_blocking().is_err()
-        {
+        if let Err(command) = self.commands.try_send(Command::Add(
+            id,
+            Box::new(connection),
+            local_ufrag,
+            readiness.clone(),
+        )) {
+            drop(command);
             self.delivery
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -344,7 +338,7 @@ fn drive<K: Eq + Hash + Clone + Send + 'static>(
         for _ in 0..DEFAULT_COMMAND_CHANNEL_CAPACITY {
             let now = Instant::now();
             match commands.try_recv() {
-                Ok(Command::Add(id, connection, local_ufrag, readiness, ack)) => {
+                Ok(Command::Add(id, connection, local_ufrag, readiness)) => {
                     if entries
                         .get(&id)
                         .is_some_and(|entry| entry.readiness.is_retired())
@@ -352,6 +346,7 @@ fn drive<K: Eq + Hash + Clone + Send + 'static>(
                         retire_entry(&id, &mut entries, &mut router, &delivery);
                     }
                     if readiness.is_retired() || entries.contains_key(&id) {
+                        drop(connection);
                         delivery
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
@@ -371,7 +366,7 @@ fn drive<K: Eq + Hash + Clone + Send + 'static>(
                             rtt_reported_at: None,
                         },
                     );
-                    if ack.try_send(()).is_err() {
+                    if !readiness.admit() {
                         retire_entry(&id, &mut entries, &mut router, &delivery);
                         delivery
                             .lock()

@@ -10,7 +10,7 @@ use nethernet::prelude::{
     Answered, LanSignaler, LanSignalerConfig, LanSignalerInput, LanSignalerOutput, OfferPolicy,
     PlayerInfo, Sans, ServerData, ServerIdentity, TokenTrust,
 };
-use nethernet::protocol::constants::MAX_DATAGRAM_SIZE;
+use nethernet::protocol::constants::{MAX_BYTES, MAX_DATAGRAM_SIZE};
 use nethernet::protocol::{Signal, SignalType};
 use nethernet::session::Channel;
 use std::collections::HashMap;
@@ -92,6 +92,8 @@ struct SessionEntry {
     ready: Option<EstablishedSessionId>,
     readiness: Readiness,
     created: Instant,
+    answer: Option<Vec<Signal>>,
+    answer_deadline: Instant,
     remote_addr: Option<SocketAddr>,
     rtt: Option<Duration>,
     player: Option<Arc<PlayerInfo>>,
@@ -300,15 +302,9 @@ impl NetherServer {
 
         let _ = self.signaler.handle(LanSignalerInput::Update(now));
 
-        while let Some(output) = self.signaler.poll() {
-            match output {
-                LanSignalerOutput::Datagram(buf, addr) => {
-                    let _ = send_discovery(&self.socket, &buf, addr);
-                }
-                LanSignalerOutput::Signal(signal) => self.handle_signal(signal, now),
-                LanSignalerOutput::ServerDiscovered(..) | LanSignalerOutput::Wait(_) => {}
-            }
-        }
+        self.drive_signaling(now);
+        self.publish_answers(now);
+        self.drive_signaling(now);
 
         let mut events = Vec::new();
         self.pool.drive(&mut events);
@@ -351,6 +347,50 @@ impl NetherServer {
             self.timeouts.establish(),
             now,
         );
+    }
+
+    /// Drains only the original signaler's outputs, including newly committed answers.
+    fn drive_signaling(&mut self, now: Instant) {
+        while let Some(output) = self.signaler.poll() {
+            match output {
+                LanSignalerOutput::Datagram(buf, addr) => {
+                    let _ = send_discovery(&self.socket, &buf, addr);
+                }
+                LanSignalerOutput::Signal(signal) => self.handle_signal(signal, now),
+                LanSignalerOutput::ServerDiscovered(..) | LanSignalerOutput::Wait(_) => {}
+            }
+        }
+    }
+
+    /// Publishes each retained answer once, after the same worker acknowledged its original core.
+    fn publish_answers(&mut self, now: Instant) {
+        let mut failed = Vec::new();
+        for (id, entry) in &mut self.sessions {
+            if entry.answer.is_none() {
+                continue;
+            }
+            if entry.readiness.is_retired() || now >= entry.answer_deadline {
+                failed.push(id.clone());
+                continue;
+            }
+            if !entry.readiness.is_admitted() {
+                continue;
+            }
+            let signals = entry
+                .answer
+                .take()
+                .expect("the original answer remains staged");
+            if signals
+                .into_iter()
+                .try_for_each(|signal| self.signaler.handle(LanSignalerInput::Signal(signal, now)))
+                .is_err()
+            {
+                failed.push(id.clone());
+            }
+        }
+        for id in failed {
+            self.remove_session(&id);
+        }
     }
 
     fn handle_signal(&mut self, signal: Signal, now: Instant) {
@@ -427,7 +467,16 @@ impl NetherServer {
             }
         };
 
-        let Some(readiness) = self.pool.add(id.clone(), connection, local_ufrag) else {
+        let fits = signals
+            .iter()
+            .try_fold(MAX_BYTES, |remaining, signal| {
+                remaining.checked_sub(signal.to_string().len())
+            })
+            .is_some();
+        let readiness = fits
+            .then(|| self.pool.add(id.clone(), connection, local_ufrag))
+            .flatten();
+        let Some(readiness) = readiness else {
             let refusal = Signal::error(
                 offer.connection_id,
                 SignalErrorCode::IncomingConnectionIgnored,
@@ -436,15 +485,14 @@ impl NetherServer {
             let _ = self.signaler.handle(LanSignalerInput::Signal(refusal, now));
             return;
         };
-        for signal in signals {
-            let _ = self.signaler.handle(LanSignalerInput::Signal(signal, now));
-        }
         self.sessions.insert(
             id,
             SessionEntry {
                 ready: None,
                 readiness,
                 created: now,
+                answer: Some(signals),
+                answer_deadline: now + self.timeouts.establish(),
                 remote_addr: None,
                 rtt: None,
                 player: player.map(Arc::new),
@@ -482,6 +530,8 @@ mod expiry_tests {
             }),
             readiness,
             created,
+            answer: None,
+            answer_deadline: created,
             remote_addr: None,
             rtt: None,
             player: None,

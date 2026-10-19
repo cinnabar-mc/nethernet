@@ -7,7 +7,7 @@ use nethernet::protocol::webrtc::Description;
 use nethernet::sans::Sans;
 use nethernet::session::{
     Channel, GatheringState, IceConfig, IceError, IcePolicy, IceServer, Session, SessionEvent,
-    SessionInput, SessionOutput, TurnCredentials,
+    SessionInput, SessionOutput, TurnAddressFamily, TurnCredentials, TurnStreamId, TurnStreamRoute,
 };
 use rtc::ice::candidate::{Candidate, CandidateType};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -27,22 +27,25 @@ fn addr(v6: bool, port: u16) -> SocketAddr {
 
 fn config(server: SocketAddr, now: Instant, policy: IcePolicy) -> IceConfig {
     IceConfig {
-        servers: vec![IceServer::Turn(
-            server,
-            TurnCredentials::new(
-                USER.to_string(),
-                PASSWORD.to_string(),
-                now + Duration::from_secs(1200),
-            )
-            .unwrap(),
-        )],
+        servers: vec![IceServer::Turn(server, credentials(now))],
         policy,
         ..Default::default()
     }
 }
 
+/// Original bounded credentials shared by the finite UDP and stream carrier fixtures.
+fn credentials(now: Instant) -> TurnCredentials {
+    TurnCredentials::new(
+        USER.to_owned(),
+        PASSWORD.to_owned(),
+        now + Duration::from_secs(1200),
+    )
+    .unwrap()
+}
+
 struct Endpoint<S: Phase = Connecting> {
     local: SocketAddr,
+    stream: Option<(TurnStreamId, TurnStreamRoute)>,
     session: Session<S>,
     ready: bool,
     received: Vec<(Channel, Vec<u8>)>,
@@ -55,8 +58,18 @@ impl<S: Phase> Endpoint<S> {
         while let Some(output) = self.session.poll() {
             match output {
                 SessionOutput::Send(data, to) => {
+                    assert!(
+                        self.stream.is_none(),
+                        "stream TURN bytes were emitted through UDP"
+                    );
                     assert_eq!(to, server.addr, "relay-only traffic escaped the TURN path");
                     server.receive(self.local, data);
+                    progressed = true;
+                }
+                SessionOutput::SendStream(data, route) => {
+                    assert_eq!(self.stream.map(|(_, route)| route), Some(route));
+                    assert_eq!(route.remote(), server.addr);
+                    server.receive(route.local(), data);
                     progressed = true;
                 }
                 SessionOutput::Event(SessionEvent::Ready) => {
@@ -105,12 +118,18 @@ fn deliver_server_packets<S: Live>(
     while let Some((to, data)) = server.packets.pop_front() {
         let endpoint = endpoints
             .iter_mut()
-            .find(|endpoint| endpoint.local == to)
+            .find(|endpoint| {
+                endpoint
+                    .stream
+                    .map_or(endpoint.local, |(_, route)| route.local())
+                    == to
+            })
             .unwrap();
-        endpoint
-            .session
-            .handle(SessionInput::Packet(data.into(), server.addr, now))
-            .unwrap();
+        let input = match endpoint.stream {
+            Some((_, route)) => SessionInput::StreamPacket(data.into(), route, now),
+            None => SessionInput::Packet(data.into(), server.addr, now),
+        };
+        endpoint.session.handle(input).unwrap();
         progressed = true;
     }
     progressed
@@ -137,16 +156,54 @@ fn pair_with_binding(
     refuse_extra: bool,
     drop_bindings: bool,
 ) -> ([Endpoint<Established>; 2], TurnPeer, Instant) {
+    pair_with_carrier(v6, extra, refuse_extra, drop_bindings, None)
+}
+
+/// The same RTC allocation and secured pair over an explicit outer carrier, with no extra driver.
+fn pair_with_carrier(
+    v6: bool,
+    extra: Vec<Candidate>,
+    refuse_extra: bool,
+    drop_bindings: bool,
+    stream_family: Option<TurnAddressFamily>,
+) -> ([Endpoint<Established>; 2], TurnPeer, Instant) {
     let mut now = Instant::now();
     let mut server = TurnPeer::new(addr(v6, 3478));
     server.drop_bindings = drop_bindings;
+    server.ipv6_relay = stream_family == Some(TurnAddressFamily::Ipv6);
     let mut ice = config(server.addr, now, IcePolicy::RelayOnly);
     if drop_bindings {
         ice.gather_timeout = Duration::from_millis(100);
     }
-    let (a, a_description) =
-        Session::new_with_ice(addr(v6, 41000), true, 1, ice.clone(), now).unwrap();
-    let (b, b_description) = Session::new_with_ice(addr(v6, 41001), false, 2, ice, now).unwrap();
+    let streams = [42000, 42001].map(|port| {
+        stream_family.map(|_| {
+            (
+                TurnStreamId::new(0).unwrap(),
+                TurnStreamRoute::new(addr(v6, port), server.addr).unwrap(),
+            )
+        })
+    });
+    let mut configs = [ice.clone(), ice];
+    if let Some(family) = stream_family {
+        for (config, stream) in configs.iter_mut().zip(streams) {
+            let (id, route) = stream.unwrap();
+            config.servers = vec![IceServer::TurnStream {
+                id,
+                remote: server.addr,
+                credentials: credentials(now),
+                requested_family: (family
+                    != if route.local().is_ipv4() {
+                        TurnAddressFamily::Ipv4
+                    } else {
+                        TurnAddressFamily::Ipv6
+                    })
+                .then_some(family),
+            }];
+        }
+    }
+    let [a_ice, b_ice] = configs;
+    let (a, a_description) = Session::new_with_ice(addr(v6, 41000), true, 1, a_ice, now).unwrap();
+    let (b, b_description) = Session::new_with_ice(addr(v6, 41001), false, 2, b_ice, now).unwrap();
     let a = match a.try_establish() {
         Err(a) => a,
         Ok(_) => panic!("gathering cannot produce data-channel readiness"),
@@ -158,17 +215,31 @@ fn pair_with_binding(
     let mut endpoints = [
         Endpoint {
             local: addr(v6, 41000),
+            stream: streams[0],
             session: a,
             ready: false,
             received: Vec::new(),
         },
         Endpoint {
             local: addr(v6, 41001),
+            stream: streams[1],
             session: b,
             ready: false,
             received: Vec::new(),
         },
     ];
+    for endpoint in &mut endpoints {
+        if let Some((id, route)) = endpoint.stream {
+            assert!(
+                !endpoint.drain(&mut server),
+                "an unactivated carrier emitted network work"
+            );
+            endpoint
+                .session
+                .handle(SessionInput::ActivateTurnStream(id, route, now))
+                .unwrap();
+        }
+    }
     for _ in 0..100 {
         step(&mut endpoints, &mut server, &mut now);
         if endpoints
@@ -241,6 +312,7 @@ fn pair_with_binding(
     );
     let endpoints = endpoints.map(|endpoint| Endpoint {
         local: endpoint.local,
+        stream: endpoint.stream,
         session: endpoint
             .session
             .try_establish()
@@ -418,6 +490,7 @@ fn relay_only_sessions_secure_and_exchange_both_channels_over_ipv4_and_ipv6_udp(
             result.unwrap();
             let mut endpoint = Endpoint {
                 local: endpoint.local,
+                stream: endpoint.stream,
                 session,
                 ready: endpoint.ready,
                 received: endpoint.received,
@@ -429,6 +502,9 @@ fn relay_only_sessions_secure_and_exchange_both_channels_over_ipv4_and_ipv6_udp(
         assert_eq!(server.allocation_count(), 0);
     }
 }
+
+#[path = "ice_relay/stream.rs"]
+mod stream;
 
 #[test]
 fn gathering_has_a_deadline_and_rejects_wrong_source_or_corrupt_authenticated_success() {

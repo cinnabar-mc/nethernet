@@ -194,6 +194,7 @@ dependencies = [
  "rand",
  "rcgen",
  "rtc",
+ "rtc-turn 0.21.1 (git+https://github.com/cinnabar-mc/rtc-turn?rev=ceef0780c54c4f5fdc08e7e343403f8026653171)",
  "rustls",
  "rustls-platform-verifier",
  "socket2",
@@ -1703,6 +1704,7 @@ dependencies = [
  "rand",
  "rsa",
  "rtc",
+ "rtc-turn 0.21.1 (git+https://github.com/cinnabar-mc/rtc-turn?rev=ceef0780c54c4f5fdc08e7e343403f8026653171)",
  "serde",
  "serde_json",
  "sha2",
@@ -1725,6 +1727,7 @@ dependencies = [
  "rand",
  "reqwest",
  "rtc",
+ "rtc-turn 0.21.1 (git+https://github.com/cinnabar-mc/rtc-turn?rev=ceef0780c54c4f5fdc08e7e343403f8026653171)",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -2224,7 +2227,7 @@ dependencies = [
  "rtc-shared",
  "rtc-srtp",
  "rtc-stun",
- "rtc-turn",
+ "rtc-turn 0.21.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls",
  "sansio",
  "serde",
@@ -2449,6 +2452,19 @@ name = "rtc-turn"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c53078a0696df5a3a5e4947bc550c5e903b59803b252f1d39062d637ebd3d17e"
+dependencies = [
+ "bytes",
+ "log",
+ "rtc-crypto",
+ "rtc-shared",
+ "rtc-stun",
+ "sansio",
+]
+
+[[package]]
+name = "rtc-turn"
+version = "0.21.1"
+source = "git+https://github.com/cinnabar-mc/rtc-turn?rev=ceef0780c54c4f5fdc08e7e343403f8026653171#ceef0780c54c4f5fdc08e7e343403f8026653171"
 dependencies = [
  "bytes",
  "log",

@@ -191,6 +191,17 @@ impl NetherClient {
         connection_id: u64,
         config: ConnectionConfig,
     ) -> std::result::Result<Self, (Option<SignalErrorCode>, NetherError)> {
+        if config.client_ice.as_ref().is_some_and(|ice| {
+            ice.ice
+                .servers
+                .iter()
+                .any(|server| server.stream_id().is_some())
+        }) {
+            return Err((
+                None,
+                NetherError::Protocol(nethernet::session::IceError::UnsupportedCarrier.into()),
+            ));
+        }
         let deadline = tokio::time::Instant::now() + config.timeouts.negotiation;
         let bind_addr = config
             .client_ice

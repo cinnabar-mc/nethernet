@@ -143,6 +143,7 @@ fn connected_pair_with_pending_ready() -> (Session<Established>, Session<Establi
                 }
                 SessionOutput::Message(..) => panic!("unexpected message before Ready"),
                 SessionOutput::Wait(_) => {}
+                SessionOutput::SendStream(..) => panic!("host-only session emitted stream traffic"),
             }
         }
         for (data, to) in offerer_outbox {
@@ -164,6 +165,7 @@ fn connected_pair_with_pending_ready() -> (Session<Established>, Session<Establi
                 }
                 SessionOutput::Message(..) => panic!("unexpected message before Ready"),
                 SessionOutput::Wait(_) => {}
+                SessionOutput::SendStream(..) => panic!("host-only session emitted stream traffic"),
             }
         }
         for (data, to) in answerer_outbox {
@@ -587,6 +589,7 @@ fn full_handshake_and_bidirectional_data_exchange() {
             match output {
                 SessionOutput::Send(data, to) => offerer_outbox.push((data, to)),
                 SessionOutput::Event(_) | SessionOutput::Wait(_) => {}
+                SessionOutput::SendStream(..) => panic!("host-only session emitted stream traffic"),
                 SessionOutput::Message(channel, data) => offerer_received.push((channel, data)),
             }
         }
@@ -603,6 +606,7 @@ fn full_handshake_and_bidirectional_data_exchange() {
             match output {
                 SessionOutput::Send(data, to) => answerer_outbox.push((data, to)),
                 SessionOutput::Event(_) | SessionOutput::Wait(_) => {}
+                SessionOutput::SendStream(..) => panic!("host-only session emitted stream traffic"),
                 SessionOutput::Message(channel, data) => answerer_received.push((channel, data)),
             }
         }

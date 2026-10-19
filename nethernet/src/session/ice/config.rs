@@ -1,4 +1,6 @@
-//! Resolved inputs for the session's UDP STUN/TURN owner.
+//! Resolved inputs for the session's STUN/TURN transaction owners.
+use super::route::{TurnAddressFamily, TurnStreamId};
+use super::target::TurnStreamTarget;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -24,6 +26,8 @@ pub enum IceError {
     PendingLimit,
     #[error("ICE session is closed")]
     Closed,
+    #[error("TURN stream carrier is not installed")]
+    UnsupportedCarrier,
 }
 
 /// A bounded TURN credential with a caller-monotonic admission expiry; intentionally has no Debug implementation.
@@ -56,20 +60,53 @@ impl TurnCredentials {
     }
 }
 
-/// A numeric UDP endpoint resolved by the caller. Hostnames and socket I/O belong to a runtime adapter.
+/// Numeric endpoints resolved by the caller. Hostnames and socket I/O belong to a runtime adapter.
 #[derive(Clone)]
 pub enum IceServer {
     /// Gather a server-reflexive candidate with a STUN Binding transaction.
     Stun(SocketAddr),
     /// Gather a relay candidate and a server-reflexive candidate from the same UDP endpoint.
     Turn(SocketAddr, TurnCredentials),
+    /// Requests an explicit UDP relay family on the original UDP carrier.
+    TurnWithFamily {
+        addr: SocketAddr,
+        credentials: TurnCredentials,
+        family: TurnAddressFamily,
+    },
+    /// Reserves a bounded pending allocation before the original TCP/TLS tuple is available.
+    TurnStream {
+        id: TurnStreamId,
+        remote: SocketAddr,
+        credentials: TurnCredentials,
+        /// Absence derives from the actual connected carrier when it is activated.
+        requested_family: Option<TurnAddressFamily>,
+    },
 }
 
 impl IceServer {
     /// The already-resolved server address.
     pub fn addr(&self) -> SocketAddr {
         match self {
-            Self::Stun(addr) | Self::Turn(addr, _) => *addr,
+            Self::Stun(addr) | Self::Turn(addr, _) | Self::TurnWithFamily { addr, .. } => *addr,
+            Self::TurnStream { remote, .. } => *remote,
+        }
+    }
+
+    /// The bounded pending carrier slot, absent for the original UDP constructors.
+    pub fn stream_id(&self) -> Option<TurnStreamId> {
+        match self {
+            Self::TurnStream { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Whether this endpoint owns a TURN allocation rather than a STUN binding only.
+    pub(super) fn credentials(&self) -> Option<&TurnCredentials> {
+        match self {
+            Self::Stun(_) => None,
+            Self::Turn(_, credentials)
+            | Self::TurnWithFamily { credentials, .. }
+            | Self::TurnStream { credentials, .. } => Some(credentials),
         }
     }
 }
@@ -103,16 +140,32 @@ impl Default for IceConfig {
 
 impl IceConfig {
     /// Checks bounded inputs before any RTC transaction is constructed.
-    pub(super) fn validate(&self, local: SocketAddr, now: Instant) -> Result<(), IceError> {
-        if self.servers.len() > MAX_ICE_SERVERS
+    pub fn validate(&self, local: SocketAddr, now: Instant) -> Result<(), IceError> {
+        self.validate_with_stream_targets(local, &[], now)
+    }
+
+    /// Validates one combined endpoint budget before an adapter opens any stream sockets.
+    /// The pure session later validates the actual bound routes with [`Self::validate`].
+    pub fn validate_with_stream_targets(
+        &self,
+        local: SocketAddr,
+        targets: &[TurnStreamTarget],
+        now: Instant,
+    ) -> Result<(), IceError> {
+        if self
+            .servers
+            .len()
+            .checked_add(targets.len())
+            .is_none_or(|total| total > MAX_ICE_SERVERS)
             || self.gather_timeout.is_zero()
             || self.gather_timeout > Duration::from_secs(60)
             || now.checked_add(self.gather_timeout).is_none()
             || (self.policy == IcePolicy::RelayOnly
+                && targets.is_empty()
                 && !self
                     .servers
                     .iter()
-                    .any(|server| matches!(server, IceServer::Turn(..))))
+                    .any(|server| server.credentials().is_some()))
         {
             return Err(IceError::Configuration);
         }
@@ -121,18 +174,25 @@ impl IceConfig {
             if addr.port() == 0
                 || addr.ip().is_unspecified()
                 || addr.ip().is_multicast()
-                || addr.is_ipv4() != local.is_ipv4()
-                || self.servers[..index]
-                    .iter()
-                    .any(|previous| previous.addr() == addr)
+                || (server.stream_id().is_none() && addr.is_ipv4() != local.is_ipv4())
+                || self.servers[..index].iter().any(|previous| {
+                    match (previous.stream_id(), server.stream_id()) {
+                        (Some(previous), Some(current)) => previous == current,
+                        (None, None) => previous.addr() == addr,
+                        _ => false,
+                    }
+                })
             {
                 return Err(IceError::Configuration);
             }
-            if let IceServer::Turn(_, credential) = server
+            if let Some(credential) = server.credentials()
                 && credential.valid_until <= now
             {
                 return Err(IceError::Credentials);
             }
+        }
+        for target in targets {
+            target.validate(now)?;
         }
         Ok(())
     }

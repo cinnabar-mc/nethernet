@@ -47,6 +47,7 @@ where
             while let Some(output) = connection.poll() {
                 match output {
                     SessionOutput::Send(data, to) => { socket.send_to(&data, to).await.map_err(|error| (None, NetherError::from(error)))?; }
+                    SessionOutput::SendStream(..) => return Err((Some(SignalErrorCode::Ice), NetherError::Protocol(nethernet::session::IceError::UnsupportedCarrier.into()))),
                     SessionOutput::Wait(wait) => { wake = Instant::now() + wait; }
                     SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => return Err((Some(SignalErrorCode::Ice), NetherError::ConnectionClosed)),
                     _ => {}

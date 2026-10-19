@@ -6,12 +6,17 @@ use rtc::stun::integrity::MessageIntegrity;
 use rtc::stun::message::*;
 use rtc::stun::textattrs::{Nonce, Realm, Username};
 use rtc::stun::xoraddr::XorMappedAddress;
-use rtc::turn::proto::{
-    chandata::ChannelData, channum::ChannelNumber, data::Data, lifetime::Lifetime,
-    peeraddr::PeerAddress, relayaddr::RelayedAddress,
+use rtc_turn::proto::{
+    chandata::ChannelData,
+    channum::ChannelNumber,
+    data::Data,
+    lifetime::Lifetime,
+    peeraddr::PeerAddress,
+    relayaddr::RelayedAddress,
+    reqfamily::{REQUESTED_FAMILY_IPV6, RequestedAddressFamily},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 pub const USER: &str = "original-test-user";
@@ -37,6 +42,8 @@ pub struct TurnPeer {
     pub indications: usize,
     pub channel_data: usize,
     pub refreshes: usize,
+    pub ipv6_relay: bool,
+    pub allocation_requests: usize,
     pub refuse_refreshes: bool,
     pub last_refresh_lifetime: Option<Duration>,
     pub stale_permissions_once: bool,
@@ -58,6 +65,8 @@ impl TurnPeer {
             indications: 0,
             channel_data: 0,
             refreshes: 0,
+            ipv6_relay: false,
+            allocation_requests: 0,
             refuse_refreshes: false,
             last_refresh_lifetime: None,
             stale_permissions_once: false,
@@ -89,6 +98,17 @@ impl TurnPeer {
         request.raw = data;
         request.decode().unwrap();
         assert!(request.typ.class == CLASS_REQUEST || request.typ.class == CLASS_INDICATION);
+        if request.typ.method == METHOD_ALLOCATE {
+            self.allocation_requests += 1;
+            if self.ipv6_relay {
+                let mut family = RequestedAddressFamily::default();
+                family.get_from(&request).unwrap();
+                assert_eq!(family, REQUESTED_FAMILY_IPV6);
+            } else {
+                // Default and explicit IPv4 retain the original attribute-free request.
+                assert!(request.get(ATTR_REQUESTED_ADDRESS_FAMILY).is_err());
+            }
+        }
         if request.typ.method == METHOD_BINDING {
             if self.drop_bindings {
                 return;
@@ -145,10 +165,13 @@ impl TurnPeer {
         }
         match request.typ.method {
             METHOD_ALLOCATE => {
-                // RTC's default allocation request asks for IPv4 even over an IPv6 server transport.
-                assert!(request.get(ATTR_REQUESTED_ADDRESS_FAMILY).is_err());
                 let port = 50000 + u16::try_from(self.allocations.len()).unwrap();
-                let relay = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 80).into(), port);
+                let ip = if self.ipv6_relay {
+                    Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 80).into()
+                } else {
+                    Ipv4Addr::new(192, 0, 2, 80).into()
+                };
+                let relay = SocketAddr::new(ip, port);
                 self.allocations.insert(
                     from,
                     Allocation {

@@ -237,7 +237,7 @@ impl NetherClient {
         };
         let (mut session, description) = match ice {
             Some(ice) => {
-                SansSession::new_with_ice(bound_addr, true, rand::random(), ice, transport_now())
+                SansSession::new_with_ice(bound_addr, true, rand::random(), ice, now)
             }
             None => SansSession::new(bound_addr, true, rand::random(), now),
         }

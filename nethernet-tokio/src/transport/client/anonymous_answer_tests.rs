@@ -85,7 +85,7 @@ async fn association(answer: Answer, allow: bool) -> Result<()> {
             identity: if matches!(answer, Answer::Missing) { None } else { Some(server_key.clone()) },
             allow_unsigned_answers: matches!(answer, Answer::Missing),
             token_trust: Some(TokenTrust::Any),
-            server_ice: Some(ServerIceConfig { ice: Default::default(), bind_addr: bind }),
+            server_ice: Some(ServerIceConfig { turn_streams: Vec::new(), turn_tls: None, ice: Default::default(), bind_addr: bind }),
             max_sessions: 1,
             ..Default::default()
         }).await.unwrap();
@@ -96,7 +96,7 @@ async fn association(answer: Answer, allow: bool) -> Result<()> {
                 identity: Some(local_key),
                 server_trust: Some(TokenTrust::ServerAnswer(Arc::new(RefuseProvider))),
                 allow_anonymous_answers: allow,
-                client_ice: Some(ClientIceConfig { ice: Default::default(), bind_addr: Some(bind) }),
+                client_ice: Some(ClientIceConfig { turn_streams: Vec::new(), turn_tls: None, ice: Default::default(), bind_addr: Some(bind) }),
                 ..Default::default()
             }).await;
             let result = match connected {

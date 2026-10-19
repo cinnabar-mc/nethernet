@@ -7,6 +7,7 @@ use crate::session::guard::{GatheringGuard, transport_now};
 use crate::session::outgoing::CandidateSignaling;
 use crate::session::{AcceptedSession, Command, ServerLease, ServerRetirement, Session};
 use crate::signaling::ServerSignaling;
+use crate::transport::ice_io::IceIo;
 use crate::transport::{ConnectionConfig, local_bind_addr, pending::PendingSlot};
 use futures::{FutureExt, future::Shared};
 use nethernet::admission::OfferPolicy;
@@ -239,21 +240,38 @@ impl Peer {
         let bound = socket.local_addr().map_err(socket_error)?;
         let now = transport_now();
         let deadline = now.checked_add(establish).ok_or_else(timeout)?;
-        let answered = if let Some(ice) = &self.config.server_ice {
+        let (mut io, policy) = match &self.config.server_ice {
+            Some(ice) => {
+                let (io, policy) = IceIo::configured(
+                    socket,
+                    &ice.ice,
+                    &ice.turn_streams,
+                    ice.turn_tls.as_ref(),
+                    Some(ice.bind_addr.ip()),
+                    now,
+                    self.negotiation_deadline.min(deadline),
+                )
+                .map_err(|error| (Some(SignalErrorCode::FailedToCreatePeerConnection), error))?;
+                (Some(io), Some(policy))
+            }
+            None => (Some(IceIo::from(socket)), None),
+        };
+        let answered = if let Some(policy) = policy {
             let (mut core, description) =
-                SansSession::new_with_ice(bound, false, rand::random(), ice.ice.clone(), now)
-                    .map_err(|error| {
+                SansSession::new_with_ice(bound, false, rand::random(), policy, now).map_err(
+                    |error| {
                         (
                             Some(SignalErrorCode::FailedToCreatePeerConnection),
                             error.into(),
                         )
-                    })?;
+                    },
+                )?;
             core.set_establish_deadline(establish);
-            let mut gathering =
-                GatheringGuard::new(core, socket.clone()).with_server_capacity(lease.clone());
+            let mut gathering = GatheringGuard::new(core, io.take().expect("peer owns transport"))
+                .with_server_capacity(lease.clone());
             if ice_mode == IceMode::Full {
                 super::super::gather::gather(
-                    &socket,
+                    gathering.io.as_mut().expect("gathering owns transport"),
                     gathering.core.as_mut().expect("gathering owns session"),
                     self.negotiation_deadline.min(deadline).into(),
                 )
@@ -273,6 +291,7 @@ impl Peer {
                 .core
                 .take()
                 .expect("prepared session is transferred once");
+            io = gathering.io.take();
             prepared.finish(core, now)
         } else {
             admitted
@@ -293,7 +312,7 @@ impl Peer {
         };
         let (session, reliable, unreliable, ready) =
             Session::<Connecting>::spawn_for_server_with_signaling(
-                socket,
+                io.take().expect("prepared peer transfers transport once"),
                 answered.connection,
                 local,
                 remote,

@@ -72,7 +72,7 @@ async fn configured_server_gathers_before_or_during_answer_and_never_overtakes_i
                 identity: Some(Arc::new(server_identity.clone())),
                 // The caller grants only the exact controlled peer key/issuer.
                 token_trust: Some(signing::trust(&client_identity)),
-                server_ice: Some(ServerIceConfig { bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0), ice: IceConfig {
+                server_ice: Some(ServerIceConfig { turn_streams: Vec::new(), turn_tls: None, bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0), ice: IceConfig {
                     servers: vec![IceServer::Turn(turn.addr, TurnCredentials::new(USER.into(), PASSWORD.into(), now + Duration::from_secs(1200)).unwrap())],
                     policy: IcePolicy::RelayOnly, ..Default::default()
                 }}),
@@ -140,7 +140,7 @@ async fn configured_server_signer_failure_releases_the_gathered_allocation() {
         let now = tokio::time::Instant::now().into_std();
         let mut listener = NetherServer::bind_with(signaling, ConnectionConfig {
             identity: Some(Arc::new(RefusedSigner)), token_trust: Some(signing::trust(&client_identity)),
-            server_ice: Some(ServerIceConfig { bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0), ice: IceConfig {
+            server_ice: Some(ServerIceConfig { turn_streams: Vec::new(), turn_tls: None, bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0), ice: IceConfig {
                 servers: vec![IceServer::Turn(turn.addr, TurnCredentials::new(USER.into(), PASSWORD.into(), now + Duration::from_secs(1200)).unwrap())],
                 policy: IcePolicy::RelayOnly, ..Default::default()
             }}), ..Default::default()
@@ -182,6 +182,8 @@ async fn configured_server_rejects_original_expiry_and_accepts_explicit_replacem
                 )),
                 token_trust: Some(signing::trust(&client_identity)),
                 server_ice: Some(ServerIceConfig {
+                    turn_streams: Vec::new(),
+                    turn_tls: None,
                     bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
                     ice: IceConfig {
                         servers: vec![IceServer::Turn(
@@ -215,6 +217,8 @@ async fn configured_server_rejects_original_expiry_and_accepts_explicit_replacem
         );
         refused.finish(Ok(SignalDelivery::ServiceAccepted));
         listener.set_server_ice(Some(ServerIceConfig {
+            turn_streams: Vec::new(),
+            turn_tls: None,
             bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             ice: Default::default(),
         }));
@@ -275,6 +279,8 @@ async fn configured_server_full_stun_gathers_on_the_explicit_socket_family() {
                     identity: Some(Arc::new(server.clone())),
                     token_trust: Some(signing::trust(&client)),
                     server_ice: Some(ServerIceConfig {
+                        turn_streams: Vec::new(),
+                        turn_tls: None,
                         bind_addr: SocketAddr::new(ip, 0),
                         ice: IceConfig {
                             servers: vec![IceServer::Stun(stun.addr)],

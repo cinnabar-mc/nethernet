@@ -62,6 +62,15 @@ pub enum SessionEvent {
     PeerClosed,
 }
 
+/// Logical bodies and entries retained in the original output FIFO, excluding allocation overhead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutputUsage {
+    /// Every queued wire packet, message, event and timer notification.
+    pub entries: usize,
+    /// Total queued message and wire body lengths; sums saturate on overflow.
+    pub bytes: usize,
+}
+
 pub enum SessionOutput {
     Send(Vec<u8>, SocketAddr),
     /// Original RTC bytes for this exact caller-owned TCP/TLS stream, preserving partial-write ownership.
@@ -279,6 +288,23 @@ impl<S: Phase> Session<S> {
     /// Connecting receives are retrospective accepted data, not permission to send.
     pub fn poll(&mut self) -> Option<SessionOutput> {
         self.output.pop_front()
+    }
+
+    /// Derives retained output usage without moving, polling or copying its original payloads.
+    pub fn pending_output_usage(&self) -> OutputUsage {
+        let bytes = self.output.iter().fold(0usize, |total, output| {
+            let bytes = match output {
+                SessionOutput::Send(bytes, _)
+                | SessionOutput::SendStream(bytes, _)
+                | SessionOutput::Message(_, bytes) => bytes.len(),
+                SessionOutput::Event(_) | SessionOutput::Wait(_) => 0,
+            };
+            total.saturating_add(bytes)
+        });
+        OutputUsage {
+            entries: self.output.len(),
+            bytes,
+        }
     }
 
     /// Time allowed from the remote description until `Ready` before `Failed` is emitted; defaults to 10 seconds.

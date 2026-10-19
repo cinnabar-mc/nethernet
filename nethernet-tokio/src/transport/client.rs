@@ -6,6 +6,7 @@ use crate::protocol::{Signal, SignalType};
 use crate::session::guard::{ConnectionGuard, GatheringGuard, transport_now};
 use crate::session::{AcceptedSession, Command, Session, SessionReceiver, SessionSender};
 use crate::signaling::ClientSignaling;
+use crate::transport::ice_io::IceIo;
 use crate::transport::{ConnectionConfig, local_bind_addr};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -217,15 +218,26 @@ impl NetherClient {
             .local_addr()
             .map_err(|e| (None, NetherError::from(e)))?;
 
-        let (mut session, description) = match &config.client_ice {
-            Some(ice) => SansSession::new_with_ice(
-                bound_addr,
-                true,
-                rand::random(),
-                ice.ice.clone(),
-                transport_now(),
-            ),
-            None => SansSession::new(bound_addr, true, rand::random(), transport_now()),
+        let now = transport_now();
+        let (io, ice) = match &config.client_ice {
+            Some(ice) => {
+                let (io, policy) = IceIo::configured(
+                    socket,
+                    &ice.ice,
+                    &ice.turn_streams,
+                    ice.turn_tls.as_ref(),
+                    ice.bind_addr.map(|addr| addr.ip()),
+                    now,
+                    deadline.into_std(),
+                )
+                .map_err(|error| (Some(SignalErrorCode::FailedToCreatePeerConnection), error))?;
+                (io, Some(policy))
+            }
+            None => (IceIo::from(socket), None),
+        };
+        let (mut session, description) = match ice {
+            Some(ice) => SansSession::new_with_ice(bound_addr, true, rand::random(), ice, now),
+            None => SansSession::new(bound_addr, true, rand::random(), now),
         }
         .map_err(|error| {
             (
@@ -239,10 +251,10 @@ impl NetherClient {
         } else {
             IceMode::Trickle
         };
-        let mut gathering = GatheringGuard::new(session, socket.clone());
+        let mut gathering = GatheringGuard::new(session, io);
         if ice_mode == IceMode::Full {
             super::gather::gather(
-                &socket,
+                gathering.io.as_mut().expect("gathering owns transport"),
                 gathering
                     .core
                     .as_mut()
@@ -265,7 +277,13 @@ impl NetherClient {
             ice_mode,
         );
 
-        let mut guard = ConnectionGuard::new(connection, socket.clone());
+        let mut guard = ConnectionGuard::new(
+            connection,
+            gathering
+                .io
+                .take()
+                .expect("gathered transport is handed off once"),
+        );
         let mut signals_out = signals.into_iter();
         let offer = signals_out
             .next()
@@ -289,9 +307,10 @@ impl NetherClient {
             remote_network_id.to_string(),
         )];
         outgoing.extend(signals_out);
+        let (connection, io) = guard.pending_parts();
         let server_public_key = negotiation::exchange(
-            &socket,
-            guard.core(),
+            io,
+            connection,
             &mut incoming,
             signaling,
             outgoing,
@@ -303,13 +322,13 @@ impl NetherClient {
             deadline,
         )
         .await?;
-        let connection = guard.take();
+        let (connection, io) = guard.take();
 
         let local = Addr::new(signaling.network_id(), connection_id);
         let remote = Addr::new(remote_network_id.to_string(), connection_id);
 
         let (session, reliable, unreliable, ready_rx) = Session::<Connecting>::spawn_with_signaling(
-            socket,
+            io,
             connection,
             local,
             remote,
@@ -527,6 +546,48 @@ impl AsyncWrite for NetherClient {
 mod tests {
     use super::*;
     use nethernet::identity::ServerIdentity;
+
+    /// Configured preflight retains the original failure classification before an offer exists.
+    #[tokio::test]
+    async fn configured_client_preserves_expired_credential_signal_classification() {
+        use nethernet::session::{IceConfig, IceServer, TurnCredentials};
+        let (caller, _driver) =
+            crate::CallerSignaling::new("local".into(), "peer".into(), Default::default()).unwrap();
+        let signaling = ClientSignaling::from(caller);
+        let now = transport_now();
+        let config = ConnectionConfig {
+            client_ice: Some(crate::ClientIceConfig {
+                turn_streams: Vec::new(),
+                turn_tls: None,
+                bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                ice: IceConfig {
+                    servers: vec![IceServer::Turn(
+                        "127.0.0.1:3478".parse().unwrap(),
+                        TurnCredentials::new(
+                            "original-user".into(),
+                            "original-password".into(),
+                            now,
+                        )
+                        .unwrap(),
+                    )],
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        let failure = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            NetherClient::negotiate(&signaling, "peer", 1, config),
+        )
+        .await
+        .expect("finite configured client preflight stalled")
+        .err()
+        .expect("expired original credential constructed a session");
+        assert_eq!(
+            failure.0,
+            Some(SignalErrorCode::FailedToCreatePeerConnection)
+        );
+    }
 
     const ANSWER: &str = "v=0\r\n\
         m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\

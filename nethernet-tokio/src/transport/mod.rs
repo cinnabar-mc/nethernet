@@ -1,6 +1,7 @@
 //! Client and server connections over a signaling backend.
 pub mod client;
 mod gather;
+pub(crate) mod ice_io;
 mod pending;
 pub mod server;
 
@@ -25,21 +26,29 @@ pub(crate) fn local_bind_addr() -> SocketAddr {
 }
 use tokio_util::sync::CancellationToken;
 
-/// Outbound UDP ICE configuration. DNS and service credential acquisition happen before dialing.
+/// Outbound ICE configuration. DNS and service credential acquisition happen before dialing.
 #[derive(Clone)]
 pub struct ClientIceConfig {
+    /// Unopened TCP/TLS TURN carriers, bounded together with the UDP server set.
+    pub turn_streams: Vec<nethernet::session::TurnStreamTarget>,
+    /// Original TLS verifier/configuration; None uses verified platform roots.
+    pub turn_tls: Option<Arc<rustls::ClientConfig>>,
     /// Resolved server endpoints, bounded credentials, gathering deadline and candidate policy.
     pub ice: nethernet::session::IceConfig,
-    /// Optional concrete local interface and port. Use an IPv6 address for IPv6 outer server transport.
+    /// Optional local UDP bind. A concrete caller-selected IP may also bind compatible TCP targets.
     pub bind_addr: Option<SocketAddr>,
 }
 
 /// Accepting ICE configuration. The caller resolves services and selects the local socket family.
 #[derive(Clone)]
 pub struct ServerIceConfig {
+    /// Unopened TCP/TLS TURN carriers; each accepted peer owns its actual sockets.
+    pub turn_streams: Vec<nethernet::session::TurnStreamTarget>,
+    /// Original TLS verifier/configuration; None uses verified platform roots.
+    pub turn_tls: Option<Arc<rustls::ClientConfig>>,
     /// The same bounded STUN/TURN policy and original absolute credentials used by client sessions.
     pub ice: nethernet::session::IceConfig,
-    /// Concrete local interface/port, including explicit IPv6 for IPv6 service transport.
+    /// Local UDP bind; concrete caller-selected IPs also bind compatible stream targets.
     pub bind_addr: SocketAddr,
 }
 

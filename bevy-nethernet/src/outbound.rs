@@ -70,6 +70,7 @@ pub(crate) struct Outbound {
     state: SyncCell<Option<State>>,
     events: VecDeque<ConnectionEvent>,
     buffered_bytes: usize,
+    delivery_open: bool,
     reported_rtt: Option<Duration>,
     rtt_reported_at: Option<Instant>,
     buf: Box<[u8]>,
@@ -148,6 +149,7 @@ impl Outbound {
             state: SyncCell::new(Some(State::Gathering(session, description))),
             events: VecDeque::new(),
             buffered_bytes: 0,
+            delivery_open: true,
             reported_rtt: None,
             rtt_reported_at: None,
             buf: vec![0; 65536].into_boxed_slice(),
@@ -185,7 +187,7 @@ impl Outbound {
     pub(crate) fn update(&mut self, now: Instant) -> Result<(), ProtocolError> {
         let mut remaining = MAX_OUTPUTS_PER_UPDATE;
         self.timeout(now)?;
-        self.flush(&mut remaining)?;
+        self.flush(&mut remaining, now)?;
         let mut reads = MAX_DATAGRAMS_PER_UPDATE;
         while reads > 0 && remaining > 0 {
             let mut progressed = false;
@@ -193,7 +195,7 @@ impl Outbound {
                 reads -= 1;
                 progressed = true;
                 self.stream_input(input, now);
-                self.flush(&mut remaining)?;
+                self.flush(&mut remaining, now)?;
             }
             if reads == 0 || remaining == 0 {
                 break;
@@ -215,7 +217,7 @@ impl Outbound {
                     if result.is_err() {
                         tracing::debug!("discarding a rejected session datagram");
                     }
-                    self.flush(&mut remaining)?;
+                    self.flush(&mut remaining, now)?;
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error.into()),
@@ -240,15 +242,31 @@ impl Outbound {
 
     /// Feeds the owning core's deadline without introducing a second timer engine.
     fn timeout(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        match self.state.get() {
+        let result = match self.state.get() {
             Some(State::Gathering(session, _)) => session.handle(SessionInput::Timeout(now)),
             Some(State::Connected(connection)) => connection.handle(ConnectionInput::Timeout(now)),
             None => Err(ProtocolError::Other("connection closed".into())),
+        };
+        result.and(self.check_output_capacity(now))
+    }
+
+    /// Bounds the original core FIFO even while a selected carrier prevents output polling.
+    fn check_output_capacity(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        let usage = match self.state.get() {
+            Some(State::Gathering(session, _)) => session.pending_output_usage(),
+            Some(State::Connected(connection)) => connection.pending_output_usage(),
+            None => return Ok(()),
+        };
+        if usage.entries > MAX_RECEIVED_MESSAGES || usage.bytes > MAX_RECEIVED_BYTES {
+            self.close(now);
+            return Err(ProtocolError::Other(RECEIVE_LIMIT_REACHED.into()));
         }
+        Ok(())
     }
 
     /// Drains core output; nonblocking UDP congestion drops a datagram for protocol retransmission.
-    fn flush(&mut self, remaining: &mut usize) -> Result<(), ProtocolError> {
+    fn flush(&mut self, remaining: &mut usize, now: Instant) -> Result<(), ProtocolError> {
+        self.check_output_capacity(now)?;
         while *remaining > 0 {
             let selected = self.selected_turn_stream();
             if !self.streams.flush(selected) {
@@ -353,10 +371,12 @@ impl Outbound {
             ConnectionEvent::Message(_, data) => data.len(),
             _ => 0,
         };
-        if self.events.len() >= MAX_RECEIVED_MESSAGES
+        if !self.delivery_open
+            || self.events.len() >= MAX_RECEIVED_MESSAGES
             || bytes > MAX_RECEIVED_BYTES.saturating_sub(self.buffered_bytes)
         {
-            return Err(ProtocolError::Other("client receive limit reached".into()));
+            self.delivery_open = false;
+            return Err(ProtocolError::Other(RECEIVE_LIMIT_REACHED.into()));
         }
         self.buffered_bytes += bytes;
         self.events.push_back(event);
@@ -389,9 +409,9 @@ impl Outbound {
 
     /// Moves the original bounded delivery allocation out before finite transport retirement.
     pub(crate) fn retire(mut self) -> VecDeque<ConnectionEvent> {
+        self.close(Instant::now());
         let events = std::mem::take(&mut self.events);
         self.buffered_bytes = 0;
-        self.close(Instant::now());
         events
     }
 
@@ -413,8 +433,7 @@ impl Outbound {
             _ => Err(ProtocolError::Other("offer not created".into())),
         };
         let mut remaining = MAX_OUTPUTS_PER_UPDATE;
-        self.flush(&mut remaining)?;
-        result
+        result.and(self.flush(&mut remaining, now))
     }
 
     /// The active attempt id; callers fence identity validation and deadline changes before admission.
@@ -437,7 +456,7 @@ impl Outbound {
         }
         let mut remaining = MAX_OUTPUTS_PER_UPDATE;
         self.timeout(now)?;
-        self.flush(&mut remaining)?;
+        self.flush(&mut remaining, now)?;
         let selected = self.selected_turn_stream();
         if remaining == 0 || !self.streams.flush(selected) {
             return Err(std::io::Error::from(ErrorKind::WouldBlock).into());
@@ -448,8 +467,7 @@ impl Outbound {
             }
             _ => Err(ProtocolError::Other("not connected".into())),
         };
-        self.flush(&mut remaining)?;
-        result
+        result.and(self.flush(&mut remaining, now))
     }
 
     /// Renews the same live allocation with fresh credentials under its acknowledged lease.
@@ -459,7 +477,7 @@ impl Outbound {
         credentials: TurnCredentials,
         now: Instant,
     ) -> Result<(), ProtocolError> {
-        match self.state.get() {
+        let result = match self.state.get() {
             Some(State::Gathering(session, _)) => {
                 session.update_turn_credentials(server, credentials, now)
             }
@@ -467,49 +485,49 @@ impl Outbound {
                 connection.update_turn_credentials(server, credentials, now)
             }
             None => Err(ProtocolError::Other("connection closed".into())),
-        }
+        };
+        result.and(self.check_output_capacity(now))
     }
 
-    /// Stops all timers, discards application work and attempts finite best-effort relay release.
+    /// Retains the original accepted prefix and attempts only finite best-effort relay release.
     fn close(&mut self, now: Instant) {
         self.streams.flush(None);
+        let mut remaining = MAX_OUTPUTS_PER_UPDATE;
         if let Some(state) = self.state.get().take() {
             match state {
                 State::Gathering(session, _) => {
                     let (mut retired, _result) = session.close(now);
-                    for _ in 0..MAX_OUTPUTS_PER_UPDATE {
-                        match retired.poll() {
-                            Some(SessionOutput::Send(data, to)) => {
-                                let _ = self.socket.send_to(&data, to);
-                            }
-                            Some(SessionOutput::SendStream(data, route)) => {
-                                let _ = self.streams.stage(data, route);
-                            }
-                            Some(_) => {}
-                            None => break,
-                        }
+                    while let Some(output) = retired.poll() {
+                        self.retired_output(output, &mut remaining);
                     }
                 }
                 State::Connected(connection) => {
                     let (mut retired, _result) = connection.close(now);
-                    for _ in 0..MAX_OUTPUTS_PER_UPDATE {
-                        match retired.poll() {
-                            Some(SessionOutput::Send(data, to)) => {
-                                let _ = self.socket.send_to(&data, to);
-                            }
-                            Some(SessionOutput::SendStream(data, route)) => {
-                                let _ = self.streams.stage(data, route);
-                            }
-                            Some(_) => {}
-                            None => break,
-                        }
+                    while let Some(output) = retired.poll() {
+                        self.retired_output(output, &mut remaining);
                     }
                 }
             }
         }
         self.streams.finish();
-        self.events.clear();
-        self.buffered_bytes = 0;
+    }
+
+    /// Drains the same retired core into its existing bounded delivery owner without reopening a rejected prefix.
+    fn retired_output(&mut self, output: SessionOutput, remaining: &mut usize) {
+        match output {
+            SessionOutput::Message(channel, data) => {
+                let _ = self.push_event(ConnectionEvent::Message(channel, data.into_boxed_slice()));
+            }
+            SessionOutput::Send(data, to) if *remaining > 0 => {
+                *remaining -= 1;
+                let _ = self.socket.send_to(&data, to);
+            }
+            SessionOutput::SendStream(data, route) if *remaining > 0 => {
+                *remaining -= 1;
+                let _ = self.streams.stage(data, route);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -521,6 +539,7 @@ impl Drop for Outbound {
 
 const MAX_RECEIVED_MESSAGES: usize = 1024;
 const MAX_RECEIVED_BYTES: usize = 16 * 1024 * 1024;
+const RECEIVE_LIMIT_REACHED: &str = "client receive limit reached";
 
 /// Bounded application delivery shared by both outbound clients.
 #[derive(Default)]
@@ -580,6 +599,8 @@ impl Received {
     }
 }
 
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 

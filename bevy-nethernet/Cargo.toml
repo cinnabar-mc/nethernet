@@ -23,6 +23,7 @@ rustls-platform-verifier = { version = "0.7", optional = true }
 tls = ["dep:rustls", "dep:rustls-platform-verifier"]
 
 [dev-dependencies]
+rtc-turn.workspace = true
 rtc.workspace = true
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }

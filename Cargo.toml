@@ -30,5 +30,6 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 rustls-pemfile = "2"
 rtc = "0.21.1"
+rtc-turn = { git = "https://github.com/cinnabar-mc/rtc-turn", rev = "ceef0780c54c4f5fdc08e7e343403f8026653171" }
 byteorder = "1"
 ipnet = "2"

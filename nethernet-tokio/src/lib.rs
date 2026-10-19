@@ -21,7 +21,9 @@ pub use nethernet::identity::{
 pub use nethernet::phase::{Connecting, Established, Live, Phase, Retired};
 pub use protocol::packet::discovery::{MessagePacket, RequestPacket, ResponsePacket, ServerData};
 pub use protocol::{Message, MessageSegment, Signal, SignalType};
-pub use session::{AcceptedSession, Session, SessionReceiver, SessionSender};
+pub use session::{
+    AcceptedSession, SendPermit, SendReceipt, Session, SessionReceiver, SessionSender,
+};
 pub use signaling::caller::server::{
     CallerServerSignaling, CallerServerSignalingConfig, CallerServerSignalingDriver,
 };

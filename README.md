@@ -58,6 +58,24 @@ observe closure at runtime. Consuming `Session::close` returns a retired owner,
 and consuming `NetherClient::close` returns the retired session with both original
 receivers so accepted messages remain readable.
 
+For an application that must recheck authority after backpressure,
+`SessionSender::reserve_send(deadline)` reserves one slot in the same bounded
+command queue without queuing a payload. Retain that actual future across other
+service work; cancellation loses its wait position, and dropping its owned
+`SendPermit` releases capacity. Commands enter the FIFO in commit order, rather
+than reservation order.
+After a fresh application check, `permit.commit(channel, bytes)` synchronously
+returns a `SendReceipt`; consuming `receipt.acknowledged().await` observes the
+original actor's local core admission result. No await belongs between that check
+and commit. The original absolute deadline and shared closure are checked again;
+a reservation does not keep the session authorized or live. Canceling the receipt
+may retract a not-yet-admitted deadline-bound command, and cannot undo an admitted
+message or an already admitted prefix. Without a deadline, a queued command
+remains eligible for admission after receipt cancellation. The deadline bounds
+capacity acquisition and local core admission; it does not bound the receipt
+wait. Neither reservation nor acknowledgement promises remote delivery. See
+[`reserve_send`](nethernet-tokio/src/session/send.rs) for a complete usage example.
+
 Bevy clients remain stable discovery resources. Borrow
 `client.established()` to access the actual ready transport's send methods;
 retrospective receive remains available on the resource before or after a ready

@@ -3,9 +3,11 @@ pub(crate) mod command;
 pub(crate) mod guard;
 pub(crate) mod outgoing;
 mod receive;
+mod send;
 mod server;
 
 pub(crate) use command::Command;
+pub use send::{SendPermit, SendReceipt};
 pub(crate) use server::{ServerLease, ServerRetirement};
 
 use crate::addr::Addr;
@@ -608,18 +610,6 @@ impl<S: Live> AcceptedSession<S> {
 }
 
 impl SessionSender {
-    pub async fn send(&self, data: Bytes) -> Result<()> {
-        self.send_on(Channel::Reliable, data, None).await
-    }
-
-    /// Admits one reliable message before the original absolute deadline.
-    /// The driver checks the deadline immediately before SCTP admission; a
-    /// successful admission may finish transmitting afterwards. Dropping the
-    /// wait does not retract an already admitted message.
-    pub async fn send_before(&self, data: Bytes, deadline: Instant) -> Result<()> {
-        self.send_on(Channel::Reliable, data, Some(deadline)).await
-    }
-
     /// Replaces one TURN server's credential without opening a service client or changing its allocation.
     pub async fn update_turn_credentials(
         &self,
@@ -632,37 +622,6 @@ impl SessionSender {
             None,
         )
         .await?;
-        reply_rx.await.map_err(|_| NetherError::ConnectionClosed)?
-    }
-
-    /// The message must fit one segment (guide section 6.1).
-    pub async fn send_unreliable(&self, data: Bytes) -> Result<()> {
-        self.send_on(Channel::Unreliable, data, None).await
-    }
-
-    async fn send_on(
-        &self,
-        channel: Channel,
-        data: Bytes,
-        deadline: Option<Instant>,
-    ) -> Result<()> {
-        if deadline.is_some_and(|deadline| transport_now() >= deadline) {
-            return Err(NetherError::Timeout);
-        }
-        let max_size = match channel {
-            Channel::Reliable => {
-                nethernet::protocol::constants::MAX_MESSAGE_SIZE * usize::from(u8::MAX)
-            }
-            Channel::Unreliable => {
-                nethernet::protocol::constants::MAX_MESSAGE_SIZE.saturating_sub(1)
-            }
-        };
-        if data.len() > max_size {
-            return Err(nethernet::error::ProtocolError::MessageSizeExceeded(data.len()).into());
-        }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(Command::Send(channel, data, deadline, reply_tx), deadline)
-            .await?;
         reply_rx.await.map_err(|_| NetherError::ConnectionClosed)?
     }
 

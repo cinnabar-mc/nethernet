@@ -509,3 +509,120 @@ async fn consuming_client_close_retains_a_partially_read_reliable_message() {
     .await
     .expect("real client retirement did not retain the unread accepted stream chunk");
 }
+
+/// Owned reservations occupy the actual actor queue's capacity without a second payload queue.
+#[tokio::test]
+async fn reserved_send_capacity_releases_after_cancellation_and_commits_to_the_real_peer() {
+    use futures::poll;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ((session, _session_reliable), (peer, mut reliable, _peer_unreliable)) =
+            connected_pair().await;
+        let sender = session.sender();
+        let mut permits = Vec::new();
+        for _ in 0..command::COMMAND_CAPACITY {
+            permits.push(sender.reserve_send(None).await.unwrap());
+        }
+        let mut blocked = Box::pin(sender.reserve_send(None));
+        assert!(poll!(blocked.as_mut()).is_pending());
+        drop(blocked);
+        drop(permits.pop().unwrap());
+        let replacement = sender.reserve_send(None).await.unwrap();
+        let mut still_full = Box::pin(sender.reserve_send(None));
+        assert!(poll!(still_full.as_mut()).is_pending());
+        drop(still_full);
+        drop(permits);
+        replacement
+            .commit(Channel::Reliable, Bytes::from_static(b"reserved first"))
+            .unwrap()
+            .acknowledged()
+            .await
+            .unwrap();
+        sender
+            .send(Bytes::from_static(b"ordinary second"))
+            .await
+            .unwrap();
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "reserved first");
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "ordinary second");
+        drop(session.close());
+        drop(peer.close());
+    })
+    .await
+    .expect("actual reserved send capacity control stalled");
+}
+
+/// A permit cannot bypass unique lifecycle retirement or erase accepted receive data.
+#[tokio::test]
+async fn reserved_send_rejects_consuming_retirement_after_the_original_receive_prefix() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ((session, mut reliable), (peer, _peer_reliable, _peer_unreliable)) =
+            connected_pair().await;
+        for bytes in [b"first prefix".as_slice(), b"second prefix".as_slice()] {
+            peer.send(Bytes::copy_from_slice(bytes)).await.unwrap();
+        }
+        while reliable.rx.len() < 2 {
+            assert!(!session.is_closed().await);
+            tokio::task::yield_now().await;
+        }
+        let retained = session.sender();
+        let permit = retained.reserve_send(None).await.unwrap();
+        let retired = session.close();
+        assert!(matches!(
+            permit.commit(Channel::Reliable, Bytes::from_static(b"retired send")),
+            Err(NetherError::ConnectionClosed)
+        ));
+        assert!(matches!(
+            retained.reserve_send(None).await,
+            Err(NetherError::ConnectionClosed)
+        ));
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "first prefix");
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "second prefix");
+        assert!(reliable.recv().await.unwrap().is_none());
+        drop(retired);
+        drop(peer.close());
+    })
+    .await
+    .expect("reserved send retirement lost the accepted prefix");
+}
+
+/// Reservation and commit retain one original absolute deadline on the runtime's clock seam.
+#[tokio::test]
+async fn reserved_send_keeps_the_original_deadline_while_waiting_and_after_acquisition() {
+    use futures::poll;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ((session, _session_reliable), (peer, mut reliable, _peer_unreliable)) =
+            connected_pair().await;
+        let sender = session.sender();
+        tokio::time::pause();
+        let interval = Duration::from_millis(1);
+        let mut permits = Vec::new();
+        for _ in 0..command::COMMAND_CAPACITY {
+            permits.push(sender.reserve_send(None).await.unwrap());
+        }
+        let deadline = transport_now() + interval;
+        let mut blocked = Box::pin(sender.reserve_send(Some(deadline)));
+        assert!(poll!(blocked.as_mut()).is_pending());
+        tokio::time::advance(interval).await;
+        assert!(matches!(blocked.await, Err(NetherError::Timeout)));
+        drop(permits);
+        let deadline = transport_now() + interval;
+        let permit = sender.reserve_send(Some(deadline)).await.unwrap();
+        tokio::time::advance(interval).await;
+        assert!(matches!(
+            permit.commit(
+                Channel::Reliable,
+                Bytes::from_static(b"expired reservation")
+            ),
+            Err(NetherError::Timeout)
+        ));
+        tokio::time::resume();
+        sender
+            .send(Bytes::from_static(b"after expiry"))
+            .await
+            .unwrap();
+        assert_eq!(reliable.recv().await.unwrap().unwrap(), "after expiry");
+        drop(session.close());
+        drop(peer.close());
+    })
+    .await
+    .expect("reserved send absolute deadline control stalled");
+}

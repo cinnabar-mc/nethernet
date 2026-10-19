@@ -8,7 +8,7 @@ use crate::session::AcceptedSession;
 use crate::signaling::ServerSignaling;
 use crate::transport::{ConnectionConfig, ServerIceConfig};
 use futures::Stream;
-use nethernet::identity::TokenTrust;
+use nethernet::identity::{SdpIdentity, TokenTrust};
 use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::task::{Context, Poll};
@@ -20,6 +20,8 @@ type SharedIce = Arc<RwLock<Option<ServerIceConfig>>>;
 
 type SharedTrust = Arc<RwLock<Option<TokenTrust>>>;
 
+type SharedIdentity = Arc<RwLock<Option<Arc<dyn SdpIdentity>>>>;
+
 /// Answers offers arriving on its signaling and yields the connected sessions.
 /// Negotiating, queued and accepted sessions share `ConnectionConfig::max_sessions`.
 pub struct NetherServer {
@@ -27,6 +29,7 @@ pub struct NetherServer {
     local_addr: Addr,
     signaling: ServerSignaling,
     token_trust: SharedTrust,
+    identity: SharedIdentity,
     ice: SharedIce,
     cancel_token: CancellationToken,
     signal_handler_task: Option<JoinHandle<()>>,
@@ -41,7 +44,7 @@ impl NetherServer {
     /// Rejects capacity or deadline settings that cannot be represented by the runtime.
     pub async fn bind_with(
         signaling: impl Into<ServerSignaling>,
-        config: ConnectionConfig,
+        mut config: ConnectionConfig,
     ) -> Result<Self> {
         let signaling: ServerSignaling = signaling.into();
         if signaling.requires_identity()
@@ -72,6 +75,7 @@ impl NetherServer {
         let (incoming_tx, incoming_rx) = mpsc::channel(config.max_sessions.max(1));
         let cancel_token = CancellationToken::new();
         let token_trust = Arc::new(RwLock::new(config.token_trust.clone()));
+        let identity = Arc::new(RwLock::new(config.identity.take()));
         let ice = Arc::new(RwLock::new(config.server_ice.clone()));
         let signals = signaling.signals()?;
         let signal_handler_task = listener::start(
@@ -80,6 +84,7 @@ impl NetherServer {
             cancel_token.clone(),
             config,
             token_trust.clone(),
+            identity.clone(),
             ice.clone(),
             signals,
         );
@@ -89,6 +94,7 @@ impl NetherServer {
             local_addr,
             signaling,
             token_trust,
+            identity,
             ice,
             cancel_token,
             signal_handler_task: Some(signal_handler_task),
@@ -139,6 +145,18 @@ impl NetherServer {
         &self.local_addr
     }
 
+    /// Replaces the answer signer captured by later offers on this same listener.
+    /// Pending and accepted peers retain their original signer and transport lifetimes.
+    /// The caller acquires and validates the replacement; `SdpIdentity::augment` keeps its
+    /// original per-answer signing and credential checks. This performs no refresh or I/O
+    /// and changes neither offer trust nor existing TURN or WebSocket credentials.
+    pub fn set_identity(&self, identity: Arc<dyn SdpIdentity>) {
+        *self
+            .identity
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(identity);
+    }
+
     /// Replaces STUN/TURN configuration for later offers without extending existing credentials.
     /// Pure session construction validates bounds, family and absolute expiry at each admission.
     /// Live sessions use Session::update_turn_credentials for their existing allocation.
@@ -178,3 +196,6 @@ impl Stream for NetherServer {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod identity_tests;

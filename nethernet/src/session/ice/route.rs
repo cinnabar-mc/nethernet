@@ -1,5 +1,5 @@
 //! Numeric carrier identity, independent of the UDP address family requested for a relay.
-use super::config::IceError;
+use super::config::{IceError, MAX_ICE_SERVERS};
 use rtc_turn::proto::reqfamily::{
     REQUESTED_FAMILY_IPV4, REQUESTED_FAMILY_IPV6, RequestedAddressFamily,
 };
@@ -17,12 +17,37 @@ pub enum TurnAddressFamily {
 }
 
 impl TurnAddressFamily {
+    /// Shares the actual carrier-family default between pending allocation and target metadata.
+    pub(super) fn for_local(actual: SocketAddr) -> Self {
+        if actual.is_ipv4() {
+            Self::Ipv4
+        } else {
+            Self::Ipv6
+        }
+    }
+
     /// Uses the dependency's existing attribute encoder before transaction authentication.
     pub(super) fn requested(self) -> RequestedAddressFamily {
         match self {
             Self::Ipv4 => REQUESTED_FAMILY_IPV4,
             Self::Ipv6 => REQUESTED_FAMILY_IPV6,
         }
+    }
+}
+
+/// One bounded slot in a session's pending stream configuration, independent of any socket tuple.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TurnStreamId(u8);
+
+impl TurnStreamId {
+    /// Names a caller-owned carrier slot within the same session's existing endpoint allowance.
+    pub fn new(index: usize) -> Result<Self, IceError> {
+        if index >= MAX_ICE_SERVERS {
+            return Err(IceError::Configuration);
+        }
+        u8::try_from(index)
+            .map(Self)
+            .map_err(|_| IceError::Configuration)
     }
 }
 

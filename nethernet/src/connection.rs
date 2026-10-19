@@ -353,12 +353,16 @@ impl<S: Phase> Connection<S> {
 pub enum ConnectionInput {
     Packet(Box<[u8]>, SocketAddr, Instant),
 
-    /// The original stream is connected and its TLS policy, when applicable, has verified.
-    ActivateTurnStream(crate::session::TurnStreamRoute, Instant),
+    /// Binds the original pending slot to its connected, applicable-TLS-verified actual stream.
+    ActivateTurnStream(
+        crate::session::TurnStreamId,
+        crate::session::TurnStreamRoute,
+        Instant,
+    ),
     /// One complete TURN frame from the original bound stream tuple.
     StreamPacket(Box<[u8]>, crate::session::TurnStreamRoute, Instant),
-    /// The original stream ended; its allocation cannot be moved to another carrier.
-    StreamClosed(crate::session::TurnStreamRoute, Instant),
+    /// A pending or active stream ended; its allocation cannot move to another carrier.
+    StreamClosed(crate::session::TurnStreamId, Instant),
 
     Timeout(Instant),
 
@@ -387,14 +391,14 @@ impl<S: Live> Sans for Connection<S> {
             ConnectionInput::Packet(data, from, now) => {
                 self.session.handle(SessionInput::Packet(data, from, now))
             }
-            ConnectionInput::ActivateTurnStream(route, now) => self
+            ConnectionInput::ActivateTurnStream(id, route, now) => self
                 .session
-                .handle(SessionInput::ActivateTurnStream(route, now)),
+                .handle(SessionInput::ActivateTurnStream(id, route, now)),
             ConnectionInput::StreamPacket(data, route, now) => self
                 .session
                 .handle(SessionInput::StreamPacket(data, route, now)),
-            ConnectionInput::StreamClosed(route, now) => {
-                self.session.handle(SessionInput::StreamClosed(route, now))
+            ConnectionInput::StreamClosed(id, now) => {
+                self.session.handle(SessionInput::StreamClosed(id, now))
             }
             ConnectionInput::Timeout(now) => self.session.handle(SessionInput::Timeout(now)),
             ConnectionInput::Signal(signal, now) => self.handle_signal(&signal, now),

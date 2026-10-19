@@ -71,11 +71,8 @@ impl TurnStreamTarget {
 
     /// Derives the default relay family from this carrier's actual bound TCP tuple.
     pub fn family_for(&self, actual_local: SocketAddr) -> TurnAddressFamily {
-        self.requested_family.unwrap_or(if actual_local.is_ipv4() {
-            TurnAddressFamily::Ipv4
-        } else {
-            TurnAddressFamily::Ipv6
-        })
+        self.requested_family
+            .unwrap_or_else(|| TurnAddressFamily::for_local(actual_local))
     }
 
     /// Bounds connection and TLS setup by both the caller's cutoff and this original credential.

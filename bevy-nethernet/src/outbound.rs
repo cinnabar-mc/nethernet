@@ -61,7 +61,7 @@ impl Outbound {
                 .ice
                 .servers
                 .iter()
-                .any(|server| server.stream_route().is_some())
+                .any(|server| server.stream_id().is_some())
         }) {
             return Err(std::io::Error::new(
                 ErrorKind::Unsupported,

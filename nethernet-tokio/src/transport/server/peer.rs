@@ -251,7 +251,7 @@ impl Peer {
                     now,
                     self.negotiation_deadline.min(deadline),
                 )
-                .map_err(|error| (Some(SignalErrorCode::Ice), error))?;
+                .map_err(|error| (Some(SignalErrorCode::FailedToCreatePeerConnection), error))?;
                 (Some(io), Some(policy))
             }
             None => (Some(IceIo::from(socket)), None),

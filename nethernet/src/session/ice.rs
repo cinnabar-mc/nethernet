@@ -2,6 +2,7 @@
 mod config;
 mod route;
 mod server;
+mod target;
 use super::SessionOutput;
 use crate::error::ProtocolError;
 use crate::protocol::webrtc::certificate;
@@ -25,6 +26,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+pub use target::{MAX_ICE_URL_BYTES, TurnStreamSecurity, TurnStreamTarget};
 
 pub struct IceLayer {
     agent: Agent,

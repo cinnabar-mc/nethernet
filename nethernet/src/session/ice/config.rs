@@ -1,5 +1,6 @@
 //! Resolved inputs for the session's STUN/TURN transaction owners.
 use super::route::{TurnAddressFamily, TurnStreamRoute};
+use super::target::TurnStreamTarget;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -137,12 +138,28 @@ impl Default for IceConfig {
 
 impl IceConfig {
     /// Checks bounded inputs before any RTC transaction is constructed.
-    pub(super) fn validate(&self, local: SocketAddr, now: Instant) -> Result<(), IceError> {
-        if self.servers.len() > MAX_ICE_SERVERS
+    pub fn validate(&self, local: SocketAddr, now: Instant) -> Result<(), IceError> {
+        self.validate_with_stream_targets(local, &[], now)
+    }
+
+    /// Validates one combined endpoint budget before an adapter opens any stream sockets.
+    /// The pure session later validates the actual bound routes with [`Self::validate`].
+    pub fn validate_with_stream_targets(
+        &self,
+        local: SocketAddr,
+        targets: &[TurnStreamTarget],
+        now: Instant,
+    ) -> Result<(), IceError> {
+        if self
+            .servers
+            .len()
+            .checked_add(targets.len())
+            .is_none_or(|total| total > MAX_ICE_SERVERS)
             || self.gather_timeout.is_zero()
             || self.gather_timeout > Duration::from_secs(60)
             || now.checked_add(self.gather_timeout).is_none()
             || (self.policy == IcePolicy::RelayOnly
+                && targets.is_empty()
                 && !self
                     .servers
                     .iter()
@@ -167,6 +184,9 @@ impl IceConfig {
             {
                 return Err(IceError::Credentials);
             }
+        }
+        for target in targets {
+            target.validate(now)?;
         }
         Ok(())
     }

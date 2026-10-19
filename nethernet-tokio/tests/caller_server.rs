@@ -19,7 +19,9 @@ fn signed(identity: &ServerIdentity) -> ConnectionConfig {
     ConnectionConfig {
         identity: Some(Arc::new(identity.clone())),
         attempts: 1,
-        client_ice: Some(ClientIceConfig { turn_streams: Vec::new(), turn_tls: None,
+        client_ice: Some(ClientIceConfig {
+            turn_streams: Vec::new(),
+            turn_tls: None,
             ice: Default::default(),
             bind_addr: Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)),
         }),

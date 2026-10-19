@@ -243,7 +243,7 @@ impl Peer {
         let (mut io, policy) = match &self.config.server_ice {
             Some(ice) => {
                 let (io, policy) = IceIo::configured(
-                    socket.clone(),
+                    socket,
                     &ice.ice,
                     &ice.turn_streams,
                     ice.turn_tls.as_ref(),
@@ -254,7 +254,7 @@ impl Peer {
                 .map_err(|error| (Some(SignalErrorCode::Ice), error))?;
                 (Some(io), Some(policy))
             }
-            None => (Some(IceIo::from(socket.clone())), None),
+            None => (Some(IceIo::from(socket)), None),
         };
         let answered = if let Some(policy) = policy {
             let (mut core, description) =

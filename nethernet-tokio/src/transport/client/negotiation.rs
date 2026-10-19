@@ -45,17 +45,17 @@ where
         let mut outgoing: Option<BoxFuture<'static, Result<()>>> = None;
         let mut answer: Option<(Signal, Option<VerifyingKey>)> = None;
         loop {
-            while !io.blocked() {
+            while !io.blocked(connection.selected_turn_stream()) {
                 let Some(output) = connection.poll() else { break; };
                 match output {
-                    SessionOutput::Send(data, to) => { io.send_datagram(&data, to).await.map_err(|error| (None, NetherError::from(error)))?; }
-                    SessionOutput::SendStream(data, route) => io.send_stream(data, route).map_err(|error| (Some(SignalErrorCode::Ice), error))?,
+                    SessionOutput::Send(data, to) => { io.send_datagram(&data, to).await.map_err(|error| (None, error))?; }
+                    SessionOutput::SendStream(data, route) => io.send_stream(data, route, connection.selected_turn_stream()).map_err(|error| (Some(SignalErrorCode::Ice), error))?,
                     SessionOutput::Wait(wait) => { wake = Instant::now() + wait; }
                     SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => return Err((Some(SignalErrorCode::Ice), NetherError::ConnectionClosed)),
                     _ => {}
                 }
             }
-            if !io.blocked() && queued.is_empty() && outgoing.is_none() {
+            if !io.blocked(connection.selected_turn_stream()) && queued.is_empty() && outgoing.is_none() {
                 if let Some(signal) = connection.poll_local_signal() { queued.push_back(signal); }
                 else if let Some((answer, key)) = answer {
                     // Apply the answer only at handoff, so Ready/data cannot be consumed by this pre-session driver.

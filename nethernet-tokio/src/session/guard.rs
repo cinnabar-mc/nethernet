@@ -147,6 +147,14 @@ impl DrivenConnection {
         }
     }
 
+    /// Reads the core-selected live stream allocation without inferring it from wire output.
+    pub fn selected_turn_stream(&self) -> Option<nethernet::session::TurnStreamRoute> {
+        match self.state.as_ref().expect("driver retains its core") {
+            ActiveConnection::Connecting(core) => core.selected_turn_stream(),
+            ActiveConnection::Established(core) => core.selected_turn_stream(),
+        }
+    }
+
     /// Borrows the current SCTP measurement in either live driver phase.
     pub fn rtt(&self) -> Option<Duration> {
         match self.state.as_ref().expect("driver retains its core") {
@@ -176,6 +184,23 @@ impl DrivenConnection {
             }
             ActiveConnection::Established(core) => {
                 core.update_turn_credentials(server, credentials, now)
+            }
+        }
+    }
+
+    /// Refreshes only the existing allocation on the exact retained stream, never another endpoint.
+    pub fn update_turn_stream_credentials(
+        &mut self,
+        route: nethernet::session::TurnStreamRoute,
+        credentials: nethernet::session::TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        match self.state.as_mut().expect("driver retains its core") {
+            ActiveConnection::Connecting(core) => {
+                core.update_turn_stream_credentials(route, credentials, now)
+            }
+            ActiveConnection::Established(core) => {
+                core.update_turn_stream_credentials(route, credentials, now)
             }
         }
     }

@@ -222,7 +222,7 @@ impl NetherClient {
         let (io, ice) = match &config.client_ice {
             Some(ice) => {
                 let (io, policy) = IceIo::configured(
-                    socket.clone(),
+                    socket,
                     &ice.ice,
                     &ice.turn_streams,
                     ice.turn_tls.as_ref(),
@@ -233,7 +233,7 @@ impl NetherClient {
                 .map_err(|error| (Some(SignalErrorCode::Ice), error))?;
                 (io, Some(policy))
             }
-            None => (IceIo::from(socket.clone()), None),
+            None => (IceIo::from(socket), None),
         };
         let (mut session, description) = match ice {
             Some(ice) => {

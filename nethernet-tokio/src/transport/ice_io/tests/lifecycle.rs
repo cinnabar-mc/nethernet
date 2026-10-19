@@ -2,14 +2,14 @@ use super::*;
 use nethernet::session::TurnStreamId;
 use rtc_turn::proto::{chandata::ChannelData, channum::ChannelNumber};
 
-fn frame(body: &[u8]) -> Box<[u8]> {
+fn frame(body: &[u8]) -> Vec<u8> {
     let mut frame = ChannelData {
         data: body.to_vec(),
         number: ChannelNumber(0x4000),
         ..Default::default()
     };
     frame.encode();
-    frame.raw.into_boxed_slice()
+    frame.raw
 }
 
 #[tokio::test]
@@ -37,6 +37,22 @@ async fn pending_tls_keeps_udp_and_another_stream_live_and_retires_at_original_c
         assert_eq!(route.local(), ready.peer_addr().unwrap());
         assert_eq!(route.remote(), ready.local_addr().unwrap());
         assert!(!route.local().ip().is_unspecified());
+        let mut first_tls_byte = [0; 1];
+        {
+        let handshake = async { held.read_exact(&mut first_tls_byte).await.unwrap(); };
+        let drive = async {
+            loop {
+                match io.next().await.unwrap() {
+                    IceEvent::Activated(id, _) => panic!("unverified held TLS activated: {id:?}"),
+                    IceEvent::Closed(_) => panic!("held TLS retired before original cutoff"),
+                    _ => {},
+                }
+            }
+        };
+        tokio::pin!(handshake, drive);
+        tokio::select! { biased; _ = &mut handshake => {}, _ = &mut drive => unreachable!() }
+        }
+
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender.send_to(b"original UDP remains live", SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), udp.local_addr().unwrap().port())).await.unwrap();
         loop {
@@ -52,7 +68,7 @@ async fn pending_tls_keeps_udp_and_another_stream_live_and_retires_at_original_c
         assert!(matches!(io.next().await.unwrap(), IceEvent::Closed(id) if id == TurnStreamId::new(0).unwrap()));
         tokio::time::resume();
         let original = frame(b"no replay after a borrowed poll is canceled");
-        io.send_stream(original.clone(), route).unwrap();
+        io.send_stream(original.clone(), route, Some(route)).unwrap();
         let mut borrowed = Box::pin(io.next());
         // The borrowed wait can be abandoned; the original frame/cursor belongs to IceIo.
         let first = futures::poll!(borrowed.as_mut());
@@ -70,7 +86,7 @@ async fn pending_tls_keeps_udp_and_another_stream_live_and_retires_at_original_c
         // Pending TLS's same original socket also retires; its ClientHello is not TURN/auth output.
         let mut handshake_prefix = Vec::new();
         held.read_to_end(&mut handshake_prefix).await.unwrap();
-        assert!(!handshake_prefix.is_empty());
+        assert_ne!(first_tls_byte[0], 0, "held target emitted no actual TLS handshake prefix");
     }).await.expect("finite stalled TLS isolation control stalled");
 }
 

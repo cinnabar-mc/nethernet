@@ -91,7 +91,14 @@ impl TurnWire {
             };
             let size = match read {
                 Ok(size) => size,
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    return None;
+                }
                 Err(error) => panic!("controlled TURN read failed: {error}"),
             };
             if size == 0 {
@@ -100,15 +107,15 @@ impl TurnWire {
             self.decoder.extend_from_slice(&bytes[..size]);
         }
     }
-    async fn write(&mut self, bytes: &[u8]) {
+    async fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         match &mut self.stream {
             TestWire::Tcp(stream) => {
-                stream.write_all(bytes).await.unwrap();
-                stream.flush().await.unwrap();
+                stream.write_all(bytes).await?;
+                stream.flush().await
             }
             TestWire::Tls(stream) => {
-                stream.write_all(bytes).await.unwrap();
-                stream.flush().await.unwrap();
+                stream.write_all(bytes).await?;
+                stream.flush().await
             }
         }
     }
@@ -119,8 +126,12 @@ async fn service_pair(
     listener: TcpListener,
     tls: Option<Arc<rustls::ServerConfig>>,
     done: CancellationToken,
+    refreshed: tokio::sync::oneshot::Sender<()>,
 ) {
     let mut turn = turn::TurnPeer::new(listener.local_addr().unwrap());
+    turn.ipv6_relay = listener.local_addr().unwrap().is_ipv6();
+    let mut refreshed = Some(refreshed);
+    let mut nonzero_refreshes = 0;
     let (first, _) = listener.accept().await.unwrap();
     let (second, _) = listener.accept().await.unwrap();
     let (first, second) = tokio::join!(
@@ -128,7 +139,7 @@ async fn service_pair(
         TurnWire::accept(second, tls)
     );
     let mut peers = [first, second];
-    loop {
+    'serve: loop {
         let (first, second) = peers.split_at_mut(1);
         let (index, packet) = tokio::select! {
             biased;
@@ -139,16 +150,48 @@ async fn service_pair(
         let Some(packet) = packet else {
             break;
         };
+        let previous_refreshes = turn.refreshes;
         turn.receive(peers[index].remote, packet);
+        if turn.refreshes > previous_refreshes
+            && turn
+                .last_refresh_lifetime
+                .is_some_and(|lifetime| !lifetime.is_zero())
+        {
+            nonzero_refreshes += 1;
+        }
         while let Some((to, bytes)) = turn.packets.pop_front() {
-            peers
+            if peers
                 .iter_mut()
                 .find(|peer| peer.remote == to)
                 .unwrap()
                 .write(&bytes)
-                .await;
+                .await
+                .is_err()
+            {
+                // Original close does not wait for a TURN deallocation ACK. Any earlier failure
+                // still leaves the actual pair unable to complete its secured data assertions.
+                break 'serve;
+            }
+        }
+        if nonzero_refreshes >= 2
+            && turn
+                .last_refresh_lifetime
+                .is_some_and(|lifetime| !lifetime.is_zero())
+        {
+            assert_eq!(
+                turn.allocation_count(),
+                2,
+                "refresh replaced an original allocation"
+            );
+            if let Some(refreshed) = refreshed.take() {
+                let _ = refreshed.send(());
+            }
         }
     }
+    assert_eq!(
+        nonzero_refreshes, 2,
+        "unadmitted/abandoned renewal dispatched an extra actual Refresh"
+    );
     assert_eq!(
         turn.allocation_requests, 4,
         "each socket must perform both actual Allocate attempts"
@@ -170,7 +213,8 @@ async fn secured_actor_pair(listener: TcpListener, tls: bool) {
         TurnStreamSecurity::Tcp
     };
     let done = CancellationToken::new();
-    let service = service_pair(listener, tls.then_some(server_tls), done.clone());
+    let (refreshed, renewal_observed) = tokio::sync::oneshot::channel();
+    let service = service_pair(listener, tls.then_some(server_tls), done.clone(), refreshed);
     let pair = async {
         let mut gathered = Vec::new();
         for controlling in [true, false] {
@@ -244,6 +288,8 @@ async fn secured_actor_pair(listener: TcpListener, tls: bool) {
         a_core
             .handle(ConnectionInput::Signal(answers[0].clone(), transport_now()))
             .unwrap();
+        let a_route = a.io.as_ref().unwrap().streams[0].1.route.unwrap();
+        let b_route = b.io.as_ref().unwrap().streams[0].1.route.unwrap();
         let (a, mut a_rx, _a_unreliable, a_ready) = RuntimeSession::<Connecting>::spawn(
             a.io.take().unwrap(),
             a_core,
@@ -259,6 +305,125 @@ async fn secured_actor_pair(listener: TcpListener, tls: bool) {
         let (a_ready, b_ready) = tokio::try_join!(a_ready, b_ready).unwrap();
         let a = a.establish(a_ready);
         let b = b.establish(b_ready);
+        for (session, expected) in [(&a, a_route), (&b, b_route)] {
+            let (reply, selected) = tokio::sync::oneshot::channel();
+            session
+                .signal_sender()
+                .send(crate::session::Command::SelectedTurnStream(reply))
+                .await
+                .unwrap();
+            assert_eq!(
+                selected.await.unwrap(),
+                Some(expected),
+                "actual Ready actor selected a different carrier than its retained socket"
+            );
+        }
+        let renewal_deadline = transport_now() + Duration::from_secs(5);
+        let (reply, outcome) = tokio::sync::oneshot::channel();
+        a.signal_sender()
+            .send(crate::session::Command::TurnStreamCredentials(
+                vec![target(addr, security.clone())],
+                transport_now(),
+                reply,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome.await.unwrap(),
+                Err(crate::error::NetherError::Timeout)
+            ),
+            "actor admitted an expired queued stream renewal"
+        );
+        let (reply, abandoned) = tokio::sync::oneshot::channel();
+        drop(abandoned);
+        a.signal_sender()
+            .send(crate::session::Command::TurnStreamCredentials(
+                vec![target(addr, security.clone())],
+                renewal_deadline,
+                reply,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            a.update_turn_streams_before(Vec::new(), renewal_deadline)
+                .await
+                .is_err(),
+            "missing selected replacement reported success"
+        );
+        assert!(
+            a.update_turn_streams_before(
+                vec![
+                    target(addr, security.clone()),
+                    target(addr, security.clone())
+                ],
+                renewal_deadline
+            )
+            .await
+            .is_err(),
+            "ambiguous selected replacements reported success"
+        );
+        assert!(
+            matches!(
+                a.update_turn_streams_before(vec![target(addr, security.clone())], transport_now())
+                    .await,
+                Err(crate::error::NetherError::Timeout)
+            ),
+            "expired original cutoff admitted renewal"
+        );
+        let mut replacement = target(addr, security.clone());
+        replacement.bind_ip = Some(std::net::Ipv4Addr::LOCALHOST.into());
+        assert!(
+            a.update_turn_streams_before(vec![replacement], renewal_deadline)
+                .await
+                .is_err(),
+            "changed source policy rotated an existing socket"
+        );
+        let mut replacement = target(addr, security.clone());
+        replacement.credentials = TurnCredentials::new(
+            "different allocation user".into(),
+            turn::PASSWORD.into(),
+            transport_now() + Duration::from_secs(1200),
+        )
+        .unwrap();
+        assert!(
+            a.update_turn_streams_before(vec![replacement], renewal_deadline)
+                .await
+                .is_err(),
+            "changed username moved an existing allocation"
+        );
+        let mut replacement = target(addr, security.clone());
+        replacement.credentials =
+            TurnCredentials::new(turn::USER.into(), turn::PASSWORD.into(), transport_now())
+                .unwrap();
+        assert!(
+            a.update_turn_streams_before(vec![replacement], renewal_deadline)
+                .await
+                .is_err(),
+            "expired replacement entered the actual core"
+        );
+        a.update_turn_streams_before(vec![target(addr, security.clone())], renewal_deadline)
+            .await
+            .unwrap();
+        b.update_turn_streams_before(vec![target(addr, security.clone())], renewal_deadline)
+            .await
+            .unwrap();
+        renewal_observed
+            .await
+            .expect("same socket service did not observe both actual Refresh requests");
+        for (session, expected) in [(&a, a_route), (&b, b_route)] {
+            let (reply, selected) = tokio::sync::oneshot::channel();
+            session
+                .signal_sender()
+                .send(crate::session::Command::SelectedTurnStream(reply))
+                .await
+                .unwrap();
+            assert_eq!(
+                selected.await.unwrap(),
+                Some(expected),
+                "renewal replaced the actual original socket"
+            );
+        }
         a.send(Bytes::from_static(
             b"same retained TURN socket after gathering",
         ))
@@ -283,11 +448,26 @@ async fn secured_actor_pair(listener: TcpListener, tls: bool) {
 }
 
 #[tokio::test]
-async fn tcp_and_verified_tls_turn_keep_actual_sockets_through_gather_and_real_actor() {
-    for tls in [false, true] {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), secured_actor_pair(listener, tls))
-            .await
-            .expect("finite actual TURN actor pair stalled");
+async fn tcp_and_verified_tls_turn_keep_original_sockets_through_actor_and_refresh() {
+    for bind in ["127.0.0.1:0", "[::1]:0"] {
+        for tls in [false, true] {
+            let listener = match TcpListener::bind(bind).await {
+                Ok(listener) => listener,
+                Err(error)
+                    if bind.starts_with('[')
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+                        ) =>
+                {
+                    eprintln!("missing fixture: IPv6 loopback TCP ({error})");
+                    continue;
+                }
+                Err(error) => panic!("controlled loopback listener unavailable: {error}"),
+            };
+            tokio::time::timeout(Duration::from_secs(10), secured_actor_pair(listener, tls))
+                .await
+                .expect("finite actual TURN actor pair stalled");
+        }
     }
 }

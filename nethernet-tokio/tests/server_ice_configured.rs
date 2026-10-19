@@ -181,7 +181,9 @@ async fn configured_server_rejects_original_expiry_and_accepts_explicit_replacem
                     ServerIdentity::generate("fixture-server", SystemTime::now()).unwrap(),
                 )),
                 token_trust: Some(signing::trust(&client_identity)),
-                server_ice: Some(ServerIceConfig { turn_streams: Vec::new(), turn_tls: None,
+                server_ice: Some(ServerIceConfig {
+                    turn_streams: Vec::new(),
+                    turn_tls: None,
                     bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
                     ice: IceConfig {
                         servers: vec![IceServer::Turn(
@@ -214,7 +216,9 @@ async fn configured_server_rejects_original_expiry_and_accepts_explicit_replacem
             nethernet::error::SignalErrorCode::FailedToCreatePeerConnection as u32
         );
         refused.finish(Ok(SignalDelivery::ServiceAccepted));
-        listener.set_server_ice(Some(ServerIceConfig { turn_streams: Vec::new(), turn_tls: None,
+        listener.set_server_ice(Some(ServerIceConfig {
+            turn_streams: Vec::new(),
+            turn_tls: None,
             bind_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             ice: Default::default(),
         }));
@@ -274,7 +278,9 @@ async fn configured_server_full_stun_gathers_on_the_explicit_socket_family() {
                 ConnectionConfig {
                     identity: Some(Arc::new(server.clone())),
                     token_trust: Some(signing::trust(&client)),
-                    server_ice: Some(ServerIceConfig { turn_streams: Vec::new(), turn_tls: None,
+                    server_ice: Some(ServerIceConfig {
+                        turn_streams: Vec::new(),
+                        turn_tls: None,
                         bind_addr: SocketAddr::new(ip, 0),
                         ice: IceConfig {
                             servers: vec![IceServer::Stun(stun.addr)],

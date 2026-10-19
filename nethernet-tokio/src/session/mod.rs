@@ -312,7 +312,7 @@ impl Session<Connecting> {
                 .as_ref()
                 .is_none_or(|signaling| signaling.enabled.is_none());
             let terminal = 'drive: loop {
-                let admit_commands = !io.blocked();
+                let admit_commands = !io.blocked(connection.selected_turn_stream());
                 tokio::select! {
                     biased;
 
@@ -343,6 +343,10 @@ impl Session<Connecting> {
                         #[cfg(test)]
                         Some(Command::QueuedCommands(reply)) => {
                             let _ = reply.send(commands.len());
+                        }
+                        #[cfg(test)]
+                        Some(Command::SelectedTurnStream(reply)) => {
+                            let _ = reply.send(connection.selected_turn_stream());
                         }
                         Some(Command::Send(channel, data, deadline, reply)) => {
                             let now = transport_now();
@@ -384,11 +388,25 @@ impl Session<Connecting> {
                             let result = connection.update_turn_credentials(server, credentials, transport_now()).map_err(NetherError::from);
                             let _ = reply.send(result);
                         }
+                        Some(Command::TurnStreamCredentials(targets, deadline, reply)) => {
+                            let now = transport_now();
+                            let result = if now >= deadline {
+                                Err(NetherError::Timeout)
+                            } else if reply.is_closed() {
+                                Err(NetherError::ConnectionClosed)
+                            } else if targets.len() > nethernet::session::MAX_ICE_SERVERS {
+                                Err(NetherError::Ice("TURN replacement target limit exceeded".into()))
+                            } else if let Some(route) = connection.selected_turn_stream() {
+                                io.selected_credentials(targets, route, now).and_then(|credentials|
+                                    connection.update_turn_stream_credentials(route, credentials, now).map_err(NetherError::from))
+                            } else { Ok(()) };
+                            let _ = reply.send(result);
+                        }
                         None => break Terminal::Eof,
                     },
                 }
 
-                while !io.blocked() {
+                while !io.blocked(connection.selected_turn_stream()) {
                     let Some(output) = connection.poll() else {
                         break;
                     };
@@ -399,7 +417,10 @@ impl Session<Connecting> {
                             }
                         }
                         SessionOutput::SendStream(data, route) => {
-                            if io.send_stream(data, route).is_err() {
+                            if io
+                                .send_stream(data, route, connection.selected_turn_stream())
+                                .is_err()
+                            {
                                 break 'drive Terminal::Transport;
                             }
                         }
@@ -578,6 +599,17 @@ impl Session<Established> {
     pub fn sender(&self) -> SessionSender {
         self.handle().clone()
     }
+    /// Refreshes this actor's selected stream from exactly one matching original target.
+    pub async fn update_turn_streams_before(
+        &self,
+        targets: Vec<nethernet::session::TurnStreamTarget>,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.handle()
+            .update_turn_streams_before(targets, deadline)
+            .await
+    }
+
     /// Sends through the established capability while retaining unique lifecycle ownership.
     pub async fn send(&self, data: Bytes) -> Result<()> {
         self.handle().send(data).await
@@ -634,6 +666,43 @@ impl<S: Live> AcceptedSession<S> {
 }
 
 impl SessionSender {
+    /// Refreshes only the same actual selected stream, under one original admission cutoff.
+    /// Direct/UDP selection needs no stream mutation. Missing or ambiguous selected-target
+    /// replacements fail; this never reconnects. Success means local core admission, not a
+    /// remote Refresh ACK. Canceling an unadmitted wait retracts it; admitted work stays owned.
+    pub async fn update_turn_streams_before(
+        &self,
+        targets: Vec<nethernet::session::TurnStreamTarget>,
+        deadline: Instant,
+    ) -> Result<()> {
+        if targets.len() > nethernet::session::MAX_ICE_SERVERS {
+            return Err(NetherError::Ice(
+                "TURN replacement target limit exceeded".into(),
+            ));
+        }
+        let now = transport_now();
+        if now >= deadline {
+            return Err(NetherError::Timeout);
+        }
+        for target in &targets {
+            target
+                .validate(now)
+                .map_err(nethernet::error::ProtocolError::from)?;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.enqueue(
+            Command::TurnStreamCredentials(targets, deadline, reply_tx),
+            Some(deadline),
+        )
+        .await?;
+        tokio::select! {
+            biased;
+            _ = self.close_token.cancelled() => Err(NetherError::ConnectionClosed),
+            _ = tokio::time::sleep_until(deadline.into()) => Err(NetherError::Timeout),
+            result = reply_rx => result.map_err(|_| NetherError::ConnectionClosed)?,
+        }
+    }
+
     /// Replaces one TURN server's credential without opening a service client or changing its allocation.
     pub async fn update_turn_credentials(
         &self,

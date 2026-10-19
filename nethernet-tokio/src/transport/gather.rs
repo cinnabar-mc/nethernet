@@ -11,17 +11,17 @@ pub(crate) async fn gather(io: &mut IceIo, session: &mut Session, deadline: Inst
     tokio::time::timeout_at(deadline, async {
         let mut wake = Instant::now();
         loop {
-            while !io.blocked() {
+            while !io.blocked(session.selected_turn_stream()) {
                 let Some(output) = session.poll() else { break; };
                 match output {
                     SessionOutput::Send(data, to) => { io.send_datagram(&data, to).await?; }
-                    SessionOutput::SendStream(data, route) => io.send_stream(data, route)?,
+                    SessionOutput::SendStream(data, route) => io.send_stream(data, route, session.selected_turn_stream())?,
                     SessionOutput::Wait(wait) => { wake = Instant::now() + wait; }
                     SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => return Err(NetherError::ConnectionClosed),
                     _ => {}
                 }
             }
-            if !io.blocked() && session.gathering_state() == GatheringState::Complete {
+            if !io.blocked(session.selected_turn_stream()) && session.gathering_state() == GatheringState::Complete {
                 if session.local_candidates().is_empty() { return Err(NetherError::Ice("no usable local candidates".to_owned())); }
                 return Ok(());
             }

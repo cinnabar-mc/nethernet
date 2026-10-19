@@ -2,7 +2,8 @@
 use crate::error::{NetherError, Result};
 use crate::session::guard::transport_now;
 use nethernet::session::{
-    MAX_TURN_STREAM_FRAME_BYTES, TurnStreamRoute, TurnStreamSecurity, TurnStreamTarget,
+    MAX_TURN_STREAM_FRAME_BYTES, TurnAddressFamily, TurnStreamRoute, TurnStreamSecurity,
+    TurnStreamTarget,
 };
 use rtc::shared::turn_framing::TurnStreamDecoder;
 use rustls::pki_types::ServerName;
@@ -29,6 +30,7 @@ enum State {
     Connecting(TcpStream, Option<(TlsConnector, ServerName<'static>)>),
     Handshaking(Pin<Box<tokio_rustls::Connect<TcpStream>>>),
     Active(Wire),
+    Retiring,
     Closed,
 }
 
@@ -62,13 +64,52 @@ impl Wire {
     }
 }
 
+/// Original endpoint policy without a retained credential or socket clone.
+struct TargetIdentity {
+    remote: SocketAddr,
+    bind_ip: Option<IpAddr>,
+    security: TurnStreamSecurity,
+    requested_family: Option<TurnAddressFamily>,
+}
+impl TargetIdentity {
+    fn new(target: &TurnStreamTarget) -> Self {
+        // Exhaustive destructuring makes newly added target policy require an explicit decision.
+        let TurnStreamTarget {
+            remote,
+            bind_ip,
+            security,
+            credentials: _,
+            requested_family,
+        } = target;
+        Self {
+            remote: *remote,
+            bind_ip: *bind_ip,
+            security: security.clone(),
+            requested_family: *requested_family,
+        }
+    }
+    fn matches(&self, target: &TurnStreamTarget) -> bool {
+        let TurnStreamTarget {
+            remote,
+            bind_ip,
+            security,
+            credentials: _,
+            requested_family,
+        } = target;
+        self.remote == *remote
+            && self.bind_ip == *bind_ip
+            && self.security == *security
+            && self.requested_family == *requested_family
+    }
+}
+
 pub(super) struct Carrier {
     pub route: Option<TurnStreamRoute>,
-    remote: SocketAddr,
+    identity: TargetIdentity,
     state: State,
     deadline: Instant,
     decoder: TurnStreamDecoder,
-    write: Option<(Box<[u8]>, usize)>,
+    write: Option<(Vec<u8>, usize)>,
 }
 
 impl Carrier {
@@ -103,7 +144,7 @@ impl Carrier {
         let stream = TcpStream::from_std(socket.into())?;
         Ok(Self {
             route: None,
-            remote: target.remote,
+            identity: TargetIdentity::new(target),
             state: State::Connecting(stream, tls),
             deadline,
             decoder: TurnStreamDecoder::new(),
@@ -111,12 +152,24 @@ impl Carrier {
         })
     }
 
+    /// Matches the original configured endpoint and only its still-active verified socket.
+    pub fn matches_target(&self, target: &TurnStreamTarget) -> bool {
+        self.identity.matches(target)
+    }
+    pub fn active_route(&self) -> Option<TurnStreamRoute> {
+        if matches!(self.state, State::Active(_)) {
+            self.route
+        } else {
+            None
+        }
+    }
+
     pub fn blocked(&self) -> bool {
         self.write.is_some()
     }
 
     /// Retains exactly the original frame until its complete write and flush; never appends a queue.
-    pub fn send(&mut self, data: Box<[u8]>) -> Result<()> {
+    pub fn send(&mut self, data: Vec<u8>) -> Result<()> {
         if data.len() > MAX_TURN_STREAM_FRAME_BYTES || self.write.is_some() {
             return Err(NetherError::InvalidState(
                 "TURN stream output exceeds its retained frame".into(),
@@ -148,7 +201,65 @@ impl Carrier {
         }
     }
 
+    /// Drops only this candidate's socket; complete already-read frames precede its closure.
+    pub fn retire(&mut self) {
+        if !self.retiring() {
+            self.state = State::Retiring;
+            self.write = None;
+        }
+    }
+
+    pub fn retiring(&self) -> bool {
+        matches!(self.state, State::Retiring | State::Closed)
+    }
+
+    /// Attempts the existing prefix once without adding a second retained frame.
+    pub fn flush_now(&mut self) -> bool {
+        if self.write.is_none() {
+            return true;
+        }
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        match self.poll_write_frame(&mut context) {
+            Poll::Ready(Ok(())) => true,
+            Poll::Ready(Err(error)) => {
+                tracing::debug!(%error, "TURN stream write failed");
+                self.retire();
+                false
+            }
+            Poll::Pending => false,
+        }
+    }
+
+    fn poll_write_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some((data, offset)) = &mut self.write else {
+            return Poll::Ready(Ok(()));
+        };
+        let State::Active(wire) = &mut self.state else {
+            return Poll::Ready(Err(io::ErrorKind::NotConnected.into()));
+        };
+        while *offset < data.len() {
+            let size = ready!(wire.poll_write(cx, &data[*offset..]))?;
+            if size == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            *offset += size;
+        }
+        ready!(wire.poll_flush(cx))?;
+        self.write = None;
+        Poll::Ready(Ok(()))
+    }
+
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<CarrierEvent>> {
+        if let Some(frame) = self
+            .decoder
+            .next_message()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        {
+            return Poll::Ready(Ok(CarrierEvent::Frame(frame.into_boxed_slice())));
+        }
+        if matches!(self.state, State::Retiring) {
+            return Poll::Ready(Err(NetherError::ConnectionClosed));
+        }
         if self
             .setup_deadline()
             .is_some_and(|deadline| transport_now() >= deadline)
@@ -160,7 +271,7 @@ impl Carrier {
             if let Some(error) = stream.take_error()? {
                 return Poll::Ready(Err(error.into()));
             }
-            if stream.peer_addr()? != self.remote {
+            if stream.peer_addr()? != self.identity.remote {
                 return Poll::Ready(Err(io::Error::other(
                     "TCP remote changed during connection",
                 )
@@ -196,39 +307,16 @@ impl Carrier {
                 self.route.expect("connected stream retains actual tuple"),
             )));
         }
+        if self.write.is_some() {
+            match self.poll_write_frame(cx) {
+                Poll::Ready(Ok(())) => return Poll::Ready(Ok(CarrierEvent::Written)),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                Poll::Pending => {}
+            }
+        }
         let State::Active(wire) = &mut self.state else {
             return Poll::Pending;
         };
-        if let Some((data, offset)) = &mut self.write {
-            // One bounded frame per poll. A partial write remains owned on Pending.
-            while *offset < data.len() {
-                match wire.poll_write(cx, &data[*offset..]) {
-                    Poll::Ready(Ok(0)) => {
-                        return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero).into()));
-                    }
-                    Poll::Ready(Ok(size)) => *offset += size,
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                    Poll::Pending => break,
-                }
-            }
-            if *offset == data.len() {
-                match wire.poll_flush(cx) {
-                    Poll::Ready(Ok(())) => {
-                        self.write = None;
-                        return Poll::Ready(Ok(CarrierEvent::Written));
-                    }
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                    Poll::Pending => {}
-                }
-            }
-        }
-        if let Some(frame) = self
-            .decoder
-            .next_message()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-        {
-            return Poll::Ready(Ok(CarrierEvent::Frame(frame.into_boxed_slice())));
-        }
         let remaining = MAX_TURN_STREAM_FRAME_BYTES.saturating_sub(self.decoder.buffered_len());
         if remaining == 0 {
             return Poll::Ready(Err(
@@ -299,10 +387,13 @@ pub(super) fn platform_config() -> Result<Arc<rustls::ClientConfig>> {
 mod tests {
     use super::*;
     use crate::transport::ice_io::tests::{target, tls_pair};
+    use crate::transport::ice_io::{IceEvent, IceIo};
+    use nethernet::session::{IceConfig, TurnStreamId};
     use rtc_turn::proto::{chandata::ChannelData, channum::ChannelNumber};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::net::UdpSocket;
 
     fn frame(body: &[u8]) -> Vec<u8> {
         let mut frame = ChannelData {
@@ -365,7 +456,7 @@ mod tests {
                 assert_eq!(&*received, expected);
             }
             let outgoing = frame(b"one original output frame");
-            carrier.send(outgoing.clone().into_boxed_slice()).unwrap();
+            carrier.send(outgoing.clone()).unwrap();
             let mut borrowed = Box::pin(futures::future::poll_fn(|cx| carrier.poll(cx)));
             let outcome = futures::poll!(borrowed.as_mut());
             drop(borrowed);
@@ -420,7 +511,7 @@ mod tests {
             let mut expected = Vec::new();
             let mut observed = false;
             for _ in 0..64 {
-                carrier.send(original.clone().into_boxed_slice()).unwrap();
+                carrier.send(original.clone()).unwrap();
                 expected.extend_from_slice(&original);
                 let mut borrowed = Box::pin(futures::future::poll_fn(|cx| carrier.poll(cx)));
                 let outcome = futures::poll!(borrowed.as_mut());
@@ -510,5 +601,137 @@ mod tests {
         })
         .await
         .expect("finite original credential cutoff control stalled");
+    }
+    #[tokio::test]
+    async fn selected_socket_pressure_is_retained_but_unused_overload_keeps_other_paths_live() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listeners = [
+                TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            ];
+            let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let targets = [
+                target(listeners[0].local_addr().unwrap(), TurnStreamSecurity::Tcp),
+                target(listeners[1].local_addr().unwrap(), TurnStreamSecurity::Tcp),
+            ];
+            let (mut io, _) = IceIo::configured(
+                udp.clone(),
+                &IceConfig::default(),
+                &targets,
+                None,
+                None,
+                transport_now(),
+                transport_now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            let activate = async {
+                let mut routes = [None, None];
+                while routes.iter().any(Option::is_none) {
+                    match io.next().await.unwrap() {
+                        IceEvent::Activated(id, route) => {
+                            let index = if id == TurnStreamId::new(0).unwrap() {
+                                0
+                            } else {
+                                assert_eq!(id, TurnStreamId::new(1).unwrap());
+                                1
+                            };
+                            routes[index] = Some(route);
+                        }
+                        _ => panic!("actual plain carriers failed before activation"),
+                    }
+                }
+                [routes[0].unwrap(), routes[1].unwrap()]
+            };
+            let (first, second, routes) =
+                tokio::join!(listeners[0].accept(), listeners[1].accept(), activate);
+            let (mut first, _) = first.unwrap();
+            let (mut second, _) = second.unwrap();
+            // This is the wire owner's selected-policy input. The separate real actor pair asserts
+            // the original core getter supplies exactly this actual retained socket identity.
+            let State::Active(Wire::Tcp(stream)) = &io.streams[0].1.state else {
+                panic!("actual pressure socket is not active");
+            };
+            socket2::SockRef::from(stream)
+                .set_send_buffer_size(1024)
+                .unwrap();
+            let original = frame(&vec![0x5a; 60_000]);
+            let mut pressured = false;
+            for _ in 0..64 {
+                if io.blocked(Some(routes[0])) && !io.streams[0].1.flush_now() {
+                    pressured = true;
+                    break;
+                }
+                io.send_stream(original.clone(), routes[0], Some(routes[0]))
+                    .unwrap();
+            }
+            assert!(
+                pressured,
+                "bounded original frames did not reach actual selected socket pressure"
+            );
+            assert!(io.blocked(Some(routes[0])));
+            assert!(
+                !io.streams[0].1.retiring(),
+                "normal selected pressure retired a healthy carrier"
+            );
+            assert!(
+                !io.blocked(Some(routes[1])),
+                "an unused blocked carrier applied global admission pressure"
+            );
+            for _ in 0..64 {
+                io.send_stream(original.clone(), routes[0], Some(routes[1]))
+                    .unwrap();
+                if io.streams[0].1.retiring() {
+                    break;
+                }
+            }
+            assert!(
+                io.streams[0].1.retiring(),
+                "a second unused frame exceeded the slot without retiring its carrier"
+            );
+            assert!(!io.streams[1].1.retiring());
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            sender
+                .send_to(b"usable UDP", udp.local_addr().unwrap())
+                .await
+                .unwrap();
+            let marker = frame(b"the other original TCP stream remains usable");
+            io.send_stream(marker.clone(), routes[1], Some(routes[1]))
+                .unwrap();
+            let advance = async {
+                let mut closed = false;
+                let mut datagram = false;
+                let mut written = false;
+                while !(closed && datagram && written) {
+                    match io.next().await.unwrap() {
+                        IceEvent::Closed(id) => {
+                            assert_eq!(id, TurnStreamId::new(0).unwrap());
+                            closed = true;
+                        }
+                        IceEvent::Datagram(bytes, from) => {
+                            assert_eq!(&*bytes, b"usable UDP");
+                            assert_eq!(from, sender.local_addr().unwrap());
+                            datagram = true;
+                        }
+                        IceEvent::Written => written = true,
+                        _ => panic!("unused overload changed the surviving carrier"),
+                    }
+                }
+            };
+            let receive = async {
+                let mut bytes = vec![0; marker.len()];
+                second.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(bytes, marker);
+            };
+            tokio::join!(advance, receive);
+            drop(io);
+            let mut accepted_prefix = Vec::new();
+            first.read_to_end(&mut accepted_prefix).await.unwrap();
+            assert!(
+                accepted_prefix.len() <= original.len() * 128,
+                "unused carrier acquired an unbounded wire queue"
+            );
+        })
+        .await
+        .expect("finite selected/unused actual socket pressure control stalled");
     }
 }

@@ -114,8 +114,13 @@ impl IceIo {
         Ok((io, ice))
     }
 
-    pub fn blocked(&self) -> bool {
-        self.streams.iter().any(|(_, carrier)| carrier.blocked())
+    /// Only the core's actual selected carrier applies session-wide application backpressure.
+    pub fn blocked(&self, selected: Option<TurnStreamRoute>) -> bool {
+        selected.is_some_and(|route| {
+            self.streams
+                .iter()
+                .any(|(_, carrier)| carrier.route == Some(route) && carrier.blocked())
+        })
     }
     pub async fn next(&mut self) -> Result<IceEvent> {
         let deadline = self
@@ -169,18 +174,72 @@ impl IceIo {
         Poll::Pending
     }
 
+    /// Takes exactly one fresh credential for the same original selected stream descriptor.
+    pub fn selected_credentials(
+        &self,
+        targets: Vec<TurnStreamTarget>,
+        selected: TurnStreamRoute,
+        now: Instant,
+    ) -> Result<nethernet::session::TurnCredentials> {
+        let (_, carrier) = self
+            .streams
+            .iter()
+            .find(|(_, carrier)| carrier.active_route() == Some(selected))
+            .ok_or_else(|| {
+                crate::error::NetherError::Ice("selected TURN stream is not active".into())
+            })?;
+        let mut matches = targets
+            .into_iter()
+            .filter(|target| carrier.matches_target(target));
+        let target = matches.next().ok_or_else(|| {
+            crate::error::NetherError::Ice("selected TURN stream has no replacement".into())
+        })?;
+        if matches.next().is_some() {
+            return Err(crate::error::NetherError::Ice(
+                "selected TURN replacement is ambiguous".into(),
+            ));
+        }
+        target
+            .validate(now)
+            .map_err(nethernet::error::ProtocolError::from)?;
+        Ok(target.credentials)
+    }
+
     pub async fn send_datagram(&self, data: &[u8], to: SocketAddr) -> Result<()> {
         self.udp.send_to(data, to).await?;
         Ok(())
     }
     /// Transfers the original core output into its sole matching carrier without another FIFO.
-    pub fn send_stream(&mut self, data: Box<[u8]>, route: TurnStreamRoute) -> Result<()> {
+    pub fn send_stream(
+        &mut self,
+        data: Vec<u8>,
+        route: TurnStreamRoute,
+        selected: Option<TurnStreamRoute>,
+    ) -> Result<()> {
         match self
             .streams
             .iter_mut()
             .find(|(_, carrier)| carrier.route == Some(route))
         {
-            Some((_, carrier)) => carrier.send(data),
+            Some((_, carrier)) => {
+                if carrier.retiring() {
+                    return Ok(());
+                }
+                if carrier.blocked() && !carrier.flush_now() {
+                    if selected == Some(route) {
+                        return Err(crate::error::NetherError::InvalidState(
+                            "selected TURN output polled during write backpressure".into(),
+                        ));
+                    }
+                    // Candidate-local overload: another payload would exceed this carrier's slot.
+                    carrier.retire();
+                    return Ok(());
+                }
+                if carrier.retiring() {
+                    return Ok(());
+                }
+                carrier.send(data)
+            }
             None => Err(crate::error::NetherError::ConnectionClosed),
         }
     }
@@ -195,14 +254,11 @@ impl IceIo {
                     .streams
                     .iter_mut()
                     .find(|(_, carrier)| carrier.route == Some(route))
+                    && carrier.flush_now()
+                    && !carrier.retiring()
+                    && carrier.send(data).is_ok()
                 {
-                    let mut context = Context::from_waker(futures::task::noop_waker_ref());
-                    if carrier.blocked() {
-                        let _ = carrier.poll(&mut context);
-                    }
-                    if !carrier.blocked() && carrier.send(data).is_ok() {
-                        let _ = carrier.poll(&mut context);
-                    }
+                    let _ = carrier.flush_now();
                 }
             }
             _ => {}

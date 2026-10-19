@@ -11,7 +11,7 @@ pub use config::{
     GatheringState, IceConfig, IceError, IcePolicy, IceServer, MAX_ICE_SERVERS,
     MAX_TURN_CREDENTIAL_BYTES, TurnCredentials,
 };
-pub use route::{MAX_TURN_STREAM_FRAME_BYTES, TurnAddressFamily, TurnStreamRoute};
+pub use route::{MAX_TURN_STREAM_FRAME_BYTES, TurnAddressFamily, TurnStreamId, TurnStreamRoute};
 use rtc::ice::agent::agent_config::AgentConfig;
 use rtc::ice::agent::{Agent, Credentials, Event};
 use rtc::ice::candidate::candidate_host::CandidateHostConfig;
@@ -212,7 +212,7 @@ impl IceLayer {
         if let Some(server) = self
             .servers
             .iter_mut()
-            .find(|server| server.addr == from && server.stream.is_none())
+            .find(|server| server.addr == from && server.stream_id().is_none())
         {
             server.handle_read(TaggedBytesMut {
                 now,
@@ -230,18 +230,26 @@ impl IceLayer {
         Ok(())
     }
 
-    /// Activates only the configured actual TCP tuple after its edge has verified the carrier.
+    /// Binds the pending slot once to the same connected, verified carrier's actual TCP tuple.
     pub fn activate_stream(
         &mut self,
+        id: TurnStreamId,
         route: TurnStreamRoute,
         now: Instant,
     ) -> Result<(), ProtocolError> {
         self.advance_servers(now)?;
+        if self
+            .servers
+            .iter()
+            .any(|server| server.stream_route() == Some(route))
+        {
+            return Err(IceError::Configuration.into());
+        }
         self.servers
             .iter_mut()
-            .find(|server| server.stream == Some(route))
+            .find(|server| server.stream_id() == Some(id))
             .ok_or(IceError::Configuration)?
-            .activate(route, now)
+            .activate(id, route, now)
     }
 
     /// A complete TURN frame belongs to its exact configured TCP tuple, independently of UDP sources.
@@ -257,7 +265,7 @@ impl IceLayer {
         self.advance_servers(now)?;
         self.servers
             .iter_mut()
-            .find(|server| server.stream == Some(route))
+            .find(|server| server.stream_route() == Some(route))
             .ok_or(IceError::Configuration)?
             .handle_read(TaggedBytesMut {
                 now,
@@ -272,24 +280,29 @@ impl IceLayer {
         self.drain_servers()
     }
 
-    /// Retires this exact carrier, keeping other gathering and established routes intact.
+    /// Retires a pending or active reservation, returning only its actual route when one existed.
     pub fn close_stream(
         &mut self,
-        route: TurnStreamRoute,
+        id: TurnStreamId,
         now: Instant,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<Option<TurnStreamRoute>, ProtocolError> {
         self.advance_servers(now)?;
-        self.servers
+        let server = self
+            .servers
             .iter_mut()
-            .find(|server| server.stream == Some(route))
-            .ok_or(IceError::Configuration)?
-            .retire();
-        self.writes.retain(|packet| {
-            !(packet.transport.transport_protocol == TransportProtocol::TCP
-                && packet.transport.local_addr == route.local()
-                && packet.transport.peer_addr == route.remote())
-        });
-        self.drain_servers()
+            .find(|server| server.stream_id() == Some(id))
+            .ok_or(IceError::Configuration)?;
+        let route = server.stream_route();
+        server.retire();
+        if let Some(route) = route {
+            self.writes.retain(|packet| {
+                !(packet.transport.transport_protocol == TransportProtocol::TCP
+                    && packet.transport.local_addr == route.local()
+                    && packet.transport.peer_addr == route.remote())
+            });
+        }
+        self.drain_servers()?;
+        Ok(route)
     }
 
     /// Sends STUN to the ICE engine and admits media only from a checked pair.
@@ -461,24 +474,17 @@ impl IceLayer {
                                 url: None,
                             }
                             .new_candidate_server_reflexive(),
-                            CandidateType::Relay => CandidateRelayConfig {
-                                base_config,
-                                rel_addr: self.servers[index]
-                                    .stream
-                                    .map(TurnStreamRoute::local)
-                                    .or(self.servers[index].reflexive)
-                                    .unwrap_or(self.servers[index].local)
-                                    .ip()
-                                    .to_string(),
-                                rel_port: self.servers[index]
-                                    .stream
-                                    .map(TurnStreamRoute::local)
-                                    .or(self.servers[index].reflexive)
-                                    .unwrap_or(self.servers[index].local)
-                                    .port(),
-                                url: None,
+                            CandidateType::Relay => {
+                                let related =
+                                    self.servers[index].related_addr().ok_or(IceError::Server)?;
+                                CandidateRelayConfig {
+                                    base_config,
+                                    rel_addr: related.ip().to_string(),
+                                    rel_port: related.port(),
+                                    url: None,
+                                }
+                                .new_candidate_relay()
                             }
-                            .new_candidate_relay(),
                             _ => continue,
                         }
                         .map_err(|_| IceError::Server)?;
@@ -596,7 +602,7 @@ impl IceLayer {
         let index = self
             .servers
             .iter()
-            .position(|server| server.stream == Some(route))
+            .position(|server| server.stream_route() == Some(route))
             .ok_or(IceError::Configuration)?;
         self.update_credentials_at(index, credentials, now)
     }

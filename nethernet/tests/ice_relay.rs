@@ -7,7 +7,7 @@ use nethernet::protocol::webrtc::Description;
 use nethernet::sans::Sans;
 use nethernet::session::{
     Channel, GatheringState, IceConfig, IceError, IcePolicy, IceServer, Session, SessionEvent,
-    SessionInput, SessionOutput, TurnAddressFamily, TurnCredentials, TurnStreamRoute,
+    SessionInput, SessionOutput, TurnAddressFamily, TurnCredentials, TurnStreamId, TurnStreamRoute,
 };
 use rtc::ice::candidate::{Candidate, CandidateType};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -45,7 +45,7 @@ fn credentials(now: Instant) -> TurnCredentials {
 
 struct Endpoint<S: Phase = Connecting> {
     local: SocketAddr,
-    stream: Option<TurnStreamRoute>,
+    stream: Option<(TurnStreamId, TurnStreamRoute)>,
     session: Session<S>,
     ready: bool,
     received: Vec<(Channel, Vec<u8>)>,
@@ -67,7 +67,7 @@ impl<S: Phase> Endpoint<S> {
                     progressed = true;
                 }
                 SessionOutput::SendStream(data, route) => {
-                    assert_eq!(self.stream, Some(route));
+                    assert_eq!(self.stream.map(|(_, route)| route), Some(route));
                     assert_eq!(route.remote(), server.addr);
                     server.receive(route.local(), data);
                     progressed = true;
@@ -121,12 +121,12 @@ fn deliver_server_packets<S: Live>(
             .find(|endpoint| {
                 endpoint
                     .stream
-                    .map_or(endpoint.local, TurnStreamRoute::local)
+                    .map_or(endpoint.local, |(_, route)| route.local())
                     == to
             })
             .unwrap();
         let input = match endpoint.stream {
-            Some(route) => SessionInput::StreamPacket(data.into(), route, now),
+            Some((_, route)) => SessionInput::StreamPacket(data.into(), route, now),
             None => SessionInput::Packet(data.into(), server.addr, now),
         };
         endpoint.session.handle(input).unwrap();
@@ -176,15 +176,28 @@ fn pair_with_carrier(
         ice.gather_timeout = Duration::from_millis(100);
     }
     let streams = [42000, 42001].map(|port| {
-        stream_family.map(|_| TurnStreamRoute::new(addr(v6, port), server.addr).unwrap())
+        stream_family.map(|_| {
+            (
+                TurnStreamId::new(0).unwrap(),
+                TurnStreamRoute::new(addr(v6, port), server.addr).unwrap(),
+            )
+        })
     });
     let mut configs = [ice.clone(), ice];
     if let Some(family) = stream_family {
-        for (config, route) in configs.iter_mut().zip(streams) {
+        for (config, stream) in configs.iter_mut().zip(streams) {
+            let (id, route) = stream.unwrap();
             config.servers = vec![IceServer::TurnStream {
-                route: route.unwrap(),
+                id,
+                remote: server.addr,
                 credentials: credentials(now),
-                family,
+                requested_family: (family
+                    != if route.local().is_ipv4() {
+                        TurnAddressFamily::Ipv4
+                    } else {
+                        TurnAddressFamily::Ipv6
+                    })
+                .then_some(family),
             }];
         }
     }
@@ -216,14 +229,14 @@ fn pair_with_carrier(
         },
     ];
     for endpoint in &mut endpoints {
-        if let Some(route) = endpoint.stream {
+        if let Some((id, route)) = endpoint.stream {
             assert!(
                 !endpoint.drain(&mut server),
                 "an unactivated carrier emitted network work"
             );
             endpoint
                 .session
-                .handle(SessionInput::ActivateTurnStream(route, now))
+                .handle(SessionInput::ActivateTurnStream(id, route, now))
                 .unwrap();
         }
     }

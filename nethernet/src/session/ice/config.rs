@@ -1,5 +1,5 @@
 //! Resolved inputs for the session's STUN/TURN transaction owners.
-use super::route::{TurnAddressFamily, TurnStreamRoute};
+use super::route::{TurnAddressFamily, TurnStreamId};
 use super::target::TurnStreamTarget;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -73,11 +73,13 @@ pub enum IceServer {
         credentials: TurnCredentials,
         family: TurnAddressFamily,
     },
-    /// Reserves an actual TCP tuple; activation follows the caller's verified carrier completion.
+    /// Reserves a bounded pending allocation before the original TCP/TLS tuple is available.
     TurnStream {
-        route: TurnStreamRoute,
+        id: TurnStreamId,
+        remote: SocketAddr,
         credentials: TurnCredentials,
-        family: TurnAddressFamily,
+        /// Absence derives from the actual connected carrier when it is activated.
+        requested_family: Option<TurnAddressFamily>,
     },
 }
 
@@ -86,14 +88,14 @@ impl IceServer {
     pub fn addr(&self) -> SocketAddr {
         match self {
             Self::Stun(addr) | Self::Turn(addr, _) | Self::TurnWithFamily { addr, .. } => *addr,
-            Self::TurnStream { route, .. } => route.remote(),
+            Self::TurnStream { remote, .. } => *remote,
         }
     }
 
-    /// The exact stream binding, absent for the original UDP constructors.
-    pub fn stream_route(&self) -> Option<TurnStreamRoute> {
+    /// The bounded pending carrier slot, absent for the original UDP constructors.
+    pub fn stream_id(&self) -> Option<TurnStreamId> {
         match self {
-            Self::TurnStream { route, .. } => Some(*route),
+            Self::TurnStream { id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -172,9 +174,13 @@ impl IceConfig {
             if addr.port() == 0
                 || addr.ip().is_unspecified()
                 || addr.ip().is_multicast()
-                || (server.stream_route().is_none() && addr.is_ipv4() != local.is_ipv4())
+                || (server.stream_id().is_none() && addr.is_ipv4() != local.is_ipv4())
                 || self.servers[..index].iter().any(|previous| {
-                    previous.addr() == addr && previous.stream_route() == server.stream_route()
+                    match (previous.stream_id(), server.stream_id()) {
+                        (Some(previous), Some(current)) => previous == current,
+                        (None, None) => previous.addr() == addr,
+                        _ => false,
+                    }
                 })
             {
                 return Err(IceError::Configuration);

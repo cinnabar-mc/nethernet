@@ -16,7 +16,7 @@ use ice::IceLayer;
 pub use ice::{
     GatheringState, IceConfig, IceError, IcePolicy, IceServer, MAX_ICE_SERVERS, MAX_ICE_URL_BYTES,
     MAX_TURN_CREDENTIAL_BYTES, MAX_TURN_STREAM_FRAME_BYTES, TurnAddressFamily, TurnCredentials,
-    TurnStreamRoute, TurnStreamSecurity, TurnStreamTarget,
+    TurnStreamId, TurnStreamRoute, TurnStreamSecurity, TurnStreamTarget,
 };
 use rtc::datachannel::message::Message as DcepMessage;
 use rtc::ice::candidate::Candidate;
@@ -63,14 +63,14 @@ pub enum SessionOutput {
 pub enum SessionInput {
     Packet(Box<[u8]>, SocketAddr, Instant),
 
-    /// Starts allocation only after the caller connected and, for TLS, verified this actual carrier.
-    ActivateTurnStream(TurnStreamRoute, Instant),
+    /// Binds a pending slot and starts allocation after connection and applicable TLS verification.
+    ActivateTurnStream(TurnStreamId, TurnStreamRoute, Instant),
 
     /// One complete RTC-framed TURN message from the exact activated stream.
     StreamPacket(Box<[u8]>, TurnStreamRoute, Instant),
 
-    /// The original stream ended; retire only its allocation and pending transaction owners.
-    StreamClosed(TurnStreamRoute, Instant),
+    /// A pending or active carrier ended; retire only its original allocation/transaction owners.
+    StreamClosed(TurnStreamId, Instant),
 
     /// Transports start once the description or a later candidate supplies a remote address.
     RemoteDescription(Description, Vec<Candidate>, Instant),
@@ -692,8 +692,8 @@ impl<S: Phase> Session<S> {
                 self.ice.send_selected(data, to, now)?;
             }
         }
-        while let Some((data, to)) = self.ice.poll_write()? {
-            self.output.push_back(SessionOutput::Send(data, to));
+        while let Some(output) = self.ice.poll_write()? {
+            self.output.push_back(output);
         }
         if failed {
             self.fail(now)?;
@@ -780,7 +780,7 @@ impl<S: Live> Sans for Session<S> {
     fn handle(&mut self, msg: SessionInput) -> Result<(), ProtocolError> {
         let now = match &msg {
             SessionInput::Packet(_, _, now)
-            | SessionInput::ActivateTurnStream(_, now)
+            | SessionInput::ActivateTurnStream(_, _, now)
             | SessionInput::StreamPacket(_, _, now)
             | SessionInput::StreamClosed(_, now)
             | SessionInput::RemoteDescription(_, _, now)
@@ -799,8 +799,8 @@ impl<S: Live> Sans for Session<S> {
         }
         match msg {
             SessionInput::Packet(data, from, now) => self.handle_packet(&data, from, now),
-            SessionInput::ActivateTurnStream(route, now) => {
-                self.ice.activate_stream(route, now)?;
+            SessionInput::ActivateTurnStream(id, route, now) => {
+                self.ice.activate_stream(id, route, now)?;
                 self.pump(now)?;
                 self.push_wait(now);
                 Ok(())
@@ -809,11 +809,12 @@ impl<S: Live> Sans for Session<S> {
                 self.ice.handle_stream_read(&data, route, now)?;
                 self.drain_ice_read(now)
             }
-            SessionInput::StreamClosed(route, now) => {
-                self.ice.close_stream(route, now)?;
-                self.output.retain(
-                    |output| !matches!(output, SessionOutput::SendStream(_, old) if *old == route),
-                );
+            SessionInput::StreamClosed(id, now) => {
+                if let Some(route) = self.ice.close_stream(id, now)? {
+                    self.output.retain(
+                        |output| !matches!(output, SessionOutput::SendStream(_, old) if *old == route),
+                    );
+                }
                 self.pump(now)?;
                 self.push_wait(now);
                 Ok(())

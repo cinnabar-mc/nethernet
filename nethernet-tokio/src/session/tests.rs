@@ -678,3 +678,61 @@ async fn rtt_observation_matches_original_actor_and_withdraws_on_close_or_abort(
     .await
     .expect("RTT observation retained a retired actor");
 }
+
+/// A retained observation must not block the original synchronous close capability.
+#[tokio::test]
+async fn rtt_observation_does_not_block_synchronous_retirement() {
+    let ((sender, sender_reliable), (receiver, mut reliable, unreliable)) = connected_pair().await;
+    let retained = receiver.sender();
+    let observation = retained.subscribe_rtt();
+    let receiver_guard = retained._guard.clone();
+    let sender_guard = sender.handle()._guard.clone();
+    let held = observation.borrow();
+    let (completed, completion) = std::sync::mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        retained.start_close();
+        let _ = completed.send(());
+        retained
+    });
+    // This finite event wait also lets a blocking baseline release every owner before asserting.
+    let closed_while_observed = completion.recv_timeout(Duration::from_secs(1)).is_ok();
+    drop(held);
+    let retained = closer.join().expect("owned close thread panicked");
+    let receiver_end = tokio::time::timeout(Duration::from_secs(10), reliable.recv()).await;
+    sender.sender().start_close();
+    drop((
+        sender,
+        sender_reliable,
+        receiver,
+        reliable,
+        unreliable,
+        retained,
+        observation,
+    ));
+    let mut receiver_guard = Arc::try_unwrap(receiver_guard)
+        .ok()
+        .expect("one receiver task owner");
+    let mut sender_guard = Arc::try_unwrap(sender_guard)
+        .ok()
+        .expect("one sender task owner");
+    let receiver_join =
+        tokio::time::timeout(Duration::from_secs(10), &mut receiver_guard.task).await;
+    let sender_join = tokio::time::timeout(Duration::from_secs(10), &mut sender_guard.task).await;
+    drop((receiver_guard, sender_guard));
+    assert!(
+        receiver_end.is_ok(),
+        "original receiver failed to terminate"
+    );
+    assert!(
+        matches!(receiver_join, Ok(Ok(()))),
+        "original receiving actor failed to retire"
+    );
+    assert!(
+        matches!(sender_join, Ok(Ok(()))),
+        "original sending actor failed to retire"
+    );
+    assert!(
+        closed_while_observed,
+        "RTT observation blocked synchronous retirement"
+    );
+}

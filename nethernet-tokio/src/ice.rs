@@ -36,6 +36,7 @@ pub enum IceResolveError {
 /// Supply the original absolute credential expiry, rather than extending a cached service TTL.
 /// The caller's deadline bounds the whole operation. Numeric inputs bypass DNS. Known TCP/TLS
 /// alternatives are skipped when a UDP URL is available; this edge does not implement those transports.
+/// URLs with no address for the bound socket family are skipped; if none remain, resolution fails.
 /// Use the resulting owned endpoints in `nethernet::session::IceConfig` for either runtime adapter.
 pub async fn resolve_ice_servers(
     servers: &[IceServer],
@@ -100,11 +101,7 @@ pub async fn resolve_ice_servers(
     let mut owners = Vec::new();
     for (record, url) in parsed {
         let addr = if let Ok(ip) = url.host.parse::<IpAddr>() {
-            let addr = SocketAddr::new(ip, url.port);
-            if addr.is_ipv4() != local.is_ipv4() {
-                return Err(IceResolveError::AddressFamily);
-            }
-            addr
+            SocketAddr::new(ip, url.port)
         } else {
             let addresses = tokio::time::timeout_at(
                 deadline.min(valid_until).into(),
@@ -119,13 +116,19 @@ pub async fn resolve_ice_servers(
                 }
             })?
             .map_err(|_| IceResolveError::Dns)?;
-            addresses
+            let Some(addr) = addresses
                 .into_iter()
                 .find(|addr| addr.is_ipv4() == local.is_ipv4())
-                .ok_or(IceResolveError::AddressFamily)?
+            else {
+                continue;
+            };
+            addr
         };
         if addr.ip().is_unspecified() || addr.ip().is_multicast() {
             return Err(IceResolveError::Invalid);
+        }
+        if addr.is_ipv4() != local.is_ipv4() {
+            continue;
         }
         let server = &servers[record];
         let endpoint = if url.scheme == SchemeType::Stun {
@@ -170,6 +173,9 @@ pub async fn resolve_ice_servers(
     if transport_now() >= deadline {
         return Err(IceResolveError::TimedOut);
     }
+    if resolved.is_empty() && !servers.is_empty() {
+        return Err(IceResolveError::AddressFamily);
+    }
     Ok(resolved)
 }
 
@@ -178,6 +184,41 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
+
+    /// An unrelated numeric family cannot suppress the same service's usable alternative.
+    #[tokio::test]
+    async fn resolver_retains_usable_service_urls_after_another_socket_family() {
+        let now = transport_now();
+        let expires = now + Duration::from_secs(30);
+        let deadline = now + Duration::from_secs(5);
+        let port = 40280;
+        let endpoints = [
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
+        ];
+        let mut outcomes = Vec::new();
+        for (index, expected) in endpoints.iter().copied().enumerate() {
+            let other = endpoints[1 - index];
+            let service = IceServer {
+                urls: vec![format!("stun:{other}"), format!("stun:{expected}")],
+                ..Default::default()
+            };
+            let resolved = resolve_ice_servers(
+                &[service],
+                SocketAddr::new(expected.ip(), 0),
+                expires,
+                deadline,
+            )
+            .await;
+            outcomes.push((expected, resolved));
+        }
+        for (expected, resolved) in outcomes {
+            let resolved = resolved
+                .expect("an unrelated address family discarded a usable numeric service URL");
+            assert_eq!(resolved.len(), 1);
+            assert!(matches!(resolved[0], ResolvedServer::Stun(addr) if addr == expected));
+        }
+    }
 
     #[tokio::test]
     async fn resolver_preserves_deadlines_socket_family_and_udp_service_alternatives() {

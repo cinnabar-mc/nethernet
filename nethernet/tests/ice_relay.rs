@@ -1000,4 +1000,5 @@ fn owned_turn_transactions_ignore_wrong_methods_and_reflected_requests() {
     }
 }
 
+#[path = "ice_relay/allocation_lifetime.rs"]
 mod allocation_lifetime;

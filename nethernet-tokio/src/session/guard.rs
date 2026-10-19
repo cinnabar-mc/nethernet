@@ -140,7 +140,6 @@ impl DrivenConnection {
     }
 
     /// Reads the original core FIFO without bypassing the actor's ownership.
-    #[cfg(test)]
     pub fn pending_output_usage(&self) -> nethernet::session::OutputUsage {
         match self.state.as_ref().expect("driver retains its core") {
             ActiveConnection::Connecting(core) => core.pending_output_usage(),
@@ -214,11 +213,19 @@ impl DrivenConnection {
         }
     }
 
-    /// Consumes whichever live phase remains, retaining teardown output even when close reports failure.
-    fn close(mut self, now: Instant, io: &mut IceIo) {
-        let (mut retired, _result) = match self.state.take().expect("driver retains its core") {
+    /// Takes the original owner once, keeping its accepted prefix available for bounded final delivery.
+    pub fn retire(&mut self, now: Instant) -> Option<Connection<nethernet::phase::Retired>> {
+        let (retired, _result) = match self.state.take()? {
             ActiveConnection::Connecting(core) => core.close(now),
             ActiveConnection::Established(core) => core.close(now),
+        };
+        Some(retired)
+    }
+
+    /// Finite fallback teardown remains safe after the actor already consumed its original core.
+    fn close(mut self, now: Instant, io: &mut IceIo) {
+        let Some(mut retired) = self.retire(now) else {
+            return;
         };
         while let Some(output) = retired.poll() {
             io.best_effort(output);

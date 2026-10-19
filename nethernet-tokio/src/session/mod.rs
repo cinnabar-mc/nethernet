@@ -422,6 +422,12 @@ impl Session<Connecting> {
                     connection.pending_output_usage(),
                     io.kernel_blocked(connection.selected_turn_stream()),
                 );
+                let usage = connection.pending_output_usage();
+                if usage.entries > PACKET_CHANNEL_CAPACITY
+                    || usage.bytes > receive::MAX_ACCEPTED_BYTES
+                {
+                    break Terminal::Capacity;
+                }
                 while !io.blocked(connection.selected_turn_stream()) {
                     let Some(output) = connection.poll() else {
                         break;
@@ -492,6 +498,8 @@ impl Session<Connecting> {
                     .publish(rtt.filter(|sample| !sample.is_zero()));
             };
             rtt_observation.0.retire();
+            let terminal =
+                drain_retired_prefix(connection, io, &packet_tx, &unreliable_tx, terminal);
             packet_tx.finish(terminal);
             unreliable_tx.finish(terminal);
             close_token.cancel();
@@ -505,6 +513,41 @@ impl Session<Connecting> {
             _phase: PhantomData,
         }
     }
+}
+
+/// Preserves the original accepted prefix in its existing final owner before reporting retirement.
+fn drain_retired_prefix(
+    connection: &mut guard::DrivenConnection,
+    io: &mut IceIo,
+    reliable: &Producer,
+    unreliable: &Producer,
+    mut terminal: Terminal,
+) -> Terminal {
+    let Some(mut retired) = connection.retire(transport_now()) else {
+        return terminal;
+    };
+    let mut reliable_open = true;
+    while let Some(output) = retired.poll() {
+        match output {
+            SessionOutput::Message(Channel::Reliable, data) if reliable_open => {
+                if let Err(error) = reliable.push(Bytes::from(data)) {
+                    reliable_open = false;
+                    if matches!(terminal, Terminal::Eof) {
+                        terminal = match error {
+                            AdmissionError::Full => Terminal::Capacity,
+                            AdmissionError::Closed => Terminal::Transport,
+                        };
+                    }
+                }
+            }
+            SessionOutput::Message(Channel::Reliable, _) => {}
+            SessionOutput::Message(Channel::Unreliable, data) => {
+                let _ = unreliable.push(Bytes::from(data));
+            }
+            output => io.best_effort(output),
+        }
+    }
+    terminal
 }
 
 impl<S: Phase> Session<S> {

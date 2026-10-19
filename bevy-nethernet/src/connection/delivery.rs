@@ -163,6 +163,32 @@ impl<K: Clone + Eq> Delivery<K> {
         channel: Channel,
         bytes: Box<[u8]>,
     ) -> bool {
+        if readiness.is_retired() {
+            return false;
+        }
+        self.enqueue_message(readiness, channel, bytes)
+    }
+
+    /// Retains only already accepted output from the exact original core while its worker retires it.
+    pub(super) fn retained_message(
+        &mut self,
+        readiness: &Readiness,
+        channel: Channel,
+        bytes: Box<[u8]>,
+    ) -> bool {
+        if !readiness.is_retired() {
+            return false;
+        }
+        self.enqueue_message(readiness, channel, bytes)
+    }
+
+    /// Both original live output and its retirement prefix use this single final charge and order.
+    fn enqueue_message(
+        &mut self,
+        readiness: &Readiness,
+        channel: Channel,
+        bytes: Box<[u8]>,
+    ) -> bool {
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -173,8 +199,7 @@ impl<K: Clone + Eq> Delivery<K> {
         let Some(total_bytes) = self.bytes.checked_add(bytes.len()) else {
             return false;
         };
-        if entry.terminal
-            || readiness.is_retired()
+        if entry.owner_finished
             || self.packets >= self.limits.max_received_packets
             || total_bytes > self.limits.max_received_bytes
         {
@@ -276,7 +301,9 @@ impl<K: Clone + Eq> Delivery<K> {
             let eligible = match record.event.event {
                 PoolUpdate::Ready(_) => true,
                 PoolUpdate::Failed => self.entries.iter().any(|entry| {
-                    entry.readiness.matches(&record.event.readiness) && entry.unpublished == 0
+                    entry.readiness.matches(&record.event.readiness)
+                        && entry.owner_finished
+                        && entry.unpublished == 0
                 }),
                 PoolUpdate::Rtt(_) => false,
             };
@@ -408,6 +435,8 @@ impl<K: Clone + Eq> Delivery<K> {
     }
 }
 
+#[cfg(test)]
+mod retained_tests;
 #[cfg(test)]
 mod retirement_tests;
 #[cfg(test)]

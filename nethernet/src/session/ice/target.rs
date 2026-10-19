@@ -57,7 +57,7 @@ impl TurnStreamTarget {
     }
 
     /// Uses only a caller-explicit concrete source, never an unrelated UDP routing probe.
-    /// Without one, the adapter validates this TCP socket's actual tuple after connect starts.
+    /// Without one, the adapter validates this TCP socket's actual tuple after connect completes.
     pub fn local_bind_ip(&self, fallback: Option<IpAddr>) -> Result<Option<IpAddr>, IceError> {
         let usable = |ip: IpAddr| {
             !ip.is_unspecified() && !ip.is_multicast() && ip.is_ipv4() == self.remote.is_ipv4()

@@ -14,7 +14,7 @@ pub use addr::Addr;
 pub use builders::*;
 pub use credentials::{Credentials, IceServer};
 pub use error::{NetherError, Result};
-pub use ice::{IceResolveError, resolve_ice_servers};
+pub use ice::{IceResolveError, ResolvedIceTargets, resolve_ice_servers, resolve_ice_targets};
 pub use nethernet::identity::{
     PlayerInfo, SdpIdentity, SelfSignedIdentity, ServerIdentity, TokenIdentity, TokenTrust,
 };

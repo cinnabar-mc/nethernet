@@ -99,6 +99,26 @@ runtime adapters.
 - Candidate inference for peers that gathered nothing a host on another network can reach
 - Connection limits and trusted proxies on the HTTP endpoint
 
+### ICE relay carriers
+
+The core accepts UDP TURN endpoints with an explicit `TurnAddressFamily`, and
+stream reservations through `IceServer::TurnStream`. Assign each pending carrier
+its own bounded `TurnStreamId`. After that same socket connects and any TLS
+verification completes, submit `ActivateTurnStream(id, route, now)` with its
+actual `TurnStreamRoute`. Submit complete dependency-framed messages through
+`StreamPacket`, write `SendStream` output back to that original carrier, and
+report failure through `StreamClosed(id, now)`, including before a tuple exists.
+The core opens no sockets and performs no TLS or DNS work. Closing a selected
+carrier preserves accepted messages before its terminal event.
+
+`resolve_ice_targets` resolves service URLs into UDP endpoints and unopened
+`TurnStreamTarget`s under one caller deadline, credential expiry and endpoint
+limit. TLS targets retain the original hostname for verification. Source address
+selection belongs to the connected stream; it is independent of the UDP socket.
+The existing `resolve_ice_servers` API remains UDP-only. These core and resolution
+APIs do not make the current runtime adapters accept stream reservations; they
+reject them until a caller supplies stream I/O.
+
 ### Usage
 
 To build the project:

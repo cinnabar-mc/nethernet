@@ -321,6 +321,7 @@ impl<S: Phase> Connection<S> {
     }
 
     /// Rotates one TURN allocation's credential using the caller's clock.
+    /// Success admits the refresh locally; its actual response determines the allocation lifetime.
     pub fn update_turn_credentials(
         &mut self,
         server: SocketAddr,

@@ -59,6 +59,7 @@ pub(super) struct Server {
     client: Option<Client>,
     binding: Option<TransactionId>,
     allocating: bool,
+    // Bounds initial allocation admission; an acknowledged allocation owns a separate lease.
     credential_expiry: Option<Instant>,
     username: Option<String>,
     allocation_expiry: Option<Instant>,
@@ -321,6 +322,7 @@ impl Server {
                     if self.allocation_expiry.is_none() {
                         self.retire();
                     } else {
+                        self.credential_expiry = None;
                         self.events
                             .push_back(ServerEvent::Candidate(CandidateType::Relay, addr));
                         if let Some(reflexive) = self.reflexive {
@@ -591,7 +593,6 @@ impl Server {
             .map_err(|_| IceError::Server)?;
         self.integrity_key = Some(key);
         self.manual_refresh_pending = true;
-        self.credential_expiry = Some(credentials.valid_until);
         Ok(())
     }
 

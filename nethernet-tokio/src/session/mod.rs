@@ -567,7 +567,8 @@ impl Session<Established> {
     pub async fn send_unreliable(&self, data: Bytes) -> Result<()> {
         self.handle().send_unreliable(data).await
     }
-    /// Rotates the original live allocation without extending its credential expiry.
+    /// Admits a password rotation on the original live allocation; its actual response determines the lease.
+    /// Completion acknowledges local actor admission rather than the remote Refresh response.
     pub async fn update_turn_credentials(
         &self,
         server: std::net::SocketAddr,

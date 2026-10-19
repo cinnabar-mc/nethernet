@@ -409,4 +409,6 @@ impl<K: Clone + Eq> Delivery<K> {
 }
 
 #[cfg(test)]
+mod retirement_tests;
+#[cfg(test)]
 mod tests;

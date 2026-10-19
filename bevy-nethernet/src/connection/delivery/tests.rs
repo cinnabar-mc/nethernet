@@ -128,3 +128,126 @@ fn undrained_generations_hold_capacity_without_giving_stale_tokens_new_authority
         old = Some(current);
     }
 }
+
+/// Continuous successor payloads cannot hide an already eligible terminal or retain its slot.
+#[test]
+fn continuous_payload_promotion_cannot_starve_an_original_terminal() {
+    let mut delivery = Delivery::new();
+    delivery.set_limits(ServerLimits {
+        max_sessions: 2,
+        max_received_packets: 2,
+        max_received_bytes: 2,
+    });
+    let retired = delivery.reserve(1).unwrap();
+    let active = delivery.reserve(2).unwrap();
+    delivery.ready(&retired, None);
+    delivery.ready(&active, None);
+    let mut updates = Vec::new();
+    delivery.advance(&mut updates, 2);
+    for _ in 0..2 {
+        assert!(matches!(
+            delivery.next_event().unwrap().event,
+            PoolUpdate::Ready(_)
+        ));
+    }
+    delivery.owner_finished(&retired);
+    let mut expected = VecDeque::new();
+    let mut next = 0_u8;
+    let mut terminal = false;
+    for _ in 0..4 {
+        while delivery.packets < 2 {
+            expected.push_back(next);
+            assert!(delivery.message(&active, Channel::Reliable, Box::from([next])));
+            next += 1;
+        }
+        delivery.advance(&mut updates, 2);
+        while let Some((id, bytes)) = delivery.recv(Channel::Reliable) {
+            assert_eq!(id, 2);
+            assert_eq!(bytes.as_ref(), &[expected.pop_front().unwrap()]);
+        }
+        if let Some(event) = delivery.next_event() {
+            assert!(!terminal);
+            assert!(matches!(event.event, PoolUpdate::Failed));
+            assert!(event.readiness.matches(&retired));
+            terminal = true;
+        }
+    }
+    assert!(
+        terminal,
+        "continuous payload promotion starved the original eligible terminal"
+    );
+    assert!(delivery.contains(&2, &active));
+    assert!(!delivery.contains(&1, &retired));
+    assert!(
+        delivery.reserve(3).is_some(),
+        "consumed original terminal retained its admission slot"
+    );
+    assert_eq!((delivery.packets, delivery.bytes), (0, 0));
+    assert!(expected.is_empty());
+}
+
+/// An older accepted unreliable prefix and its terminal progress under sustained reliable traffic.
+#[test]
+fn continuous_reliable_successors_cannot_hide_an_original_unreliable_prefix() {
+    let mut delivery = Delivery::new();
+    delivery.set_limits(ServerLimits {
+        max_sessions: 2,
+        max_received_packets: 3,
+        max_received_bytes: 3,
+    });
+    let retired = delivery.reserve(1).unwrap();
+    let active = delivery.reserve(2).unwrap();
+    delivery.ready(&retired, None);
+    delivery.ready(&active, None);
+    let mut updates = Vec::new();
+    delivery.advance(&mut updates, 2);
+    for _ in 0..2 {
+        assert!(matches!(
+            delivery.next_event().unwrap().event,
+            PoolUpdate::Ready(_)
+        ));
+    }
+    assert!(delivery.message(&retired, Channel::Unreliable, Box::from(&b"u"[..])));
+    delivery.owner_finished(&retired);
+    let mut prefix = false;
+    let mut terminal = false;
+    for _ in 0..4 {
+        while delivery.packets < 3 {
+            assert!(delivery.message(&active, Channel::Reliable, Box::from(&b"r"[..])));
+        }
+        delivery.advance(&mut updates, 2);
+        while let Some((id, bytes)) = delivery.recv(Channel::Reliable) {
+            assert_eq!(id, 2);
+            assert_eq!(bytes.as_ref(), b"r");
+        }
+        if let Some((id, bytes)) = delivery.recv(Channel::Unreliable) {
+            assert!(!prefix);
+            assert_eq!(id, 1);
+            assert_eq!(bytes.as_ref(), b"u");
+            prefix = true;
+        }
+        if let Some(event) = delivery.next_event() {
+            assert!(
+                prefix,
+                "terminal preceded visibility of its own original prefix"
+            );
+            assert!(!terminal);
+            assert!(matches!(event.event, PoolUpdate::Failed));
+            assert!(event.readiness.matches(&retired));
+            terminal = true;
+        }
+    }
+    assert!(
+        prefix,
+        "reliable successors starved the original accepted unreliable prefix"
+    );
+    assert!(
+        terminal,
+        "the original prefix's terminal never became visible"
+    );
+    assert!(delivery.contains(&2, &active));
+    assert!(delivery.reserve(3).is_some());
+    delivery.advance(&mut updates, 3);
+    while delivery.recv(Channel::Reliable).is_some() {}
+    assert_eq!((delivery.packets, delivery.bytes), (0, 0));
+}

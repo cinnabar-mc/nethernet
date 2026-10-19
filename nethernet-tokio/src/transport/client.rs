@@ -13,6 +13,7 @@ use nethernet::connection::{Connection as SansConnection, IceMode};
 use nethernet::identity::{TokenTrust, verify_answer_with_policy};
 use nethernet::phase::{Connecting, Retired};
 use nethernet::session::Session as SansSession;
+use p384::ecdsa::VerifyingKey;
 use rand::Rng;
 use std::io;
 use std::pin::Pin;
@@ -38,9 +39,9 @@ fn check_answer(
     server_trust: Option<&TokenTrust>,
     allow_anonymous: bool,
     now: SystemTime,
-) -> std::result::Result<(), (Option<SignalErrorCode>, NetherError)> {
+) -> std::result::Result<Option<VerifyingKey>, (Option<SignalErrorCode>, NetherError)> {
     verify_answer_with_policy(&answer.data, server_trust, allow_anonymous, now)
-        .map(|_| ())
+        .and_then(|claims| claims.map(|claims| claims.client_public_key()).transpose())
         .map_err(|e| {
             (
                 Some(SignalErrorCode::FailedToSetRemoteDescription),
@@ -108,6 +109,7 @@ impl Stream for SessionStream {
 /// Client connection; AsyncRead and AsyncWrite use the reliable channel.
 pub struct NetherClient {
     session: Session,
+    server_public_key: Option<VerifyingKey>,
     unreliable: SessionReceiver,
     reader: Option<StreamReader<SessionStream, Bytes>>,
     send_future: Option<ReusableBoxFuture<'static, Result<()>>>,
@@ -276,7 +278,7 @@ impl NetherClient {
             remote_network_id.to_string(),
         )];
         outgoing.extend(signals_out);
-        negotiation::exchange(
+        let server_public_key = negotiation::exchange(
             &socket,
             guard.core(),
             &mut incoming,
@@ -322,11 +324,9 @@ impl NetherClient {
             })?
             .map_err(|_| (None, NetherError::ConnectionClosed))?;
 
-        Ok(Self::from_session(
-            session.establish(ready),
-            reliable,
-            unreliable,
-        ))
+        let mut client = Self::from_session(session.establish(ready), reliable, unreliable);
+        client.server_public_key = server_public_key;
+        Ok(client)
     }
 
     pub(crate) fn from_session(
@@ -336,11 +336,18 @@ impl NetherClient {
     ) -> Self {
         Self {
             session,
+            server_public_key: None,
             unreliable,
             reader: Some(StreamReader::new(SessionStream { receiver: reliable })),
             send_future: None,
             shutdown_future: None,
         }
+    }
+
+    /// Borrows the key authenticated by the selected answer policy on this established connection.
+    /// Missing or unchecked identities return `None`; application trust remains a separate decision.
+    pub fn server_public_key(&self) -> Option<&VerifyingKey> {
+        self.server_public_key.as_ref()
     }
 
     pub async fn send(&self, data: Bytes) -> Result<()> {

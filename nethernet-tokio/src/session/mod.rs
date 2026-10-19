@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -59,8 +59,18 @@ pub struct SessionSender {
     local_addr: Addr,
     remote_addr: Addr,
     command_tx: mpsc::Sender<Command>,
+    rtt: watch::Sender<Option<Duration>>,
     close_token: CancellationToken,
     _guard: Arc<TaskGuard>,
+}
+
+/// Withdraws observations even when the original actor is aborted mid-operation.
+struct RttPublisher(watch::Sender<Option<Duration>>);
+
+impl Drop for RttPublisher {
+    fn drop(&mut self) {
+        self.0.send_replace(None);
+    }
 }
 
 /// Unique transport lifecycle owner. Constructors return it only after actual readiness.
@@ -226,6 +236,7 @@ impl Session<Connecting> {
         let (unreliable_tx, unreliable_rx) = receive::channel(Channel::Unreliable);
         let (ready_tx, ready_rx) = oneshot::channel();
         let close_token = CancellationToken::new();
+        let (rtt, _) = watch::channel(None);
 
         let task = Self::drive(
             socket,
@@ -235,6 +246,7 @@ impl Session<Connecting> {
             unreliable_tx,
             Some(ready_tx),
             close_token.clone(),
+            rtt.clone(),
             signaling,
             server.clone(),
         );
@@ -250,6 +262,7 @@ impl Session<Connecting> {
                 local_addr: local,
                 remote_addr: remote,
                 command_tx,
+                rtt,
                 close_token,
                 _guard: guard.clone(),
             }),
@@ -281,6 +294,7 @@ impl Session<Connecting> {
         unreliable_tx: Producer,
         mut ready_tx: Option<oneshot::Sender<Ready>>,
         close_token: CancellationToken,
+        rtt_observation: watch::Sender<Option<Duration>>,
         signaling: Option<CandidateSignaling>,
         server: Option<Arc<ServerLease>>,
     ) -> JoinHandle<()> {
@@ -288,6 +302,7 @@ impl Session<Connecting> {
         let driver_closed = close_token.clone().drop_guard();
         tokio::spawn(async move {
             let _driver_closed = driver_closed;
+            let rtt_observation = RttPublisher(rtt_observation);
             let (connection, socket) = guard.parts();
             let mut buf = vec![0u8; 65536];
             let mut wake = transport_now();
@@ -426,7 +441,18 @@ impl Session<Connecting> {
                 }
 
                 rtt = connection.rtt();
+                let observed = rtt.filter(|sample| !sample.is_zero());
+                rtt_observation.0.send_if_modified(|current| {
+                    // Check under the same observation lock as synchronous local retirement.
+                    let observed = observed.filter(|_| !close_token.is_cancelled());
+                    if *current == observed {
+                        return false;
+                    }
+                    *current = observed;
+                    true
+                });
             };
+            rtt_observation.0.send_replace(None);
             packet_tx.finish(terminal);
             unreliable_tx.finish(terminal);
             close_token.cancel();
@@ -647,6 +673,7 @@ impl SessionSender {
     /// Repeated calls are harmless and this never aborts the actor task or waits for I/O.
     pub fn start_close(&self) {
         self.close_token.cancel();
+        self.rtt.send_replace(None);
     }
 
     /// Starts closing and returns without waiting for teardown.
@@ -669,6 +696,15 @@ impl SessionSender {
             socket_addr,
             ..self.remote_addr.clone()
         }
+    }
+
+    /// Subscribes to the same actor's full SCTP round-trip estimate without queuing a command.
+    ///
+    /// `None` means unmeasured or retired, including an aborted actor. A closed
+    /// channel also means withdrawn, regardless of its last borrowed value.
+    /// Receivers do not retain the session, its actor or its socket.
+    pub fn subscribe_rtt(&self) -> watch::Receiver<Option<Duration>> {
+        self.rtt.subscribe()
     }
 
     /// None until a round trip time has been measured.

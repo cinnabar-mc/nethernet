@@ -626,3 +626,55 @@ async fn reserved_send_keeps_the_original_deadline_while_waiting_and_after_acqui
     .await
     .expect("reserved send absolute deadline control stalled");
 }
+
+/// The observation follows the actual actor and cannot retain or resurrect a retired measurement.
+#[tokio::test]
+async fn rtt_observation_matches_original_actor_and_withdraws_on_close_or_abort() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for abort in [false, true] {
+            let ((sender, _sender_reliable), (receiver, mut reliable, _unreliable)) =
+                connected_pair().await;
+            let retained = receiver.sender();
+            let observation = retained.subscribe_rtt();
+            sender
+                .send(Bytes::from_static(b"actual observed association"))
+                .await
+                .unwrap();
+            assert_eq!(
+                reliable.recv().await.unwrap().unwrap(),
+                "actual observed association"
+            );
+            let original = retained.rtt().await.filter(|sample| !sample.is_zero());
+            let observed = *observation.borrow();
+            assert!(observed.is_none_or(|sample| !sample.is_zero()));
+            if original.is_some() {
+                assert!(
+                    observed.is_some(),
+                    "a measured original estimate was not observed"
+                );
+            }
+            if abort {
+                reliable._guard.task.abort();
+            } else {
+                retained.start_close();
+                assert_eq!(
+                    *observation.borrow(),
+                    None,
+                    "local close withdraws synchronously"
+                );
+            }
+            receiver.closed().await;
+            assert!(reliable.recv().await.is_err() || !abort);
+            assert_eq!(
+                *observation.borrow(),
+                None,
+                "actor termination retained an old RTT"
+            );
+            drop(receiver);
+            drop(retained);
+            sender.sender().start_close();
+        }
+    })
+    .await
+    .expect("RTT observation retained a retired actor");
+}

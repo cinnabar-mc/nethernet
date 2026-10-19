@@ -171,14 +171,6 @@ impl Streams {
             return Ok(());
         }
         if carrier.pending.is_some() {
-            #[cfg(test)]
-            eprintln!(
-                "TURN_DIAGNOSTIC second frame retires route={route:?} pending={:?}",
-                carrier
-                    .pending
-                    .as_ref()
-                    .map(|frame| (frame.written, frame.bytes.len()))
-            );
             // A busy unused candidate cannot hold a usable selected path behind a second frame.
             carrier.retire();
             return Ok(());
@@ -199,16 +191,6 @@ impl Streams {
     /// Closes without interleaving TLS shutdown into an unfinished original application frame.
     pub(super) fn finish(&mut self) {
         for carrier in &mut self.carriers {
-            #[cfg(test)]
-            eprintln!(
-                "TURN_DIAGNOSTIC finish route={:?} pending={:?} tls_pending={}",
-                carrier.route,
-                carrier
-                    .pending
-                    .as_ref()
-                    .map(|frame| (frame.written, frame.bytes.len())),
-                carrier.wire.as_ref().is_some_and(Wire::has_pending_output)
-            );
             if carrier.pending.is_none()
                 && let Some(wire) = &mut carrier.wire
             {
@@ -230,14 +212,7 @@ impl Carrier {
         match self.write(&mut pending) {
             Ok(true) => {}
             Ok(false) => self.pending = Some(pending),
-            Err(_error) => {
-                #[cfg(test)]
-                eprintln!(
-                    "TURN_DIAGNOSTIC original frame failed route={:?} offset={} len={} error={_error:?}",
-                    self.route,
-                    pending.written,
-                    pending.bytes.len()
-                );
+            Err(_) => {
                 self.retire();
             }
         }

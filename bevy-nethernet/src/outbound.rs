@@ -267,13 +267,17 @@ impl Outbound {
                 SessionOutput::Send(data, to) => match self.socket.send_to(&data, to) {
                     Ok(_) => {}
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                    Err(error) => {
-                        #[cfg(test)]
-                        eprintln!(
-                            "TURN_DIAGNOSTIC UDP send local={:?} to={to} error={error:?}",
-                            self.socket.local_addr()
-                        );
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::BrokenPipe | ErrorKind::NotConnected
+                        ) =>
+                    {
                         return Err(error.into());
+                    }
+                    Err(error) => {
+                        // One unreachable candidate must not retire another usable ICE pair.
+                        tracing::debug!(%error, %to, "UDP candidate datagram was not sent");
                     }
                 },
                 SessionOutput::SendStream(data, route) => {
@@ -468,8 +472,6 @@ impl Outbound {
 
     /// Stops all timers, discards application work and attempts finite best-effort relay release.
     fn close(&mut self, now: Instant) {
-        #[cfg(test)]
-        eprintln!("TURN_DIAGNOSTIC close local={:?}", self.socket.local_addr());
         self.streams.flush(None);
         if let Some(state) = self.state.get().take() {
             match state {
@@ -481,11 +483,6 @@ impl Outbound {
                                 let _ = self.socket.send_to(&data, to);
                             }
                             Some(SessionOutput::SendStream(data, route)) => {
-                                #[cfg(test)]
-                                eprintln!(
-                                    "TURN_DIAGNOSTIC close frame route={route:?} len={}",
-                                    data.len()
-                                );
                                 let _ = self.streams.stage(data, route);
                             }
                             Some(_) => {}
@@ -501,11 +498,6 @@ impl Outbound {
                                 let _ = self.socket.send_to(&data, to);
                             }
                             Some(SessionOutput::SendStream(data, route)) => {
-                                #[cfg(test)]
-                                eprintln!(
-                                    "TURN_DIAGNOSTIC close frame route={route:?} len={}",
-                                    data.len()
-                                );
                                 let _ = self.streams.stage(data, route);
                             }
                             Some(_) => {}

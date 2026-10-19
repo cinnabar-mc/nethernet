@@ -64,7 +64,8 @@ async fn service(listener: TcpListener, gates: Gates, done: CancellationToken) {
     let (mut watched, mut hold, mut replay, mut release) =
         (Some(watched), Some(hold), Some(replay), Some(release));
     let mut prefix_forwarded = Some(prefix_forwarded);
-    let (mut watched_addr, mut held, mut original_binding) = (None, false, None);
+    let (mut watched_addr, mut held) = (None, false);
+    let mut original_binding: Option<Vec<u8>> = None;
     loop {
         let (first, second) = peers.split_at_mut(1);
         let read_first = !held || watched_addr != Some(first[0].remote);
@@ -296,11 +297,14 @@ async fn selected_write_pressure_bounds_original_actor_output_and_retains_live_p
             prefix_rx.await.unwrap();
             let (replayed, count) = oneshot::channel();
             replay_tx
-                .send((crate::session::PACKET_CHANNEL_CAPACITY + 2, replayed))
+                .send((
+                    nethernet::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY + 2,
+                    replayed,
+                ))
                 .unwrap();
             replayed_frames = count.await.unwrap();
             observation
-                .over_entries(crate::session::PACKET_CHANNEL_CAPACITY)
+                .over_entries(nethernet::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY)
                 .await;
             let _ = release_tx.send(());
             received_prefix = Some(a_rx.recv().await);
@@ -336,7 +340,7 @@ async fn selected_write_pressure_bounds_original_actor_output_and_retains_live_p
         "the captured original request never reached the actual socket"
     );
     assert!(
-        peak > crate::session::PACKET_CHANNEL_CAPACITY,
+        peak > nethernet::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY,
         "original actor never crossed the observed output bound"
     );
     assert_eq!(

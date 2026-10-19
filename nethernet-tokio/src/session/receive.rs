@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-const MAX_ACCEPTED_BYTES: usize = PACKET_CHANNEL_CAPACITY * MAX_MESSAGE_SIZE;
+pub(super) const MAX_ACCEPTED_BYTES: usize = PACKET_CHANNEL_CAPACITY * MAX_MESSAGE_SIZE;
 pub(super) const RELIABLE_PACKET_CAPACITY: usize = PACKET_CHANNEL_CAPACITY * 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -14,11 +14,18 @@ pub(crate) const COMMAND_CAPACITY: usize = 16;
 pub(crate) enum Command {
     #[cfg(test)]
     QueuedCommands(oneshot::Sender<usize>),
+    #[cfg(test)]
+    SelectedTurnStream(oneshot::Sender<Option<nethernet::session::TurnStreamRoute>>),
     Send(Channel, Bytes, Option<Instant>, oneshot::Sender<Result<()>>),
     Signal(Signal),
     TurnCredentials(
         SocketAddr,
         nethernet::session::TurnCredentials,
+        oneshot::Sender<Result<()>>,
+    ),
+    TurnStreamCredentials(
+        Vec<nethernet::session::TurnStreamTarget>,
+        Instant,
         oneshot::Sender<Result<()>>,
     ),
     RemoteAddr(oneshot::Sender<Option<SocketAddr>>),

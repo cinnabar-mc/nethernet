@@ -1,5 +1,6 @@
 //! Concrete cancellation owners for gathering and connected transports.
 use super::ServerLease;
+use crate::transport::ice_io::IceIo;
 use bytes::Bytes;
 use nethernet::connection::{Connection, ConnectionInput};
 use nethernet::error::ProtocolError;
@@ -12,7 +13,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::net::UdpSocket;
 
 /// Uses the runtime's monotonic clock, including Tokio's deterministic test clock.
 pub(crate) fn transport_now() -> Instant {
@@ -22,15 +22,15 @@ pub(crate) fn transport_now() -> Instant {
 /// Keeps an allocation owned while the asynchronous full-gather operation can be cancelled.
 pub(crate) struct GatheringGuard {
     pub core: Option<Session>,
-    socket: Arc<UdpSocket>,
+    pub io: Option<IceIo>,
     server_capacity: Option<Arc<ServerLease>>,
 }
 
 impl GatheringGuard {
-    pub fn new(core: Session, socket: Arc<UdpSocket>) -> Self {
+    pub fn new(core: Session, io: impl Into<IceIo>) -> Self {
         Self {
             core: Some(core),
-            socket,
+            io: Some(io.into()),
             server_capacity: None,
         }
     }
@@ -46,8 +46,8 @@ impl Drop for GatheringGuard {
         if let Some(core) = self.core.take() {
             let (mut retired, _result) = core.close(transport_now());
             while let Some(output) = retired.poll() {
-                if let SessionOutput::Send(data, to) = output {
-                    let _ = self.socket.try_send_to(&data, to);
+                if let Some(io) = &mut self.io {
+                    io.best_effort(output);
                 }
             }
         }
@@ -139,11 +139,27 @@ impl DrivenConnection {
         }
     }
 
+    /// Reads the original core FIFO without bypassing the actor's ownership.
+    pub fn pending_output_usage(&self) -> nethernet::session::OutputUsage {
+        match self.state.as_ref().expect("driver retains its core") {
+            ActiveConnection::Connecting(core) => core.pending_output_usage(),
+            ActiveConnection::Established(core) => core.pending_output_usage(),
+        }
+    }
+
     /// Reports the same engine-selected route without admitting transport work.
     pub fn remote_addr(&self) -> Option<SocketAddr> {
         match self.state.as_ref().expect("driver retains its core") {
             ActiveConnection::Connecting(core) => core.remote_addr(),
             ActiveConnection::Established(core) => core.remote_addr(),
+        }
+    }
+
+    /// Reads the core-selected live stream allocation without inferring it from wire output.
+    pub fn selected_turn_stream(&self) -> Option<nethernet::session::TurnStreamRoute> {
+        match self.state.as_ref().expect("driver retains its core") {
+            ActiveConnection::Connecting(core) => core.selected_turn_stream(),
+            ActiveConnection::Established(core) => core.selected_turn_stream(),
         }
     }
 
@@ -180,16 +196,39 @@ impl DrivenConnection {
         }
     }
 
-    /// Consumes whichever live phase remains, retaining teardown output even when close reports failure.
-    fn close(mut self, now: Instant, socket: &UdpSocket) {
-        let (mut retired, _result) = match self.state.take().expect("driver retains its core") {
+    /// Refreshes only the existing allocation on the exact retained stream, never another endpoint.
+    pub fn update_turn_stream_credentials(
+        &mut self,
+        route: nethernet::session::TurnStreamRoute,
+        credentials: nethernet::session::TurnCredentials,
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
+        match self.state.as_mut().expect("driver retains its core") {
+            ActiveConnection::Connecting(core) => {
+                core.update_turn_stream_credentials(route, credentials, now)
+            }
+            ActiveConnection::Established(core) => {
+                core.update_turn_stream_credentials(route, credentials, now)
+            }
+        }
+    }
+
+    /// Takes the original owner once, keeping its accepted prefix available for bounded final delivery.
+    pub fn retire(&mut self, now: Instant) -> Option<Connection<nethernet::phase::Retired>> {
+        let (retired, _result) = match self.state.take()? {
             ActiveConnection::Connecting(core) => core.close(now),
             ActiveConnection::Established(core) => core.close(now),
         };
+        Some(retired)
+    }
+
+    /// Finite fallback teardown remains safe after the actor already consumed its original core.
+    fn close(mut self, now: Instant, io: &mut IceIo) {
+        let Some(mut retired) = self.retire(now) else {
+            return;
+        };
         while let Some(output) = retired.poll() {
-            if let SessionOutput::Send(data, to) = output {
-                let _ = socket.try_send_to(&data, to);
-            }
+            io.best_effort(output);
         }
     }
 }
@@ -197,16 +236,16 @@ impl DrivenConnection {
 /// Owns the core during negotiation and after spawning; aborting either future still releases its allocations.
 pub(crate) struct ConnectionGuard {
     core: Option<DrivenConnection>,
-    socket: Arc<UdpSocket>,
+    io: Option<IceIo>,
     // Field order retains capacity through core and socket destruction after Drop runs.
     server_capacity: Option<Arc<ServerLease>>,
 }
 
 impl ConnectionGuard {
-    pub fn new(core: Connection, socket: Arc<UdpSocket>) -> Self {
+    pub fn new(core: Connection, io: impl Into<IceIo>) -> Self {
         Self {
             core: Some(DrivenConnection::new(core)),
-            socket,
+            io: Some(io.into()),
             server_capacity: None,
         }
     }
@@ -218,29 +257,37 @@ impl ConnectionGuard {
     }
 
     /// Borrows the actor's two owned resources without another socket owner outside this guard.
-    pub(crate) fn parts(&mut self) -> (&mut DrivenConnection, &UdpSocket) {
+    pub(crate) fn parts(&mut self) -> (&mut DrivenConnection, &mut IceIo) {
         (
             self.core
                 .as_mut()
                 .expect("connection is owned until its single handoff"),
-            self.socket.as_ref(),
+            self.io
+                .as_mut()
+                .expect("connection owns its original transport"),
         )
     }
 
-    /// Borrows the owned connection until it is handed to the session driver.
-    pub fn core(&mut self) -> &mut Connection {
-        self.core
-            .as_mut()
-            .expect("connection is owned until its single handoff")
-            .pending()
+    /// Transfers ownership synchronously, with no cancellation point between the two drivers.
+    pub fn take(&mut self) -> (Connection, IceIo) {
+        (
+            self.core
+                .take()
+                .expect("connection is handed off only once")
+                .into_pending(),
+            self.io.take().expect("transport is handed off only once"),
+        )
     }
 
-    /// Transfers ownership synchronously, with no cancellation point between the two drivers.
-    pub fn take(&mut self) -> Connection {
-        self.core
-            .take()
-            .expect("connection is handed off only once")
-            .into_pending()
+    /// Negotiation borrows the pending core and the exact transport owner together.
+    pub fn pending_parts(&mut self) -> (&mut Connection, &mut IceIo) {
+        (
+            self.core
+                .as_mut()
+                .expect("connection remains owned")
+                .pending(),
+            self.io.as_mut().expect("transport remains owned"),
+        )
     }
 }
 
@@ -250,7 +297,10 @@ impl Drop for ConnectionGuard {
             capacity.retire_route();
         }
         if let Some(core) = self.core.take() {
-            core.close(transport_now(), &self.socket);
+            core.close(
+                transport_now(),
+                self.io.as_mut().expect("live core owns its transport"),
+            );
         }
     }
 }

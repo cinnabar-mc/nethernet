@@ -115,9 +115,19 @@ carrier preserves accepted messages before its terminal event.
 `TurnStreamTarget`s under one caller deadline, credential expiry and endpoint
 limit. TLS targets retain the original hostname for verification. Source address
 selection belongs to the connected stream; it is independent of the UDP socket.
-The existing `resolve_ice_servers` API remains UDP-only. These core and resolution
-APIs do not make the current runtime adapters accept stream reservations; they
-reject them until a caller supplies stream I/O.
+The existing `resolve_ice_servers` API remains UDP-only. Core stream reservations
+require caller-owned stream I/O; the Tokio adapter supplies this through the
+configuration below.
+
+### Tokio TURN streams
+
+Tokio `ClientIceConfig` and `ServerIceConfig` accept `turn_streams: Vec<TurnStreamTarget>` alongside their original UDP `ice` configuration. `turn_tls: Option<Arc<rustls::ClientConfig>>` preserves an explicit caller verifier; `None` uses verified platform roots with an explicit crypto provider. Stream targets retain their original TLS authority independently of DNS addresses. An unspecified stream bind lets that same TCP socket choose its OS source; only its actual connected tuple enters the core, after applicable TLS verification.
+
+The existing gathering, negotiation and session actor retain the same stream sockets, TURN decoder and partial write offsets. Connection/TLS setup shares the original gathering/caller cutoff and credential expiry. Canceling a borrowed wait does not replace an owned stream or replay its accepted prefix. Dropping its original guard closes that resource and performs existing best-effort allocation teardown.
+
+Each carrier holds one original output frame. A selected stream applies normal application backpressure while reads, timers and closure continue. If a second frame for an unused stream cannot flush its existing prefix without blocking, that candidate alone retires; other routes continue. Original core output, accepted messages and terminal ordering are preserved. Empty stream targets retain the original UDP path.
+
+`Session` and `SessionSender` expose `update_turn_streams_before(targets, deadline)` for fresh service credentials. One bounded command inspects the actual selected route on its original actor. Direct/UDP selection needs no stream work. A selected stream requires exactly one fresh match for its original endpoint, TLS name, family and explicit bind policy; missing or ambiguous matches fail. The same core allocation receives the credential, with its original username and authenticated lease rules; this never reconnects. Queueing, replies and core admission retain the caller deadline. Canceling an unadmitted wait retracts it, while an already-admitted Refresh remains owned. This API does not claim to refresh UDP credentials.
 
 ### Usage
 
@@ -308,13 +318,16 @@ let config = nethernet_tokio::ConnectionConfig {
     client_ice: Some(nethernet_tokio::ClientIceConfig {
         ice: nethernet::session::IceConfig { servers, ..Default::default() },
         bind_addr: Some(local_bind_address),
+        turn_streams: Vec::new(),
+        turn_tls: None,
     }),
     ..Default::default()
 };
 ```
 
 The accepting adapter uses `ConnectionConfig::server_ice` with
-`ServerIceConfig { ice, bind_addr }`. Its bind address is explicit, including the
+`ServerIceConfig { ice, bind_addr, turn_streams: Vec::new(), turn_tls: None }`.
+Its bind address is explicit, including the
 outer UDP family; the same pure configuration, bounded endpoints and absolute
 TURN credential expiry apply. Full mode gathers before encoding/signing its
 answer. Trickle mode continues gathering during initial answer delivery, but
@@ -348,8 +361,11 @@ sends later candidates through the retained signaling owner. Runtime session
 handles accept credential rotation through `update_turn_credentials`. Cancelling
 negotiation or dropping the driver stops its state and attempts relay release.
 
-This path supports UDP STUN and TURN with IPv4 relay allocations over IPv4 or
-IPv6 outer UDP. Explicit IPv6 relay allocation and TURN TCP/TLS remain incomplete.
+Tokio supports UDP STUN/TURN and TURN over TCP or verified TLS. Relay address
+family is independent of the carrier family. `resolve_ice_targets` returns UDP
+servers and unopened stream targets; pass those targets through `turn_streams`.
+`turn_tls` preserves an explicit caller TLS policy or uses verified platform roots.
+The Bevy adapter below currently accepts UDP servers.
 The Bevy LAN and HTTP clients accept `set_ice_config(Some(ClientIceConfig {
     bind_addr: local_interface,
     ice: IceConfig { servers, ..Default::default() },

@@ -179,6 +179,41 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
+    /// An unrelated numeric family cannot suppress the same service's usable alternative.
+    #[tokio::test]
+    async fn resolver_retains_usable_service_urls_after_another_socket_family() {
+        let now = transport_now();
+        let expires = now + Duration::from_secs(30);
+        let deadline = now + Duration::from_secs(5);
+        let port = 40280;
+        let endpoints = [
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
+        ];
+        let mut outcomes = Vec::new();
+        for (index, expected) in endpoints.iter().copied().enumerate() {
+            let other = endpoints[1 - index];
+            let service = IceServer {
+                urls: vec![format!("stun:{other}"), format!("stun:{expected}")],
+                ..Default::default()
+            };
+            let resolved = resolve_ice_servers(
+                &[service],
+                SocketAddr::new(expected.ip(), 0),
+                expires,
+                deadline,
+            )
+            .await;
+            outcomes.push((expected, resolved));
+        }
+        for (expected, resolved) in outcomes {
+            let resolved = resolved
+                .expect("an unrelated address family discarded a usable numeric service URL");
+            assert_eq!(resolved.len(), 1);
+            assert!(matches!(resolved[0], ResolvedServer::Stun(addr) if addr == expected));
+        }
+    }
+
     #[tokio::test]
     async fn resolver_preserves_deadlines_socket_family_and_udp_service_alternatives() {
         let now = transport_now();

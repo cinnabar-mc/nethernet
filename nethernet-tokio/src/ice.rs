@@ -36,6 +36,7 @@ pub enum IceResolveError {
 /// Supply the original absolute credential expiry, rather than extending a cached service TTL.
 /// The caller's deadline bounds the whole operation. Numeric inputs bypass DNS. Known TCP/TLS
 /// alternatives are skipped when a UDP URL is available; this edge does not implement those transports.
+/// URLs with no address for the bound socket family are skipped; if none remain, resolution fails.
 /// Use the resulting owned endpoints in `nethernet::session::IceConfig` for either runtime adapter.
 pub async fn resolve_ice_servers(
     servers: &[IceServer],
@@ -100,11 +101,7 @@ pub async fn resolve_ice_servers(
     let mut owners = Vec::new();
     for (record, url) in parsed {
         let addr = if let Ok(ip) = url.host.parse::<IpAddr>() {
-            let addr = SocketAddr::new(ip, url.port);
-            if addr.is_ipv4() != local.is_ipv4() {
-                return Err(IceResolveError::AddressFamily);
-            }
-            addr
+            SocketAddr::new(ip, url.port)
         } else {
             let addresses = tokio::time::timeout_at(
                 deadline.min(valid_until).into(),
@@ -119,13 +116,19 @@ pub async fn resolve_ice_servers(
                 }
             })?
             .map_err(|_| IceResolveError::Dns)?;
-            addresses
+            let Some(addr) = addresses
                 .into_iter()
                 .find(|addr| addr.is_ipv4() == local.is_ipv4())
-                .ok_or(IceResolveError::AddressFamily)?
+            else {
+                continue;
+            };
+            addr
         };
         if addr.ip().is_unspecified() || addr.ip().is_multicast() {
             return Err(IceResolveError::Invalid);
+        }
+        if addr.is_ipv4() != local.is_ipv4() {
+            continue;
         }
         let server = &servers[record];
         let endpoint = if url.scheme == SchemeType::Stun {
@@ -169,6 +172,9 @@ pub async fn resolve_ice_servers(
     }
     if transport_now() >= deadline {
         return Err(IceResolveError::TimedOut);
+    }
+    if resolved.is_empty() && !servers.is_empty() {
+        return Err(IceResolveError::AddressFamily);
     }
     Ok(resolved)
 }

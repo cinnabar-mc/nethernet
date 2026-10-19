@@ -267,7 +267,14 @@ impl Outbound {
                 SessionOutput::Send(data, to) => match self.socket.send_to(&data, to) {
                     Ok(_) => {}
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        #[cfg(test)]
+                        eprintln!(
+                            "TURN_DIAGNOSTIC UDP send local={:?} to={to} error={error:?}",
+                            self.socket.local_addr()
+                        );
+                        return Err(error.into());
+                    }
                 },
                 SessionOutput::SendStream(data, route) => {
                     self.streams.stage(data, route)?;
@@ -461,6 +468,8 @@ impl Outbound {
 
     /// Stops all timers, discards application work and attempts finite best-effort relay release.
     fn close(&mut self, now: Instant) {
+        #[cfg(test)]
+        eprintln!("TURN_DIAGNOSTIC close local={:?}", self.socket.local_addr());
         self.streams.flush(None);
         if let Some(state) = self.state.get().take() {
             match state {
@@ -472,6 +481,11 @@ impl Outbound {
                                 let _ = self.socket.send_to(&data, to);
                             }
                             Some(SessionOutput::SendStream(data, route)) => {
+                                #[cfg(test)]
+                                eprintln!(
+                                    "TURN_DIAGNOSTIC close frame route={route:?} len={}",
+                                    data.len()
+                                );
                                 let _ = self.streams.stage(data, route);
                             }
                             Some(_) => {}
@@ -487,6 +501,11 @@ impl Outbound {
                                 let _ = self.socket.send_to(&data, to);
                             }
                             Some(SessionOutput::SendStream(data, route)) => {
+                                #[cfg(test)]
+                                eprintln!(
+                                    "TURN_DIAGNOSTIC close frame route={route:?} len={}",
+                                    data.len()
+                                );
                                 let _ = self.streams.stage(data, route);
                             }
                             Some(_) => {}

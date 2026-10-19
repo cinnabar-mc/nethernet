@@ -527,4 +527,49 @@ mod tests {
             ));
         }
     }
+
+    /// Parser-normalized empty identity attributes still require authentication under anonymous opt-in.
+    #[test]
+    fn anonymous_admission_rejects_parser_normalized_empty_identity() {
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let trust = TokenTrust::Any;
+        let policy = OfferPolicy::new(IceMode::Full)
+            .with_token_trust(&trust)
+            .with_anonymous_offers(true);
+        assert!(
+            policy
+                .admit(&loopback_offer(), None, wall)
+                .unwrap()
+                .player()
+                .is_none()
+        );
+
+        for attribute in [
+            "a=identity \t\r\n",
+            "a= \tidentity\r\n",
+            "a=\tidentity: \t\r\n",
+            "a=identity\u{2003}\r\n",
+        ] {
+            let mut offer = loopback_offer();
+            offer.data = offer.data.replacen("m=", &format!("{attribute}m="), 1);
+            let parsed = rtc::sdp::description::session::SessionDescription::unmarshal(
+                &mut std::io::Cursor::new(&offer.data),
+            )
+            .unwrap();
+            let identity = parsed
+                .attributes
+                .iter()
+                .find(|value| value.key == "identity")
+                .expect("the selected SDP parser recognizes a present identity attribute");
+            assert!(identity.value.as_deref().is_none_or(str::is_empty));
+            Connection::parse_offer(&offer).unwrap();
+            assert!(
+                matches!(
+                    policy.admit(&offer, None, wall),
+                    Err(AdmissionError::Untrusted(_))
+                ),
+                "a present malformed identity must not become anonymous after SDP normalization"
+            );
+        }
+    }
 }

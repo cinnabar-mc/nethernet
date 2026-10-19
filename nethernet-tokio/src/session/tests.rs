@@ -163,7 +163,7 @@ async fn concurrent_sends_wait_outside_the_bounded_real_session_command_queue() 
             queued_commands.await.unwrap() <= command::COMMAND_CAPACITY,
             "concurrent sends must retain excess payloads at their caller, not in an unbounded actor queue"
         );
-        drop(held);
+        let _ = held;
         sender.sender().close().await.unwrap();
         receiver.sender().close().await.unwrap();
     })
@@ -635,7 +635,7 @@ async fn rtt_observation_matches_original_actor_and_withdraws_on_close_or_abort(
             let ((sender, _sender_reliable), (receiver, mut reliable, _unreliable)) =
                 connected_pair().await;
             let retained = receiver.sender();
-            let observation = retained.subscribe_rtt();
+            let observation = retained.observe_rtt();
             sender
                 .send(Bytes::from_static(b"actual observed association"))
                 .await
@@ -645,7 +645,7 @@ async fn rtt_observation_matches_original_actor_and_withdraws_on_close_or_abort(
                 "actual observed association"
             );
             let original = retained.rtt().await.filter(|sample| !sample.is_zero());
-            let observed = *observation.borrow();
+            let observed = observation.get();
             assert!(observed.is_none_or(|sample| !sample.is_zero()));
             if original.is_some() {
                 assert!(
@@ -658,7 +658,7 @@ async fn rtt_observation_matches_original_actor_and_withdraws_on_close_or_abort(
             } else {
                 retained.start_close();
                 assert_eq!(
-                    *observation.borrow(),
+                    observation.get(),
                     None,
                     "local close withdraws synchronously"
                 );
@@ -666,7 +666,7 @@ async fn rtt_observation_matches_original_actor_and_withdraws_on_close_or_abort(
             receiver.closed().await;
             assert!(reliable.recv().await.is_err() || !abort);
             assert_eq!(
-                *observation.borrow(),
+                observation.get(),
                 None,
                 "actor termination retained an old RTT"
             );
@@ -684,10 +684,10 @@ async fn rtt_observation_matches_original_actor_and_withdraws_on_close_or_abort(
 async fn rtt_observation_does_not_block_synchronous_retirement() {
     let ((sender, sender_reliable), (receiver, mut reliable, unreliable)) = connected_pair().await;
     let retained = receiver.sender();
-    let observation = retained.subscribe_rtt();
+    let observation = retained.observe_rtt();
     let receiver_guard = retained._guard.clone();
     let sender_guard = sender.handle()._guard.clone();
-    let held = observation.borrow();
+    let held = observation.get();
     let (completed, completion) = std::sync::mpsc::channel();
     let closer = std::thread::spawn(move || {
         retained.start_close();
@@ -696,7 +696,7 @@ async fn rtt_observation_does_not_block_synchronous_retirement() {
     });
     // This finite event wait also lets a blocking baseline release every owner before asserting.
     let closed_while_observed = completion.recv_timeout(Duration::from_secs(1)).is_ok();
-    drop(held);
+    let _ = held;
     let retained = closer.join().expect("owned close thread panicked");
     let receiver_end = tokio::time::timeout(Duration::from_secs(10), reliable.recv()).await;
     sender.sender().start_close();

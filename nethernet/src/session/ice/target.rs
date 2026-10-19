@@ -22,7 +22,7 @@ pub enum TurnStreamSecurity {
 #[derive(Clone)]
 pub struct TurnStreamTarget {
     pub remote: SocketAddr,
-    /// Explicit concrete source interface; absence uses the original same-family UDP interface.
+    /// Explicit concrete source interface; absence permits the TCP socket's own OS route selection.
     pub bind_ip: Option<IpAddr>,
     pub security: TurnStreamSecurity,
     pub credentials: TurnCredentials,
@@ -44,7 +44,7 @@ impl TurnStreamTarget {
             return Err(IceError::Credentials);
         }
         if let Some(ip) = self.bind_ip {
-            self.local_bind_ip(ip)?;
+            self.local_bind_ip(Some(ip))?;
         }
         if let TurnStreamSecurity::Tls { server_name } = &self.security
             && (server_name.is_empty()
@@ -56,13 +56,17 @@ impl TurnStreamTarget {
         Ok(())
     }
 
-    /// Selects only an explicit or original concrete same-family local interface.
-    pub fn local_bind_ip(&self, fallback: IpAddr) -> Result<IpAddr, IceError> {
-        let ip = self.bind_ip.unwrap_or(fallback);
-        if ip.is_unspecified() || ip.is_multicast() || ip.is_ipv4() != self.remote.is_ipv4() {
-            return Err(IceError::Configuration);
+    /// Uses only a caller-explicit concrete source, never an unrelated UDP routing probe.
+    /// Without one, the adapter validates this TCP socket's actual tuple after connect starts.
+    pub fn local_bind_ip(&self, fallback: Option<IpAddr>) -> Result<Option<IpAddr>, IceError> {
+        let usable = |ip: IpAddr| {
+            !ip.is_unspecified() && !ip.is_multicast() && ip.is_ipv4() == self.remote.is_ipv4()
+        };
+        match self.bind_ip {
+            Some(ip) if usable(ip) => Ok(Some(ip)),
+            Some(_) => Err(IceError::Configuration),
+            None => Ok(fallback.filter(|ip| usable(*ip))),
         }
-        Ok(ip)
     }
 
     /// Derives the default relay family from this carrier's actual bound TCP tuple.
@@ -102,11 +106,19 @@ mod tests {
             requested_family: None,
         };
         assert!(target.validate(now).is_ok());
-        assert!(target.local_bind_ip("127.0.0.1".parse().unwrap()).is_err());
+        assert_eq!(target.local_bind_ip(None).unwrap(), None);
+        assert_eq!(
+            target
+                .local_bind_ip(Some("127.0.0.1".parse().unwrap()))
+                .unwrap(),
+            None
+        );
         target.bind_ip = Some("::1".parse().unwrap());
         assert_eq!(
-            target.local_bind_ip("127.0.0.1".parse().unwrap()).unwrap(),
-            "::1".parse::<IpAddr>().unwrap()
+            target
+                .local_bind_ip(Some("127.0.0.1".parse().unwrap()))
+                .unwrap(),
+            Some("::1".parse::<IpAddr>().unwrap())
         );
         let actual = "[::1]:50000".parse().unwrap();
         assert_eq!(target.family_for(actual), TurnAddressFamily::Ipv6);

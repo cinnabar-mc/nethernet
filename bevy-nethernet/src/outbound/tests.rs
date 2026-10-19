@@ -1,6 +1,6 @@
 use super::*;
 #[path = "../../../nethernet/tests/support/turn.rs"]
-mod turn;
+pub(super) mod turn;
 use nethernet::protocol::SignalType;
 use nethernet::protocol::webrtc::candidate::parse_ice_candidate;
 use nethernet::session::{IcePolicy, IceServer};
@@ -24,7 +24,7 @@ fn turn_update(socket: &UdpSocket, server: &mut TurnPeer) {
 }
 
 /// Preserves actual Ready/data/failure outputs while advancing one frame owner.
-fn advance(
+pub(super) fn advance(
     transport: &mut Outbound,
     now: Instant,
     ready: &mut bool,
@@ -52,6 +52,9 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
         let deadline = now + establish_within;
         let config = ClientIceConfig {
             bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            turn_streams: Vec::new(),
+            #[cfg(feature = "tls")]
+            turn_tls: None,
             ice: IceConfig {
                 servers: vec![IceServer::Turn(
                     server.addr,
@@ -66,8 +69,10 @@ fn frame_driven_relay_pairs_exchange_secured_data_and_release_exclusive_allocati
                 ..Default::default()
             },
         };
-        let mut client = Outbound::new(Some(&config), establish_within, now).unwrap();
-        let mut answerer = Outbound::new(Some(&config), establish_within, now).unwrap();
+        let mut client =
+            Outbound::new(Some(&config), establish_within, now, &ClientTls::default()).unwrap();
+        let mut answerer =
+            Outbound::new(Some(&config), establish_within, now, &ClientTls::default()).unwrap();
         assert_ne!(
             client.socket.local_addr().unwrap(),
             answerer.socket.local_addr().unwrap()
@@ -207,6 +212,9 @@ fn absolute_credential_expiry_stops_frame_gathering_and_delivery_bounds_count_by
     let expiry = start + Duration::from_secs(2);
     let config = ClientIceConfig {
         bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        turn_streams: Vec::new(),
+        #[cfg(feature = "tls")]
+        turn_tls: None,
         ice: IceConfig {
             servers: vec![IceServer::Turn(
                 server.addr,
@@ -216,7 +224,13 @@ fn absolute_credential_expiry_stops_frame_gathering_and_delivery_bounds_count_by
             ..Default::default()
         },
     };
-    let mut transport = Outbound::new(Some(&config), Duration::from_secs(10), start).unwrap();
+    let mut transport = Outbound::new(
+        Some(&config),
+        Duration::from_secs(10),
+        start,
+        &ClientTls::default(),
+    )
+    .unwrap();
     while Instant::now() < expiry {
         transport.update(Instant::now()).unwrap();
         turn_update(&socket, &mut server);

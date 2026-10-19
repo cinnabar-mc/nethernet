@@ -1,37 +1,16 @@
 #![cfg(feature = "tls")]
 
 use bevy_nethernet::prelude::*;
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, StreamOwned};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, ServerConfig, StreamOwned};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn self_signed_pair() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
-    let issued =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
-            .unwrap();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der()));
-    let server = ServerConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![issued.cert.der().clone()], key)
-        .unwrap();
-
-    let mut roots = RootCertStore::empty();
-    roots.add(issued.cert.der().clone()).unwrap();
-    let client = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    (Arc::new(server), Arc::new(client))
-}
+#[path = "support/tls.rs"]
+mod tls_support;
+use tls_support::self_signed_pair;
 
 fn server_identity() -> ServerIdentity {
     ServerIdentity::generate("server", std::time::SystemTime::now()).unwrap()

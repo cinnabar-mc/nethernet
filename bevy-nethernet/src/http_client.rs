@@ -1,9 +1,9 @@
 //! HTTP signaling client polled once per frame, with status queries and joins.
 use crate::connection::ConnectionEvent;
-use crate::http_stream::{ClientTls, Drain, HttpStream};
+use crate::http_stream::{Drain, HttpStream};
 use crate::http_wire;
-use crate::outbound::{ClientIceConfig, EstablishedClient, Outbound, Received};
-use crate::tcp_wire::Inbound;
+use crate::outbound::{ClientIceConfig, EstablishedClient, Outbound, Received, prepare_turn_tls};
+use crate::tcp_wire::{ClientTls, Inbound};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use nethernet::connection::{IceMode, Timeouts};
@@ -215,6 +215,7 @@ pub struct NetherHttpClient {
     transport: Option<Outbound>,
     gathering: Option<Gathering>,
     ice_config: Option<ClientIceConfig>,
+    turn_tls: ClientTls,
     connected: bool,
     connecting_deadline: Option<Instant>,
     timeouts: Timeouts,
@@ -241,6 +242,7 @@ impl Default for NetherHttpClient {
             transport: None,
             gathering: None,
             ice_config: None,
+            turn_tls: ClientTls::default(),
             connected: false,
             connecting_deadline: None,
             timeouts: Timeouts::default(),
@@ -385,7 +387,9 @@ impl NetherHttpClient {
         self.tls.prepare(target.secure)?;
         self.join_target = Some((target, addr));
         self.attempts_left = self.attempts.max(1);
-        if let Err(error) = self.begin_join() {
+        let now = Instant::now();
+        self.turn_tls = prepare_turn_tls(self.ice_config.as_ref())?;
+        if let Err(error) = self.begin_join(now) {
             self.join = None;
             self.retire_transport(false);
             self.gathering = None;
@@ -396,16 +400,16 @@ impl NetherHttpClient {
     }
 
     /// Starts finite gathering. Numeric ICE endpoints never invoke DNS in the frame update.
-    fn begin_join(&mut self) -> std::io::Result<()> {
+    fn begin_join(&mut self, now: Instant) -> std::io::Result<()> {
         self.attempts_left = self.attempts_left.saturating_sub(1);
         let (target, addr) = self.join_target.clone().ok_or_else(|| {
             std::io::Error::new(ErrorKind::InvalidInput, "join target is not configured")
         })?;
-        let now = Instant::now();
         self.transport = Some(Outbound::new(
             self.ice_config.as_ref(),
             self.timeouts.establish(),
             now,
+            &self.turn_tls,
         )?);
         self.gathering = Some(Gathering { target, addr });
         self.connecting_deadline = Some(now + self.timeouts.negotiation);
@@ -457,7 +461,9 @@ impl NetherHttpClient {
     }
 
     fn open_stream(&self, target: &JoinTarget, addr: SocketAddr) -> std::io::Result<HttpStream> {
-        self.tls.dial(target.secure, &target.host, addr)
+        self.tls
+            .dial(target.secure, &target.host, addr, None)
+            .map(HttpStream::connecting)
     }
 
     pub fn disconnect(&mut self) {
@@ -511,7 +517,7 @@ impl NetherHttpClient {
                 self.join = None;
                 self.gathering = None;
                 self.retire_transport(false);
-                if self.begin_join().is_ok() {
+                if self.begin_join(now).is_ok() {
                     return;
                 }
             }

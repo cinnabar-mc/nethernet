@@ -22,6 +22,9 @@ fn http_offer_is_signed_after_relay_gathering_and_disconnect_releases_the_alloca
     client.set_identity(ServerIdentity::generate("frame-client", SystemTime::now()).unwrap());
     client.set_ice_config(Some(ClientIceConfig {
         bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        turn_streams: Vec::new(),
+        #[cfg(feature = "tls")]
+        turn_tls: None,
         ice: IceConfig {
             servers: vec![IceServer::Turn(
                 turn.addr,

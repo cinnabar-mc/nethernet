@@ -1,7 +1,8 @@
 //! LAN client: discovers servers by UDP broadcast and connects to one by network id.
 use crate::connection::ConnectionEvent;
-use crate::outbound::{ClientIceConfig, EstablishedClient, Outbound, Received};
+use crate::outbound::{ClientIceConfig, EstablishedClient, Outbound, Received, prepare_turn_tls};
 use crate::socket::recv_discovery;
+use crate::tcp_wire::ClientTls;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use nethernet::connection::{IceMode, Timeouts};
@@ -62,6 +63,7 @@ pub struct NetherClient {
     socket: UdpSocket,
     transport: Option<Outbound>,
     ice_config: Option<ClientIceConfig>,
+    turn_tls: ClientTls,
     connected: bool,
     connecting_deadline: Option<Instant>,
     answered: bool,
@@ -103,6 +105,7 @@ impl NetherClient {
             socket,
             transport: None,
             ice_config: None,
+            turn_tls: ClientTls::default(),
             connected: false,
             connecting_deadline: None,
             answered: false,
@@ -185,14 +188,19 @@ impl NetherClient {
         self.received = Received::default();
         self.target = target_network_id;
         self.attempts_left = self.attempts.max(1);
-        self.begin_attempt()
+        let now = Instant::now();
+        self.turn_tls = prepare_turn_tls(self.ice_config.as_ref())?;
+        self.begin_attempt(now)
     }
 
-    fn begin_attempt(&mut self) -> std::io::Result<()> {
+    fn begin_attempt(&mut self, now: Instant) -> std::io::Result<()> {
         self.attempts_left = self.attempts_left.saturating_sub(1);
-        let now = Instant::now();
-        let mut transport =
-            Outbound::new(self.ice_config.as_ref(), self.timeouts.establish(), now)?;
+        let mut transport = Outbound::new(
+            self.ice_config.as_ref(),
+            self.timeouts.establish(),
+            now,
+            &self.turn_tls,
+        )?;
         let signals = transport
             .connect(rand::random(), self.target.to_string(), IceMode::Trickle)
             .map_err(std::io::Error::other)?;
@@ -290,7 +298,7 @@ impl NetherClient {
         {
             if !self.answered && self.attempts_left > 0 {
                 self.retire_transport(false);
-                if self.begin_attempt().is_ok() {
+                if self.begin_attempt(now).is_ok() {
                     return;
                 }
             }

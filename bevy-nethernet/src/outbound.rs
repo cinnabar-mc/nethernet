@@ -1,6 +1,8 @@
-//! One outbound UDP transport, advanced by the caller's frame rather than a worker runtime.
+//! One outbound transport, advanced by the caller's frame rather than a worker runtime.
 use crate::connection::{ActiveConnection, ConnectionEvent};
 use crate::socket::bind_shared_socket;
+use crate::tcp_wire::ClientTls;
+mod streams;
 use bevy_platform::cell::SyncCell;
 use nethernet::connection::{Connection, ConnectionInput, IceMode};
 use nethernet::error::ProtocolError;
@@ -9,7 +11,7 @@ use nethernet::protocol::webrtc::Description;
 use nethernet::sans::Sans;
 use nethernet::session::{
     Channel, GatheringState, IceConfig, Session, SessionEvent, SessionInput, SessionOutput,
-    TurnCredentials,
+    TurnCredentials, TurnStreamTarget,
 };
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -31,6 +33,29 @@ pub struct ClientIceConfig {
     pub bind_addr: SocketAddr,
     /// Pure-core gathering policy, finite timeout and numeric UDP servers.
     pub ice: IceConfig,
+    /// Already-resolved, unopened TCP/TLS TURN carriers; shares the original server-count bound.
+    pub turn_streams: Vec<TurnStreamTarget>,
+    /// Optional explicit verifier/root policy for TURN TLS, independently of HTTP signaling.
+    #[cfg(feature = "tls")]
+    pub turn_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+}
+
+/// Loads platform trust only during explicit setup, before frame-driven attempts and retries.
+pub(crate) fn prepare_turn_tls(config: Option<&ClientIceConfig>) -> std::io::Result<ClientTls> {
+    let mut tls = ClientTls::default();
+    #[cfg(feature = "tls")]
+    if let Some(custom) = config.and_then(|config| config.turn_tls.as_ref()) {
+        tls = ClientTls::with_config(custom.clone());
+    }
+    let targets = config.map_or(&[][..], |config| config.turn_streams.as_slice());
+    streams::Streams::validate(targets)?;
+    tls.prepare(targets.iter().any(|target| {
+        matches!(
+            target.security,
+            nethernet::session::TurnStreamSecurity::Tls { .. }
+        )
+    }))?;
+    Ok(tls)
 }
 
 enum State {
@@ -41,6 +66,8 @@ enum State {
 /// Exclusive ownership avoids sharing a TURN allocation transport tuple between sessions.
 pub(crate) struct Outbound {
     socket: UdpSocket,
+    streams: streams::Streams,
+    pending_stream: Option<streams::Pending>,
     state: SyncCell<Option<State>>,
     events: VecDeque<ConnectionEvent>,
     buffered_bytes: usize,
@@ -55,18 +82,37 @@ impl Outbound {
         config: Option<&ClientIceConfig>,
         establish_within: Duration,
         now: Instant,
+        tls: &ClientTls,
+    ) -> std::io::Result<Self> {
+        Self::with_role(config, establish_within, now, tls, true)
+    }
+
+    /// Constructs the same concrete owner with the actual initial ICE role.
+    fn with_role(
+        config: Option<&ClientIceConfig>,
+        establish_within: Duration,
+        now: Instant,
+        tls: &ClientTls,
+        controlling: bool,
     ) -> std::io::Result<Self> {
         if config.is_some_and(|config| {
             config
                 .ice
                 .servers
                 .iter()
-                .any(|server| server.stream_route().is_some())
+                .any(|server| server.stream_id().is_some())
         }) {
             return Err(std::io::Error::new(
                 ErrorKind::Unsupported,
                 nethernet::session::IceError::UnsupportedCarrier,
             ));
+        }
+        if let Some(config) = config {
+            config
+                .ice
+                .validate_with_stream_targets(config.bind_addr, &config.turn_streams, now)
+                .map_err(std::io::Error::other)?;
+            streams::Streams::validate(&config.turn_streams)?;
         }
         let (socket, local) = match config {
             Some(config) => {
@@ -84,13 +130,23 @@ impl Outbound {
             None => bind_shared_socket()?,
         };
         socket.set_nonblocking(true)?;
-        let ice = config.map(|config| config.ice.clone()).unwrap_or_default();
+        let mut ice = config.map(|config| config.ice.clone()).unwrap_or_default();
+        let targets = config.map_or(&[][..], |config| config.turn_streams.as_slice());
+        let streams = streams::Streams::open(
+            targets,
+            config.map(|config| config.bind_addr.ip()),
+            tls,
+            &mut ice,
+            now,
+        )?;
         let (mut session, description) =
-            Session::new_with_ice(local, true, rand::random(), ice, now)
+            Session::new_with_ice(local, controlling, rand::random(), ice, now)
                 .map_err(std::io::Error::other)?;
         session.set_establish_deadline(establish_within);
         Ok(Self {
             socket,
+            streams,
+            pending_stream: None,
             state: SyncCell::new(Some(State::Gathering(session, description))),
             events: VecDeque::new(),
             buffered_bytes: 0,
@@ -132,29 +188,43 @@ impl Outbound {
         let mut remaining = MAX_OUTPUTS_PER_UPDATE;
         self.timeout(now)?;
         self.flush(&mut remaining)?;
-        for _ in 0..MAX_DATAGRAMS_PER_UPDATE {
-            if remaining == 0 {
+        let mut reads = MAX_DATAGRAMS_PER_UPDATE;
+        while reads > 0 && remaining > 0 {
+            let mut progressed = false;
+            if let Some(input) = self.streams.poll(now) {
+                reads -= 1;
+                progressed = true;
+                self.stream_input(input, now);
+                self.flush(&mut remaining)?;
+            }
+            if reads == 0 || remaining == 0 {
                 break;
             }
-            let (len, from) = match self.socket.recv_from(&mut self.buf) {
-                Ok(packet) => packet,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            match self.socket.recv_from(&mut self.buf) {
+                Ok((len, from)) => {
+                    reads -= 1;
+                    progressed = true;
+                    let packet = self.buf[..len].into();
+                    let result = match self.state.get() {
+                        Some(State::Gathering(session, _)) => {
+                            session.handle(SessionInput::Packet(packet, from, now))
+                        }
+                        Some(State::Connected(connection)) => {
+                            connection.handle(ConnectionInput::Packet(packet, from, now))
+                        }
+                        None => return Ok(()),
+                    };
+                    if result.is_err() {
+                        tracing::debug!("discarding a rejected session datagram");
+                    }
+                    self.flush(&mut remaining)?;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error.into()),
-            };
-            let packet = self.buf[..len].into();
-            let result = match self.state.get() {
-                Some(State::Gathering(session, _)) => {
-                    session.handle(SessionInput::Packet(packet, from, now))
-                }
-                Some(State::Connected(connection)) => {
-                    connection.handle(ConnectionInput::Packet(packet, from, now))
-                }
-                None => return Ok(()),
-            };
-            if result.is_err() {
-                tracing::debug!("discarding a rejected session datagram");
             }
-            self.flush(&mut remaining)?;
+            if !progressed {
+                break;
+            }
         }
         if let Some(State::Connected(connection)) = self.state.get()
             && let Some(rtt) = connection.rtt()
@@ -181,6 +251,9 @@ impl Outbound {
 
     /// Drains core output; nonblocking UDP congestion drops a datagram for protocol retransmission.
     fn flush(&mut self, remaining: &mut usize) -> Result<(), ProtocolError> {
+        if !self.flush_stream() {
+            return Ok(());
+        }
         while *remaining > 0 {
             let output = match self.state.get() {
                 Some(State::Gathering(session, _)) => session.poll(),
@@ -197,12 +270,20 @@ impl Outbound {
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                     Err(error) => return Err(error.into()),
                 },
-                SessionOutput::SendStream(..) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::Unsupported,
-                        nethernet::session::IceError::UnsupportedCarrier,
-                    )
-                    .into());
+                SessionOutput::SendStream(data, route) => {
+                    if !self.streams.contains(route)
+                        || data.len() > nethernet::session::MAX_TURN_STREAM_FRAME_BYTES
+                    {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "TURN output has no bounded owned carrier",
+                        )
+                        .into());
+                    }
+                    self.pending_stream = Some(streams::Pending::new(data, route));
+                    if !self.flush_stream() {
+                        return Ok(());
+                    }
                 }
                 SessionOutput::Event(SessionEvent::Ready) => {
                     let addr = match self.state.get() {
@@ -221,6 +302,60 @@ impl Outbound {
             }
         }
         Ok(())
+    }
+
+    /// Applies only the exact carrier's event; an unused failed target cannot fail another route.
+    fn stream_input(&mut self, input: streams::Input, now: Instant) {
+        let activation = match &input {
+            streams::Input::Activated(_, route) => Some(*route),
+            _ => None,
+        };
+        let result = match (self.state.get(), input) {
+            (_, streams::Input::Progress) => return,
+            (Some(State::Gathering(session, _)), streams::Input::Activated(id, route)) => {
+                session.handle(SessionInput::ActivateTurnStream(id, route, now))
+            }
+            (Some(State::Gathering(session, _)), streams::Input::Packet(data, route)) => {
+                session.handle(SessionInput::StreamPacket(data.into(), route, now))
+            }
+            (Some(State::Gathering(session, _)), streams::Input::Closed(id)) => {
+                session.handle(SessionInput::StreamClosed(id, now))
+            }
+            (Some(State::Connected(connection)), streams::Input::Activated(id, route)) => {
+                connection.handle(ConnectionInput::ActivateTurnStream(id, route, now))
+            }
+            (Some(State::Connected(connection)), streams::Input::Packet(data, route)) => {
+                connection.handle(ConnectionInput::StreamPacket(data.into(), route, now))
+            }
+            (Some(State::Connected(connection)), streams::Input::Closed(id)) => {
+                connection.handle(ConnectionInput::StreamClosed(id, now))
+            }
+            (None, _) => return,
+        };
+        if result.is_err() {
+            if let Some(route) = activation {
+                self.streams.retire(route);
+            }
+            tracing::debug!("discarding rejected input on its original TURN carrier");
+        }
+    }
+
+    /// Resumes the same one output slot; a failed carrier is retired without replaying bytes.
+    fn flush_stream(&mut self) -> bool {
+        let Some(mut pending) = self.pending_stream.take() else {
+            return true;
+        };
+        match self.streams.write(&mut pending) {
+            Ok(true) => true,
+            Ok(false) => {
+                self.pending_stream = Some(pending);
+                false
+            }
+            Err(_) => {
+                self.streams.retire(pending.route());
+                true
+            }
+        }
     }
 
     /// Bounds transport delivery separately from the application receive queues.
@@ -314,7 +449,7 @@ impl Outbound {
         let mut remaining = MAX_OUTPUTS_PER_UPDATE;
         self.timeout(now)?;
         self.flush(&mut remaining)?;
-        if remaining == 0 {
+        if remaining == 0 || self.pending_stream.is_some() || self.streams.retiring() {
             return Err(std::io::Error::from(ErrorKind::WouldBlock).into());
         }
         let result = match self.state.get() {
@@ -347,6 +482,7 @@ impl Outbound {
 
     /// Stops all timers, discards application work and attempts finite best-effort relay release.
     fn close(&mut self, now: Instant) {
+        self.flush_stream();
         if let Some(state) = self.state.get().take() {
             match state {
                 State::Gathering(session, _) => {
@@ -355,6 +491,12 @@ impl Outbound {
                         match retired.poll() {
                             Some(SessionOutput::Send(data, to)) => {
                                 let _ = self.socket.send_to(&data, to);
+                            }
+                            Some(SessionOutput::SendStream(data, route))
+                                if self.pending_stream.is_none() =>
+                            {
+                                self.pending_stream = Some(streams::Pending::new(data, route));
+                                self.flush_stream();
                             }
                             Some(_) => {}
                             None => break,
@@ -368,6 +510,12 @@ impl Outbound {
                             Some(SessionOutput::Send(data, to)) => {
                                 let _ = self.socket.send_to(&data, to);
                             }
+                            Some(SessionOutput::SendStream(data, route))
+                                if self.pending_stream.is_none() =>
+                            {
+                                self.pending_stream = Some(streams::Pending::new(data, route));
+                                self.flush_stream();
+                            }
                             Some(_) => {}
                             None => break,
                         }
@@ -375,6 +523,8 @@ impl Outbound {
                 }
             }
         }
+        self.streams.finish(self.pending_stream.as_ref());
+        self.pending_stream = None;
         self.events.clear();
         self.buffered_bytes = 0;
     }

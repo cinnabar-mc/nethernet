@@ -300,8 +300,16 @@ TURN credential expiry apply. Full mode gathers before encoding/signing its
 answer. Trickle mode continues gathering during initial answer delivery, but
 late candidate sends wait until the answer and its initial candidates have
 actually completed in order. `NetherServer::set_server_ice` replaces configuration
-for later offers; it never extends an existing credential's expiry. Use
-`Session::update_turn_credentials` to renew a live allocation.
+for later offers; it never extends an existing credential's expiry.
+`Session::update_turn_credentials` accepts replacement credentials only for the
+same endpoint and username on an existing allocation. Local refresh admission
+does not prove the remote TURN server extended that allocation.
+
+`NetherServer::set_identity` replaces the signer captured by later offers.
+Pending and accepted peers retain their original identity and transport owners.
+The caller acquires and validates the replacement; this method performs no
+account, WebSocket or TURN refresh. Listener retirement releases its selected
+signer and refuses later replacements.
 
 A pure caller that gathers its own accepting session can use
 `Admitted::prepare_answer(&mut session, description, now, wall)`, then transfer

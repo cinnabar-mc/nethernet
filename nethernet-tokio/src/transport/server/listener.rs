@@ -1,5 +1,5 @@
 //! The listener owns every pending peer and routes only bounded late signals.
-use super::{SharedIce, SharedTrust, peer};
+use super::{SharedIce, SharedIdentity, SharedTrust, peer};
 use crate::error::SignalErrorCode;
 use crate::protocol::{Signal, SignalType};
 use crate::session::guard::transport_now;
@@ -22,12 +22,14 @@ struct Route {
 }
 
 /// Reserves capacity before asynchronous offer work and owns every worker until retirement.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start(
     signaling: ServerSignaling,
     incoming: mpsc::Sender<AcceptedSession>,
     listener: CancellationToken,
     config: ConnectionConfig,
     trust: SharedTrust,
+    identity: SharedIdentity,
     ice: SharedIce,
     mut signals: std::pin::Pin<Box<dyn futures::Stream<Item = Signal> + Send>>,
 ) -> JoinHandle<()> {
@@ -90,6 +92,7 @@ pub(super) fn start(
                             };
                             let mut peer_config = config.clone();
                             peer_config.token_trust = trust.read().unwrap_or_else(PoisonError::into_inner).clone();
+                            peer_config.identity = identity.read().unwrap_or_else(PoisonError::into_inner).clone();
                             peer_config.server_ice = ice.read().unwrap_or_else(PoisonError::into_inner).clone();
                             let (signal_tx, signal_rx) = mpsc::channel(COMMAND_CAPACITY);
                             let stop = CancellationToken::new();
@@ -126,6 +129,10 @@ pub(super) fn start(
         }
         // No peer can remain detached behind metadata, answer delivery or ready wait.
         listener.cancel();
+        identity
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         peers.abort_all();
         while peers.join_next().await.is_some() {}
     })

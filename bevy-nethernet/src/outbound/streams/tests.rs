@@ -4,6 +4,7 @@ use crate::connection::ActiveConnection;
 use crate::outbound::tests::{advance, turn};
 use crate::outbound::{ClientIceConfig, Outbound, State, prepare_turn_tls};
 use nethernet::connection::{Connection, IceMode};
+use nethernet::error::ProtocolError;
 use nethernet::session::{Channel, IcePolicy, TurnAddressFamily, TurnCredentials};
 use rtc::ice::candidate::CandidateType;
 use rtc::stun::attributes::{ATTR_PADDING, RawAttribute};

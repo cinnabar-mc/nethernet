@@ -261,22 +261,31 @@ async fn selected_write_pressure_bounds_original_actor_output_and_retains_live_p
         let mut captured_binding = false;
         let mut replayed_frames = 0;
         let mut received_prefix = None;
+        let mut stage = "prime send";
+        let mut prime = 0;
         let results = async {
             // Prime the original SCTP congestion window using actual delivered data before shrinking read progress.
-            for _ in 0..4 {
+            for round in 0..4 {
+                prime = round;
+                stage = "prime send";
                 a.send(Bytes::from(vec![0x41; 50 * 1024])).await.unwrap();
+                stage = "prime receive";
                 assert_eq!(b_rx.recv().await.unwrap().unwrap().len(), 50 * 1024);
+                stage = "prime acknowledgement send";
                 b.send(Bytes::from_static(b"prime acknowledged"))
                     .await
                     .unwrap();
+                stage = "prime acknowledgement receive";
                 assert_eq!(a_rx.recv().await.unwrap().unwrap(), "prime acknowledged");
             }
+            stage = "hold and authentic binding capture";
             let (held, acknowledged) = oneshot::channel();
             hold_tx.send(held).unwrap();
             captured_binding = acknowledged.await.unwrap();
             if !captured_binding {
                 return Err("fixture never received the original authenticated binding");
             }
+            stage = "actual selected kernel pressure";
             {
                 let fill = async {
                     for _ in 0..crate::session::command::COMMAND_CAPACITY {
@@ -287,14 +296,18 @@ async fn selected_write_pressure_bounds_original_actor_output_and_retains_live_p
                 tokio::pin!(fill);
                 tokio::select! { biased; _ = observation.socket_blocked() => {}, _ = &mut fill => unreachable!() }
             }
+            stage = "live prefix send";
             b.send(Bytes::from_static(PREFIX)).await.unwrap();
+            stage = "original same-socket refresh";
             b.update_turn_streams_before(
                 vec![target(address, TurnStreamSecurity::Tcp)],
                 cutoff.into_std(),
             )
             .await
             .unwrap();
+            stage = "live prefix forwarding barrier";
             prefix_rx.await.unwrap();
+            stage = "original request replay";
             let (replayed, count) = oneshot::channel();
             replay_tx
                 .send((
@@ -303,11 +316,14 @@ async fn selected_write_pressure_bounds_original_actor_output_and_retains_live_p
                 ))
                 .unwrap();
             replayed_frames = count.await.unwrap();
+            stage = "original core output threshold";
             observation
                 .over_entries(nethernet::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY)
                 .await;
             let _ = release_tx.send(());
+            stage = "live prefix receive";
             received_prefix = Some(a_rx.recv().await);
+            stage = "capacity terminal receive";
             Ok(a_rx.recv().await)
         };
         let result = tokio::time::timeout_at(cutoff, results).await;
@@ -323,14 +339,27 @@ async fn selected_write_pressure_bounds_original_actor_output_and_retains_live_p
             captured_binding,
             replayed_frames,
             received_prefix,
+            stage,
+            prime,
         )
     };
-    let (_, (result, peak, captured, written, prefix)) =
+    let (_, (result, peak, captured, written, prefix, stage, prime)) =
         tokio::time::timeout(Duration::from_secs(20), async {
             tokio::join!(service, exercise)
         })
         .await
         .expect("finite actual actor setup or original owner cleanup stalled");
+    let outcome = match &result {
+        Err(error) => format!("deadline: {error}"),
+        Ok(Err(error)) => format!("fixture: {error}"),
+        Ok(Ok(Err(error))) => format!("terminal: {error}"),
+        Ok(Ok(Ok(Some(bytes)))) => format!("message: {} bytes", bytes.len()),
+        Ok(Ok(Ok(None))) => "EOF".to_owned(),
+    };
+    eprintln!(
+        "pressure stage={stage}, prime={prime}, outcome={outcome}, captured={captured}, written={written}, peak={peak}, prefix_observed={}",
+        prefix.is_some()
+    );
     assert!(
         captured,
         "fixture never received the original authenticated request"

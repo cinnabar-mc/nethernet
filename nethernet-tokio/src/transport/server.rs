@@ -138,6 +138,10 @@ impl NetherServer {
             let _ = task.await;
         }
         self.signal_handler_task.take();
+        self.identity
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         Ok(())
     }
 
@@ -150,11 +154,15 @@ impl NetherServer {
     /// The caller acquires and validates the replacement; `SdpIdentity::augment` keeps its
     /// original per-answer signing and credential checks. This performs no refresh or I/O
     /// and changes neither offer trust nor existing TURN or WebSocket credentials.
+    /// A closed listener does not retain a replacement.
     pub fn set_identity(&self, identity: Arc<dyn SdpIdentity>) {
-        *self
+        let mut selected = self
             .identity
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = Some(identity);
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.cancel_token.is_cancelled() {
+            *selected = Some(identity);
+        }
     }
 
     /// Replaces STUN/TURN configuration for later offers without extending existing credentials.

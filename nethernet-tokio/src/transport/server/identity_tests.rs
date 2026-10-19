@@ -46,6 +46,7 @@ async fn replacing_answer_identity_changes_later_offers_and_preserves_accepted_p
         let proof = Arc::new(SigningKey::generate());
         let (initial, initial_token) = acquired_identity(&proof, 1);
         let (replacement, replacement_token) = acquired_identity(&proof, 2);
+        let renewed = Arc::downgrade(&replacement);
         let mut server = NetherServer::bind_with(accepting, ConnectionConfig {
             identity: Some(initial), token_trust: Some(TokenTrust::Any),
             server_ice: Some(ServerIceConfig { ice: Default::default(), bind_addr: bind }),
@@ -81,6 +82,7 @@ async fn replacing_answer_identity_changes_later_offers_and_preserves_accepted_p
             tokio::join!(second_close.session.closed(), second_peer_close.session.closed());
             stop.cancel();
             server.close().await.unwrap();
+            assert!(renewed.upgrade().is_none(), "closed listener retained its renewed signer");
         };
         let relay = async {
             let mut answers = Vec::new();

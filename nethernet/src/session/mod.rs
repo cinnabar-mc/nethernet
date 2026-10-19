@@ -299,6 +299,12 @@ impl<S: Phase> Session<S> {
         self.ice.gathering_state()
     }
 
+    /// The actual selected TURN stream, absent for pending, direct, UDP or retired relay owners.
+    /// This read does not drive timers or grant application sending capability.
+    pub fn selected_turn_stream(&self) -> Option<TurnStreamRoute> {
+        self.ice.selected_turn_stream()
+    }
+
     /// Rotates the password for one resolved TURN endpoint; the allocation username must remain unchanged.
     /// Success admits the refresh locally; its actual response determines the allocation lifetime.
     pub fn update_turn_credentials(

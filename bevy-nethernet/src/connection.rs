@@ -198,6 +198,8 @@ enum Command<K> {
 pub(crate) struct SessionPool<K> {
     commands: Sender<Command<K>>,
     events: Receiver<PoolEvent<K>>,
+    #[cfg(test)]
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl<K> SessionPool<K>
@@ -208,14 +210,27 @@ where
         let (command_tx, command_rx) = async_channel::unbounded();
         let (event_tx, event_rx) = async_channel::unbounded();
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("nethernet-session-pool".to_string())
             .spawn(move || drive(socket, command_rx, event_tx))
             .expect("failed to spawn the session pool's thread");
+        #[cfg(not(test))]
+        let _ = worker;
 
         Self {
             commands: command_tx,
             events: event_rx,
+            #[cfg(test)]
+            worker: Some(worker),
+        }
+    }
+
+    /// Closes and joins this fixture's original worker before observing final assertions.
+    #[cfg(test)]
+    pub(crate) fn retire_worker(&mut self) {
+        self.commands.close();
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("the original session worker panicked");
         }
     }
 
@@ -248,6 +263,7 @@ where
             Self {
                 commands: command_tx,
                 events: event_rx,
+                worker: None,
             },
             removed,
         )

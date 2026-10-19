@@ -495,3 +495,6 @@ mod expiry_tests {
         assert_eq!(sessions.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod admission_tests;

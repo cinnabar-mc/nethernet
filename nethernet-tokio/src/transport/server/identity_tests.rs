@@ -128,3 +128,48 @@ async fn replacing_answer_identity_changes_later_offers_and_preserves_accepted_p
         assert_eq!(answers, ["first", "second"]);
     }).await.expect("finite original-listener identity replacement stalled");
 }
+
+/// Natural config cancellation retires the original selected signer before explicit listener close.
+#[tokio::test]
+async fn cancelled_listener_releases_its_selected_identity_without_explicit_close() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (signaling, driver) =
+            CallerServerSignaling::new("server".into(), CallerServerSignalingConfig::default())
+                .unwrap();
+        let proof = Arc::new(SigningKey::generate());
+        let (selected, _) = acquired_identity(&proof, 1);
+        let original = Arc::downgrade(&selected);
+        let cancel = CancellationToken::new();
+        let mut server = NetherServer::bind_with(
+            signaling,
+            ConnectionConfig {
+                identity: Some(selected),
+                token_trust: Some(TokenTrust::Any),
+                cancel_token: cancel.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            server.accept().await,
+            Err(NetherError::ConnectionClosed)
+        ));
+        assert!(
+            original.upgrade().is_none(),
+            "retired listener retained its original signer"
+        );
+        let (replacement, _) = acquired_identity(&proof, 2);
+        let unused = Arc::downgrade(&replacement);
+        server.set_identity(replacement);
+        assert!(
+            unused.upgrade().is_none(),
+            "retired listener retained a later signer"
+        );
+        server.close().await.unwrap();
+        drop(driver);
+    })
+    .await
+    .expect("finite original-listener cancellation stalled");
+}

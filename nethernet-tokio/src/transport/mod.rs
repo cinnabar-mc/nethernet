@@ -77,7 +77,7 @@ pub struct ConnectionConfig {
     pub allow_anonymous_offers: bool,
 
     /// How the client authenticates the server's answer; None accepts any answer.
-    /// When set, an answer without a valid identity fails the dial.
+    /// Present identities are checked; missing identities fail unless explicitly allowed.
     pub server_trust: Option<TokenTrust>,
 
     /// Permits a missing server answer identity under the caller's explicit route policy.

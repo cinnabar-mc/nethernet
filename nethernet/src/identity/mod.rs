@@ -17,7 +17,9 @@ pub use envelope::{
 pub use player::PlayerInfo;
 pub use server::ServerIdentity;
 pub use token::TokenIdentity;
-pub use trust::{TokenTrust, TokenVerifier, validate_sdp, verify_answer};
+pub use trust::{
+    TokenTrust, TokenVerifier, validate_sdp, verify_answer, verify_answer_with_policy,
+};
 
 /// An identity that signs the fingerprints of a locally generated SDP description.
 pub trait SdpIdentity: Send + Sync {

@@ -29,6 +29,7 @@ pub(super) async fn exchange<St>(
     connection_id: u64,
     remote_network_id: &str,
     trust: Option<&TokenTrust>,
+    allow_anonymous: bool,
     within: Duration,
     deadline: Instant,
 ) -> std::result::Result<(), (Option<SignalErrorCode>, NetherError)>
@@ -77,7 +78,7 @@ where
                     if signal.connection_id != connection_id || signal.network_id != remote_network_id { continue; }
                     match signal.signal_type {
                         SignalType::Answer => {
-                            check_answer(&signal, trust, SystemTime::now())?;
+                            check_answer(&signal, trust, allow_anonymous, SystemTime::now())?;
                             if answer.is_none() { answer = Some(signal); }
                         }
                         SignalType::Candidate => connection.handle(ConnectionInput::Signal(signal, transport_now()))

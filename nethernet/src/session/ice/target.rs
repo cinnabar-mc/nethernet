@@ -73,6 +73,12 @@ impl TurnStreamTarget {
             TurnAddressFamily::Ipv6
         })
     }
+
+    /// Bounds connection and TLS setup by both the caller's cutoff and this original credential.
+    /// An acknowledged allocation keeps its separate server-owned lease.
+    pub fn admission_deadline(&self, caller_deadline: Instant) -> Instant {
+        caller_deadline.min(self.credentials.valid_until)
+    }
 }
 
 #[cfg(test)]

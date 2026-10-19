@@ -1,12 +1,15 @@
 //! A connected session driven by one task, with reliable and unreliable channels and peer metadata.
 pub(crate) mod command;
 pub(crate) mod guard;
+mod observation;
 pub(crate) mod outgoing;
 mod receive;
 mod send;
 mod server;
 
 pub(crate) use command::Command;
+pub use observation::RttObservation;
+use observation::RttPublisher;
 pub use send::{SendPermit, SendReceipt};
 pub(crate) use server::{ServerLease, ServerRetirement};
 
@@ -59,6 +62,7 @@ pub struct SessionSender {
     local_addr: Addr,
     remote_addr: Addr,
     command_tx: mpsc::Sender<Command>,
+    rtt: RttObservation,
     close_token: CancellationToken,
     _guard: Arc<TaskGuard>,
 }
@@ -226,6 +230,7 @@ impl Session<Connecting> {
         let (unreliable_tx, unreliable_rx) = receive::channel(Channel::Unreliable);
         let (ready_tx, ready_rx) = oneshot::channel();
         let close_token = CancellationToken::new();
+        let rtt = RttObservation::new();
 
         let task = Self::drive(
             socket,
@@ -235,6 +240,7 @@ impl Session<Connecting> {
             unreliable_tx,
             Some(ready_tx),
             close_token.clone(),
+            rtt.clone(),
             signaling,
             server.clone(),
         );
@@ -250,6 +256,7 @@ impl Session<Connecting> {
                 local_addr: local,
                 remote_addr: remote,
                 command_tx,
+                rtt,
                 close_token,
                 _guard: guard.clone(),
             }),
@@ -281,13 +288,16 @@ impl Session<Connecting> {
         unreliable_tx: Producer,
         mut ready_tx: Option<oneshot::Sender<Ready>>,
         close_token: CancellationToken,
+        rtt_observation: RttObservation,
         signaling: Option<CandidateSignaling>,
         server: Option<Arc<ServerLease>>,
     ) -> JoinHandle<()> {
         let mut guard = ConnectionGuard::new(connection, socket).with_server_capacity(server);
         let driver_closed = close_token.clone().drop_guard();
+        let rtt_publisher = RttPublisher(rtt_observation);
         tokio::spawn(async move {
             let _driver_closed = driver_closed;
+            let rtt_observation = rtt_publisher;
             let (connection, socket) = guard.parts();
             let mut buf = vec![0u8; 65536];
             let mut wake = transport_now();
@@ -426,7 +436,11 @@ impl Session<Connecting> {
                 }
 
                 rtt = connection.rtt();
+                rtt_observation
+                    .0
+                    .publish(rtt.filter(|sample| !sample.is_zero()));
             };
+            rtt_observation.0.retire();
             packet_tx.finish(terminal);
             unreliable_tx.finish(terminal);
             close_token.cancel();
@@ -647,6 +661,7 @@ impl SessionSender {
     /// Repeated calls are harmless and this never aborts the actor task or waits for I/O.
     pub fn start_close(&self) {
         self.close_token.cancel();
+        self.rtt.retire();
     }
 
     /// Starts closing and returns without waiting for teardown.
@@ -669,6 +684,12 @@ impl SessionSender {
             socket_addr,
             ..self.remote_addr.clone()
         }
+    }
+
+    /// Observes the same actor's full SCTP round-trip estimate without queuing a command.
+    /// The returned handle reads without locks and cannot retain this transport.
+    pub fn observe_rtt(&self) -> RttObservation {
+        self.rtt.clone()
     }
 
     /// None until a round trip time has been measured.

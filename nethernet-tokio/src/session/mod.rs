@@ -69,7 +69,7 @@ struct RttPublisher(watch::Sender<Option<Duration>>);
 
 impl Drop for RttPublisher {
     fn drop(&mut self) {
-        self.0.send_replace(None);
+        let _ = self.0.send_replace(None);
     }
 }
 

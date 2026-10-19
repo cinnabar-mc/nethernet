@@ -86,13 +86,13 @@ impl Identity {
     }
 }
 
-/// Preserves a present empty or valueless assertion so anonymous admission cannot hide malformed data.
+/// Uses SDP attribute normalization while preserving the first empty or valueless identity.
 pub(crate) fn sdp_identity_value(sdp: &str) -> Option<&str> {
-    sdp.split(['\r', '\n'])
-        .find_map(|line| match line.strip_prefix("a=identity")? {
-            "" => Some(""),
-            value => value.strip_prefix(':'),
-        })
+    sdp.split('\n').find_map(|line| {
+        let attribute = line.trim_start_matches('\r').strip_prefix("a=")?.trim();
+        let (key, value) = attribute.split_once(':').unwrap_or((attribute, ""));
+        (key == "identity").then_some(value)
+    })
 }
 
 /// The `(algorithm, digest)` pairs of the `a=fingerprint` lines of `sdp`, in order.

@@ -382,9 +382,8 @@ including those gathered after its initial offer. Active clients expose
 Outbound Bevy clients poll their nonblocking UDP/TCP/TLS sockets and pure connection on
 `update`, without a socket thread or Tokio dependency. Call updates regularly;
 pausing frames also pauses transport progress. Each client owns an exclusive UDP
-socket, including its TURN allocation tuples. The server adapter retains its
-existing shared-socket worker and command/event queues; this does not multiplex
-multiple relay allocations onto a shared TURN tuple. Outbound work reads at most
+socket, including its TURN allocation tuples. This does not multiplex multiple
+relay allocations onto a shared TURN tuple. Outbound work reads at most
 64 combined datagram/stream input steps and drains at most 1024 core outputs per
 update. Each stream retains one bounded RTC frame for input and one original
 partial output with its byte offset, plus the existing TLS buffers. A blocked
@@ -400,6 +399,18 @@ and return `WouldBlock` before admitting more work when the drain budget is full
 Cancellation drops the socket owner after finite best-effort relay release.
 Initial HTTP hostname resolution/platform TLS setup are synchronous explicit
 setup; frame retries reuse their prepared target and trust configuration.
+
+The accepting Bevy LAN and HTTP adapters use one shared UDP worker and a bounded
+command channel. `set_session_limits(ServerLimits { .. })` controls the host-wide
+session, retained packet and retained byte limits; `set_pending_limits` separately
+controls unanswered offers. Payloads stay charged until application receive, and
+retired sessions keep their admission slots until worker cleanup and lifecycle
+consumption finish. Lowering limits preserves the accepted prefix. Worker admission
+does not block the Bevy frame: the original answer waits in its existing session
+entry until that worker installs the same core. Only actual transport readiness
+grants an established send capability. A full command channel returns `WouldBlock`
+before copying a send payload. These accepting APIs currently use host candidates;
+outbound `ClientIceConfig` does not configure accepting TURN allocations.
 
 The Tokio driver admits reliable messages into one FIFO shared with the application
 receiver. Its packet budget is twice the default receiver capacity; its byte budget

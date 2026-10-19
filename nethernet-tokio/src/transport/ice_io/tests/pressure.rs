@@ -130,10 +130,12 @@ async fn service(listener: TcpListener, gates: Gates, done: CancellationToken) {
             }
         }
         // B's actual Refresh follows its reliable prefix through the SAME actor output/TCP FIFO.
-        if held && Some(from) != watched_addr && turn.refreshes > previous_refreshes {
-            if let Some(observed) = prefix_forwarded.take() {
-                let _ = observed.send(());
-            }
+        if held
+            && Some(from) != watched_addr
+            && turn.refreshes > previous_refreshes
+            && let Some(observed) = prefix_forwarded.take()
+        {
+            let _ = observed.send(());
         }
     }
 }

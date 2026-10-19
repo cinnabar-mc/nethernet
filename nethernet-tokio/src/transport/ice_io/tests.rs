@@ -130,7 +130,7 @@ async fn service_pair(
     refreshed: tokio::sync::oneshot::Sender<()>,
 ) {
     let mut turn = turn::TurnPeer::new(listener.local_addr().unwrap());
-    turn.ipv6_relay = listener.local_addr().unwrap().is_ipv6();
+    turn.ipv6_relay = turn.addr.is_ipv6();
     let mut refreshed = Some(refreshed);
     let mut nonzero_refreshes = 0;
     let (first, _) = listener.accept().await.unwrap();

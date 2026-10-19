@@ -75,9 +75,6 @@ async fn service(listener: TcpListener, gates: Gates, done: CancellationToken) {
             _ = done.cancelled() => break,
             address = async { watched.as_mut().unwrap().await }, if watched.is_some() => {
                 watched_addr = Some(address.unwrap());
-                let peer = peers.iter_mut().find(|peer| Some(peer.remote) == watched_addr).unwrap();
-                let TestWire::Tcp(socket) = &peer.stream else { unreachable!() };
-                socket2::SockRef::from(socket).set_recv_buffer_size(1024).unwrap();
                 watched = None;
                 continue;
             }

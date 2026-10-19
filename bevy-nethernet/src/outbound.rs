@@ -581,6 +581,8 @@ impl Received {
 }
 
 #[cfg(test)]
+mod capacity_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
 /// A frame-driven client owner created only by actual two-channel readiness.

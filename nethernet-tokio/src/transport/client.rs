@@ -230,7 +230,7 @@ impl NetherClient {
                     now,
                     deadline.into_std(),
                 )
-                .map_err(|error| (Some(SignalErrorCode::Ice), error))?;
+                .map_err(|error| (Some(SignalErrorCode::FailedToCreatePeerConnection), error))?;
                 (io, Some(policy))
             }
             None => (IceIo::from(socket), None),

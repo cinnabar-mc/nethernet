@@ -14,9 +14,9 @@ use dtls::EndpointEvent;
 pub use dtls::ResolvedRole;
 use ice::IceLayer;
 pub use ice::{
-    GatheringState, IceConfig, IceError, IcePolicy, IceServer, MAX_ICE_SERVERS,
+    GatheringState, IceConfig, IceError, IcePolicy, IceServer, MAX_ICE_SERVERS, MAX_ICE_URL_BYTES,
     MAX_TURN_CREDENTIAL_BYTES, MAX_TURN_STREAM_FRAME_BYTES, TurnAddressFamily, TurnCredentials,
-    TurnStreamRoute,
+    TurnStreamRoute, TurnStreamSecurity, TurnStreamTarget,
 };
 use rtc::datachannel::message::Message as DcepMessage;
 use rtc::ice::candidate::Candidate;

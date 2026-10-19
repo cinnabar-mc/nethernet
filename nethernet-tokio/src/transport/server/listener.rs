@@ -129,6 +129,10 @@ pub(super) fn start(
         }
         // No peer can remain detached behind metadata, answer delivery or ready wait.
         listener.cancel();
+        identity
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         peers.abort_all();
         while peers.join_next().await.is_some() {}
     })

@@ -37,6 +37,8 @@ pub struct TurnPeer {
     pub indications: usize,
     pub channel_data: usize,
     pub refreshes: usize,
+    pub refuse_refreshes: bool,
+    pub last_refresh_lifetime: Option<Duration>,
     pub stale_permissions_once: bool,
     pub stale_permission_responses: usize,
     pub renewed_nonce_permissions: usize,
@@ -56,6 +58,8 @@ impl TurnPeer {
             indications: 0,
             channel_data: 0,
             refreshes: 0,
+            refuse_refreshes: false,
+            last_refresh_lifetime: None,
             stale_permissions_once: false,
             stale_permission_responses: 0,
             renewed_nonce_permissions: 0,
@@ -176,25 +180,7 @@ impl TurnPeer {
                 peer.get_from(&request).unwrap();
                 if self.refuse_permissions_for == Some(peer.ip) {
                     self.permission_refusals += 1;
-                    let response = encode(vec![
-                        Box::new(request.transaction_id),
-                        Box::new(MessageType::new(
-                            METHOD_CREATE_PERMISSION,
-                            CLASS_ERROR_RESPONSE,
-                        )),
-                        Box::new(CODE_FORBIDDEN),
-                        Box::new(
-                            MessageIntegrity::new_long_term_integrity_with_provider(
-                                USER.to_owned(),
-                                REALM.to_owned(),
-                                PASSWORD.to_owned(),
-                                provider.crypto(),
-                            )
-                            .unwrap(),
-                        ),
-                        Box::new(FINGERPRINT),
-                    ]);
-                    self.packets.push_back((from, response));
+                    self.forbidden(from, &request);
                     return;
                 }
                 if self.stale_permissions_once {
@@ -242,6 +228,11 @@ impl TurnPeer {
                 self.refreshes += 1;
                 let mut lifetime = Lifetime::default();
                 lifetime.get_from(&request).unwrap();
+                self.last_refresh_lifetime = Some(lifetime.0);
+                if self.refuse_refreshes && !lifetime.0.is_zero() {
+                    self.forbidden(from, &request);
+                    return;
+                }
                 if lifetime.0.is_zero() {
                     self.allocations.remove(&from);
                 }
@@ -249,6 +240,27 @@ impl TurnPeer {
             }
             _ => panic!("unexpected TURN method"),
         }
+    }
+
+    /// Refuses the exact authenticated transaction without changing the original allocation.
+    fn forbidden(&mut self, to: SocketAddr, request: &Message) {
+        let provider = rtc::crypto::default_provider().unwrap();
+        let response = encode(vec![
+            Box::new(request.transaction_id),
+            Box::new(MessageType::new(request.typ.method, CLASS_ERROR_RESPONSE)),
+            Box::new(CODE_FORBIDDEN),
+            Box::new(
+                MessageIntegrity::new_long_term_integrity_with_provider(
+                    USER.to_owned(),
+                    REALM.to_owned(),
+                    PASSWORD.to_owned(),
+                    provider.crypto(),
+                )
+                .unwrap(),
+            ),
+            Box::new(FINGERPRINT),
+        ]);
+        self.packets.push_back((to, response));
     }
 
     /// Returns an unsigned scoped nonce challenge, preserving the server's allocation.

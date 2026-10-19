@@ -288,6 +288,7 @@ impl<S: Phase> Session<S> {
     }
 
     /// Rotates the password for one resolved TURN endpoint; the allocation username must remain unchanged.
+    /// Success admits the refresh locally; its actual response determines the allocation lifetime.
     pub fn update_turn_credentials(
         &mut self,
         server: SocketAddr,

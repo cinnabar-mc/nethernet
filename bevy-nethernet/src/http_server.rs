@@ -390,6 +390,10 @@ impl NetherHttpServer {
             }
         }
         for id in failed {
+            let _ = self.signaler.handle(HttpSignalerInput::Reject {
+                connection_id: id.connection_id,
+                reason: RejectReason::Unavailable,
+            });
             self.remove_session(&id);
         }
     }

@@ -163,7 +163,7 @@ async fn concurrent_sends_wait_outside_the_bounded_real_session_command_queue() 
             queued_commands.await.unwrap() <= command::COMMAND_CAPACITY,
             "concurrent sends must retain excess payloads at their caller, not in an unbounded actor queue"
         );
-        let _ = held;
+        drop(held);
         sender.sender().close().await.unwrap();
         receiver.sender().close().await.unwrap();
     })

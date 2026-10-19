@@ -544,7 +544,6 @@ impl<K: Eq + Hash + Clone> Router<K> {
 mod routing_tests {
     use super::*;
     use nethernet::connection::IceMode;
-    use nethernet::sans::Sans;
     use nethernet::session::Session;
     use std::collections::VecDeque;
 

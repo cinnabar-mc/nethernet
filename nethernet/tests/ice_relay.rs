@@ -504,7 +504,7 @@ fn gathering_has_a_deadline_and_rejects_wrong_source_or_corrupt_authenticated_su
     }
     assert_eq!(session.gathering_state(), GatheringState::Complete);
     assert_eq!(session.local_candidates().len(), 1);
-    // Credential expiry retires the allocation even before a remote peer is supplied.
+    // The actual allocation lifetime ends even before a remote peer is supplied.
     session
         .handle(SessionInput::Timeout(start + Duration::from_secs(1200)))
         .unwrap();
@@ -749,56 +749,38 @@ fn a_connection_trickles_candidates_gathered_after_the_initial_offer_once() {
 
 #[test]
 fn a_selected_relay_expires_before_send_even_without_a_timeout_input() {
-    for credential_expiry in [false, true] {
-        let (mut endpoints, mut server, mut now) = pair(false);
-        let expired = if credential_expiry {
-            let expires = now + Duration::from_secs(2);
-            endpoints[0]
-                .session
-                .update_turn_credentials(
-                    server.addr,
-                    TurnCredentials::new(USER.to_string(), PASSWORD.to_string(), expires).unwrap(),
-                    now,
-                )
-                .unwrap();
-            for _ in 0..20 {
-                step(&mut endpoints, &mut server, &mut now);
-            }
-            expires
-        } else {
-            // Allocation success advertised 600 seconds before this handshake became ready.
-            now + Duration::from_secs(601)
-        };
-        while endpoints[0].session.poll().is_some() {}
-        let result = endpoints[0].session.send(
-            Channel::Unreliable,
-            b"must not leave an expired relay".as_slice().into(),
-            expired,
-        );
-        let output: Vec<_> = std::iter::from_fn(|| endpoints[0].session.poll()).collect();
-        assert!(
-            !output
+    let (mut endpoints, _server, now) = pair(false);
+    // Allocation success advertised 600 seconds before this handshake became ready.
+    let expired = now + Duration::from_secs(601);
+    while endpoints[0].session.poll().is_some() {}
+    let result = endpoints[0].session.send(
+        Channel::Unreliable,
+        b"must not leave an expired relay".as_slice().into(),
+        expired,
+    );
+    let output: Vec<_> = std::iter::from_fn(|| endpoints[0].session.poll()).collect();
+    assert!(
+        !output
+            .iter()
+            .any(|output| matches!(output, SessionOutput::Send(..))),
+        "Send used an expired selected relay before its Timeout input"
+    );
+    assert!(
+        result.is_err()
+            || output
                 .iter()
-                .any(|output| matches!(output, SessionOutput::Send(..))),
-            "Send used an expired selected relay before its Timeout input (credential expiry: {credential_expiry})"
-        );
-        assert!(
-            result.is_err()
-                || output
-                    .iter()
-                    .any(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed))),
-            "expiry neither rejected Send nor failed its session"
-        );
-        assert_eq!(
-            endpoints[0].session.gathering_state(),
-            GatheringState::Closed
-        );
-        endpoints[0]
-            .session
-            .handle(SessionInput::Timeout(expired + Duration::from_secs(1000)))
-            .unwrap();
-        assert!(endpoints[0].session.poll().is_none());
-    }
+                .any(|output| matches!(output, SessionOutput::Event(SessionEvent::Failed))),
+        "expiry neither rejected Send nor failed its session"
+    );
+    assert_eq!(
+        endpoints[0].session.gathering_state(),
+        GatheringState::Closed
+    );
+    endpoints[0]
+        .session
+        .handle(SessionInput::Timeout(expired + Duration::from_secs(1000)))
+        .unwrap();
+    assert!(endpoints[0].session.poll().is_none());
 }
 
 #[test]

@@ -300,8 +300,11 @@ TURN credential expiry apply. Full mode gathers before encoding/signing its
 answer. Trickle mode continues gathering during initial answer delivery, but
 late candidate sends wait until the answer and its initial candidates have
 actually completed in order. `NetherServer::set_server_ice` replaces configuration
-for later offers; it never extends an existing credential's expiry. Use
-`Session::update_turn_credentials` to renew a live allocation.
+for later offers; it never extends a credential's admission expiry. After an
+allocation is acknowledged, its actual Allocate and Refresh response lifetimes
+apply independently of the service credential cache. `Session::update_turn_credentials`
+admits password rotation for the same allocation username; success confirms local
+admission, while the actual remote response determines the allocation lease.
 
 A pure caller that gathers its own accepting session can use
 `Admitted::prepare_answer(&mut session, description, now, wall)`, then transfer

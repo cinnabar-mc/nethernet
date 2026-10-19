@@ -26,7 +26,8 @@ pub enum IceError {
     Closed,
 }
 
-/// A bounded TURN credential with an explicit caller-monotonic expiry; intentionally has no Debug implementation.
+/// A bounded TURN credential with a caller-monotonic admission expiry; intentionally has no Debug implementation.
+/// An acknowledged allocation instead follows its actual Allocate and Refresh response lifetimes.
 /// An existing allocation accepts password rotation only; changing username requires a fresh transport tuple.
 #[derive(Clone)]
 pub struct TurnCredentials {
@@ -36,7 +37,7 @@ pub struct TurnCredentials {
 }
 
 impl TurnCredentials {
-    /// Owns the credential after checking its byte bounds. The session also checks expiry when using it.
+    /// Owns the credential after checking its byte bounds. The session checks expiry before allocation or rotation.
     pub fn new(username: String, password: String, valid_until: Instant) -> Result<Self, IceError> {
         if username.is_empty()
             || password.is_empty()

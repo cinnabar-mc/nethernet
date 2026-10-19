@@ -389,6 +389,12 @@ impl NetherServer {
             }
         }
         for id in failed {
+            let refusal = Signal::error(
+                id.connection_id,
+                SignalErrorCode::IncomingConnectionIgnored,
+                id.network_id.clone(),
+            );
+            let _ = self.signaler.handle(LanSignalerInput::Signal(refusal, now));
             self.remove_session(&id);
         }
     }

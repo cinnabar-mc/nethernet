@@ -452,7 +452,7 @@ impl Session<Connecting> {
                     true
                 });
             };
-            rtt_observation.0.send_replace(None);
+            let _ = rtt_observation.0.send_replace(None);
             packet_tx.finish(terminal);
             unreliable_tx.finish(terminal);
             close_token.cancel();
@@ -673,7 +673,7 @@ impl SessionSender {
     /// Repeated calls are harmless and this never aborts the actor task or waits for I/O.
     pub fn start_close(&self) {
         self.close_token.cancel();
-        self.rtt.send_replace(None);
+        let _ = self.rtt.send_replace(None);
     }
 
     /// Starts closing and returns without waiting for teardown.

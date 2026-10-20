@@ -1,7 +1,6 @@
 //! Caller-selected reassembly bounds preserve the original wire and terminal owners.
 
 use super::*;
-use crate::protocol::constants::DEFAULT_MAX_INCOMING_MESSAGE_BYTES;
 
 struct Observation {
     messages: Vec<Vec<u8>>,
@@ -108,24 +107,21 @@ fn exchange(incoming: Option<usize>, payload: Bytes, channel: Channel) -> Observ
     observed
 }
 
-/// A larger configured logical body crosses many normal SCTP records without changing the default.
+/// Default admission carries a 20 MB body intact while explicit smaller policies still apply.
 #[test]
-fn incoming_size_configured_three_mib_preserves_full_bytes_and_the_default_refusal() {
-    let maximum = 3 * 1024 * 1024;
-    let body = Bytes::from(vec![0x61; maximum]);
+fn incoming_size_default_twenty_mb_preserves_full_bytes() {
+    let body = Bytes::from(vec![0x61; 20_000_000]);
     let default = exchange(None, body.clone(), Channel::Reliable);
-    let configured = exchange(Some(maximum), body.clone(), Channel::Reliable);
-    assert_eq!(default.messages, [b"ab".to_vec()]);
-    assert_eq!(default.failed, 1);
-    assert!(
-        matches!(default.rejected_sizes.as_slice(), [size] if *size > DEFAULT_MAX_INCOMING_MESSAGE_BYTES && *size <= body.len())
-    );
+    assert_eq!(default.failed, 0);
+    assert!(default.rejected_sizes.is_empty());
     assert_eq!(
-        configured.messages,
+        default.messages,
         [b"ab".to_vec(), body.to_vec(), b"cd".to_vec()]
     );
-    assert_eq!(configured.failed, 0);
-    assert!(configured.rejected_sizes.is_empty());
+    let configured = exchange(Some(2_560_000), body, Channel::Reliable);
+    assert_eq!(configured.messages, [b"ab".to_vec()]);
+    assert_eq!(configured.failed, 1);
+    assert_eq!(configured.rejected_sizes.len(), 1);
 }
 
 /// Either channel's first oversized logical body retains its accepted reliable prefix and seals successors.

@@ -55,7 +55,8 @@ Direct framing users pass their segment-body limit explicitly to
 `Message::split_into_segments` and `Message::encode_unreliable`.
 
 Incoming application bodies default to `DEFAULT_MAX_INCOMING_MESSAGE_BYTES`
-(2,560,000 bytes), independently of negotiated outgoing capacity and retained queues.
+(66,846,465 bytes, or 255 fragments at the advertised SCTP size), independently of
+negotiated outgoing capacity and retained queues.
 Before accepting a remote description, a pending core can select a different bound
 with `set_max_incoming_message_size`; zero refuses nonempty bodies without reserving
 payload storage. An `OfferPolicy` can set the same bound for its original answering

@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn reassembly_past_the_total_cap_is_refused() {
-        let mut message = Message::new();
+        let mut message = Message::with_maximum(2_560_000);
         let big = Bytes::from(vec![0u8; 1 << 20]);
         let results: Vec<_> = (0..3u8)
             .map(|i| message.add_segment(MessageSegment::new(254 - i, big.clone())))

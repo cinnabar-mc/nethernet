@@ -22,11 +22,18 @@ The WebRTC-based network protocol used in newer versions of Minecraft. It provid
 [license_url]: LICENSE
 <!-- BADGES -->
 
-### Crates
+### Choose an integration
 
-- **[`nethernet`](nethernet)** - a pure sans-io implementation. It owns the wire formats, the identity assertions, the signaling state machines, and the WebRTC session itself (ICE, DTLS, SCTP, data channels, driven directly rather than through a generic peer connection), and performs no IO of its own, so it can be driven by any runtime.
-- **[`nethernet-tokio`](nethernet-tokio)** - an async tokio wrapper over the sans-io crate, exposing `NetherServer` and `NetherClient`.
-- **[`bevy-nethernet`](bevy-nethernet)** - a Bevy plugin wrapping the sans-io crate directly, for games that want to drive it from their own tick rather than through tokio.
+| Crate | Protocol and lifetime ownership | I/O and scheduling |
+| --- | --- | --- |
+| [`nethernet`](nethernet) | Signaling, identity assertions, ICE, DTLS, SCTP and data channels. | Caller-owned sockets and monotonic time; no runtime dependency or background task. |
+| [`nethernet-tokio`](nethernet-tokio) | `NetherClient`, `NetherServer` and typed session handles over the same core. | Tokio sockets and session actors on the caller's runtime. |
+| [`bevy-nethernet`](bevy-nethernet) | Bevy resources and established session capabilities over the core. | Outbound clients progress on frame updates; accepting servers use a shared UDP worker. No Tokio dependency. |
+
+These crates transport application messages. Minecraft Login, gameplay packet
+codecs and account acquisition belong to the application or a higher layer such
+as [bedrock-net](https://github.com/cinnabar-mc/bedrock-net). Keep crates from this
+repository on the same Git revision and commit your application's Cargo.lock.
 
 ### Driving the core
 
@@ -36,12 +43,25 @@ local session; the returned `Description` retains it for every encoding.
 `Admitted::answer` takes the same inputs when creating a server session. The Tokio
 and Bevy adapters generate these identifiers at their runtime boundary.
 
+Import `nethernet::sans::Sans`, feed typed inputs with `handle`, and drain `poll`
+outputs in order. `SessionInput::Packet` carries one complete received datagram;
+`Timeout` supplies the caller's current monotonic time. Retain a `Send` or
+`SendStream` output until its original socket accepts it, including any partial
+stream-write offset. `Wait(delay)` is relative to the input time that produced
+it; queueing output behind a blocked socket does not restart that timer.
+Continue servicing input and timers while the owner is live. Polling alone does
+not advance protocol time, and dropping a core owner performs no socket I/O.
+
 `Session<Connecting>` and `Connection<Connecting>` can drive control input and
 drain their original accepted output, including messages received during
 establishment. Only the consuming `try_establish` transition, backed by both
 actual data channels opening, returns `Established`. If it is still pending, the
 original owner is returned unchanged. Application `send` exists only on
 `Established`; control inputs cannot bypass that boundary.
+
+The reliable data channel is ordered. The unreliable channel is unordered with
+zero retransmissions; it still needs its actual DCEP handshake before readiness.
+See the [channel definitions](nethernet/src/session/dcep.rs) for the wire policy.
 
 `Session<Established>::max_message_size(channel)` and the corresponding
 `Connection` method report the installed outgoing body limit recorded at actual readiness.
@@ -69,9 +89,12 @@ The existing first-segment count and 1 MiB single-SCTP-record read policies are 
 selecting a larger logical body bound does not increase either one.
 
 Core `close(self, now)` consumes a live owner and returns `(Retired, teardown_result)`.
-Drain the retired owner's already accepted messages and best-effort deallocation
-output even when teardown reports an error. It cannot accept input, credentials
-or new application sends.
+It preserves accepted messages/events and, when DTLS is active, queues an encrypted
+close notification through the current ICE route before retiring transport state. Drain that
+retired FIFO, including best-effort close and TURN deallocation output, even when
+teardown reports an error. Dropping it without draining cannot notify the peer.
+This is not a peer acknowledgment or a guarantee under packet loss. The retired
+owner cannot accept input, credentials or new application sends.
 Remote failure still arrives at runtime and preserves the existing accepted
 message/terminal order; readiness does not promise that a remote peer stays live.
 
@@ -82,6 +105,9 @@ synchronously, including from an application's Drop; other capabilities then
 observe closure at runtime. Consuming `Session::close` returns a retired owner,
 and consuming `NetherClient::close` returns the retired session with both original
 receivers so accepted messages remain readable.
+Keep draining those receivers through EOF or their explicit error. `closed()`
+observes the shared close request or driver cancellation; it is not an actor join
+or evidence that the peer received the close notification.
 
 For an application that must recheck authority after backpressure,
 `SessionSender::reserve_send(deadline)` reserves one slot in the same bounded
@@ -159,21 +185,27 @@ Each carrier holds one original output frame. A selected stream applies normal a
 To build the project:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 ```
 
 To run the examples:
 
 ```bash
 # NetherNet server
-cargo run --example server -p nethernet-tokio
+cargo run --locked --example server -p nethernet-tokio
 
 # NetherNet client
-cargo run --example client -p nethernet-tokio
+cargo run --locked --example client -p nethernet-tokio
 
 # List the servers advertising themselves on the local network
-cargo run --example scanner -p nethernet-tokio
+cargo run --locked --example scanner -p nethernet-tokio
 ```
+
+The [client](nethernet-tokio/examples/client.rs) and
+[server](nethernet-tokio/examples/server.rs) demonstrate local LAN discovery and
+application-byte echo, not Minecraft authentication or world startup. The client
+uses `AsyncRead`/`AsyncWrite`, whose reads need not match message boundaries;
+`AcceptedSession.reliable.recv()` returns complete reliable bodies instead.
 
 ### Serving the HTTP endpoint
 

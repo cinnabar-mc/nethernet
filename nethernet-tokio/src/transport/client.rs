@@ -29,10 +29,13 @@ use tokio_util::io::StreamReader;
 use tokio_util::sync::ReusableBoxFuture;
 
 pub(crate) fn parse_error_code(data: &str) -> SignalErrorCode {
-    data.trim().parse::<u32>().map_or(
-        SignalErrorCode::SignalingUnknownError,
-        SignalErrorCode::from,
-    )
+    nethernet::protocol::signal::parse_error_code(data)
+        .ok()
+        .and_then(|code| u32::try_from(code).ok())
+        .map_or(
+            SignalErrorCode::SignalingUnknownError,
+            SignalErrorCode::from,
+        )
 }
 
 fn check_answer(
@@ -762,3 +765,6 @@ mod tests {
 
 #[cfg(test)]
 mod anonymous_answer_tests;
+
+#[cfg(test)]
+mod error_code_tests;

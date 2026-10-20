@@ -101,12 +101,17 @@ impl DtlsLayer {
             .map(|msg| (msg.message.to_vec(), msg.transport.peer_addr))
     }
 
-    /// Test peer operation: queue the actual encrypted DTLS close_notify record.
-    #[cfg(test)]
-    pub(super) fn close_for_test(&mut self, now: Instant) -> Result<(), ProtocolError> {
+    /// Queues the original DTLS close_notify before the transport owner is retired.
+    pub(super) fn close(&mut self, now: Instant) -> Result<(), ProtocolError> {
         self.endpoint
             .close(now)
             .map_err(|error| ProtocolError::Other(format!("{error}")))
+    }
+
+    /// Test peer operation: queue the actual encrypted DTLS close_notify record.
+    #[cfg(test)]
+    pub(super) fn close_for_test(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        self.close(now)
     }
 
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), ProtocolError> {

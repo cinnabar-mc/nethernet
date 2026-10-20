@@ -1,7 +1,6 @@
 //! Framing and discovery codec benches; `tools/go-peer` runs the same cases against go-nethernet.
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nethernet::protocol::codec::NetherCodec;
 use nethernet::protocol::constants::LOCAL_SCTP_MAX_MESSAGE_SIZE;
 use nethernet::protocol::packet::discovery::{
     MessagePacket, Packets, RequestPacket, ResponsePacket, ServerData, decode, encode,
@@ -24,11 +23,9 @@ fn pattern(len: usize) -> Bytes {
 }
 
 /// Uses the current advertised SCTP default, excluding the segment-count byte.
-fn wire_segments(data: Bytes) -> Vec<Bytes> {
-    Message::split_into_segments(data, LOCAL_SCTP_MAX_MESSAGE_SIZE as usize - size_of::<u8>())
+fn wire_segments(data: &Bytes) -> Vec<Bytes> {
+    Message::encode_segments(data, LOCAL_SCTP_MAX_MESSAGE_SIZE as usize - size_of::<u8>())
         .unwrap()
-        .iter()
-        .map(MessageSegment::encode)
         .collect()
 }
 
@@ -38,9 +35,9 @@ fn segment(c: &mut Criterion) {
         let data = pattern(size);
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(BenchmarkId::new("split", size), |b| {
-            b.iter(|| wire_segments(black_box(data.clone())))
+            b.iter(|| wire_segments(black_box(&data)))
         });
-        let wire = wire_segments(data);
+        let wire = wire_segments(&data);
         group.bench_function(BenchmarkId::new("reassemble", size), |b| {
             b.iter(|| {
                 let mut message = Message::new();
@@ -90,13 +87,7 @@ fn server_data(c: &mut Criterion) {
     let wire = input("server_data.bin");
     let data = ServerData::decode(&wire).unwrap();
     let mut group = c.benchmark_group("server_data");
-    group.bench_function("encode", |b| {
-        b.iter(|| {
-            let mut buf = Vec::new();
-            black_box(&data).serialize(&mut buf).unwrap();
-            buf
-        })
-    });
+    group.bench_function("encode", |b| b.iter(|| black_box(&data).encode().unwrap()));
     group.bench_function("decode", |b| {
         b.iter(|| ServerData::decode(black_box(&wire)).unwrap())
     });

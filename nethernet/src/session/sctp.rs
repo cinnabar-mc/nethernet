@@ -19,7 +19,7 @@ pub struct SctpLayer {
     remote_addr: SocketAddr,
     max_message_size: u32,
     association: Option<(AssociationHandle, Association)>,
-    pending_transmits: VecDeque<Vec<u8>>,
+    pending_transmits: VecDeque<Bytes>,
 }
 
 impl SctpLayer {
@@ -60,11 +60,8 @@ impl SctpLayer {
         })
     }
 
-    pub fn handle_read(&mut self, data: &[u8], now: Instant) {
-        let Some((handle, event)) =
-            self.endpoint
-                .handle(now, self.remote_addr, None, Bytes::copy_from_slice(data))
-        else {
+    pub fn handle_read(&mut self, data: Bytes, now: Instant) {
+        let Some((handle, event)) = self.endpoint.handle(now, self.remote_addr, None, data) else {
             return;
         };
 
@@ -94,7 +91,7 @@ impl SctpLayer {
         self.association.as_ref().map(|(_, assoc)| assoc.rtt())
     }
 
-    pub fn poll_transmit(&mut self, now: Instant) -> Option<Vec<u8>> {
+    pub fn poll_transmit(&mut self, now: Instant) -> Option<Bytes> {
         if let Some(data) = self.pending_transmits.pop_front() {
             return Some(data);
         }
@@ -104,8 +101,7 @@ impl SctpLayer {
         let Payload::RawEncode(packets) = transmit.message else {
             return None;
         };
-        self.pending_transmits
-            .extend(packets.into_iter().map(|b| b.to_vec()));
+        self.pending_transmits.extend(packets);
         self.pending_transmits.pop_front()
     }
 
@@ -159,11 +155,11 @@ mod tests {
 
             while let Some(data) = client.poll_transmit(now) {
                 progressed = true;
-                server.handle_read(&data, now);
+                server.handle_read(data, now);
             }
             while let Some(data) = server.poll_transmit(now) {
                 progressed = true;
-                client.handle_read(&data, now);
+                client.handle_read(data, now);
             }
 
             while let Some(event) = client.poll_event() {
@@ -212,11 +208,11 @@ mod tests {
             let mut progressed = false;
             while let Some(data) = client.poll_transmit(now) {
                 progressed = true;
-                server.handle_read(&data, now);
+                server.handle_read(data, now);
             }
             while let Some(data) = server.poll_transmit(now) {
                 progressed = true;
-                client.handle_read(&data, now);
+                client.handle_read(data, now);
             }
 
             if let Some(assoc) = server.association_mut()

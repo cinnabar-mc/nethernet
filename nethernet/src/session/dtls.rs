@@ -84,8 +84,17 @@ impl DtlsLayer {
         data: &[u8],
         now: Instant,
     ) -> Result<Vec<EndpointEvent>, ProtocolError> {
+        self.handle_read_owned(BytesMut::from(data), now)
+    }
+
+    /// Transfers a received datagram into DTLS without copying its owned buffer.
+    pub(super) fn handle_read_owned(
+        &mut self,
+        data: BytesMut,
+        now: Instant,
+    ) -> Result<Vec<EndpointEvent>, ProtocolError> {
         self.endpoint
-            .read(now, self.remote_addr, None, BytesMut::from(data))
+            .read(now, self.remote_addr, None, data)
             .map_err(|e| ProtocolError::Other(format!("{e}")))
     }
 
@@ -98,7 +107,7 @@ impl DtlsLayer {
     pub fn poll_transmit(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
         self.endpoint
             .poll_transmit()
-            .map(|msg| (msg.message.to_vec(), msg.transport.peer_addr))
+            .map(|msg| (Vec::from(msg.message), msg.transport.peer_addr))
     }
 
     /// Queues the original DTLS close_notify before the transport owner is retired.

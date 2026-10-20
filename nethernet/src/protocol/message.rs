@@ -19,11 +19,9 @@ impl MessageSegment {
         }
     }
 
+    #[inline]
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(1 + self.data.len());
-        buf.put_u8(self.remaining_segments);
-        buf.extend_from_slice(&self.data);
-        buf.freeze()
+        encode_segment(self.remaining_segments, &self.data)
     }
 
     /// Fails below two bytes, so a segment with an empty body is invalid.
@@ -105,6 +103,10 @@ impl Message {
             return self.reject(ProtocolError::MessageSizeExceeded(size));
         }
 
+        if self.data.is_empty() && segment.remaining_segments == 0 {
+            return Ok(Some(segment.data));
+        }
+
         self.data.put(segment.data);
 
         if segment.remaining_segments == 0 {
@@ -125,44 +127,33 @@ impl Message {
     }
 
     /// Splits under the caller's segment-body limit, excluding the header, with at most 255 segments.
-    #[inline(always)]
-    pub fn split_into_segments(data: Bytes, maximum_payload: usize) -> Result<Vec<MessageSegment>> {
-        let len = data.len();
+    #[inline]
+    pub fn split_into_segments(
+        mut data: Bytes,
+        maximum_payload: usize,
+    ) -> Result<Vec<MessageSegment>> {
+        let count = segment_count(data.len(), maximum_payload)?;
+        Ok((0..count)
+            .rev()
+            .map(move |remaining| {
+                let length = data.len().min(maximum_payload);
+                MessageSegment::new(remaining as u8, data.split_to(length))
+            })
+            .collect())
+    }
 
-        if len <= maximum_payload {
-            return Ok(vec![MessageSegment::new(0, data)]);
-        }
-
-        if maximum_payload == 0 {
-            return Err(ProtocolError::MessageSizeExceeded(len));
-        }
-        let segment_count = len.div_ceil(maximum_payload);
-
-        if segment_count > usize::from(u8::MAX) {
-            return Err(ProtocolError::MessageSizeExceeded(len));
-        }
-
-        let mut segments = Vec::with_capacity(segment_count);
-
-        let mut remaining = data;
-        let mut left = segment_count as u8;
-
-        while remaining.len() > maximum_payload {
-            left -= 1;
-
-            let chunk = remaining.split_to(maximum_payload);
-
-            segments.push(MessageSegment::new(left, chunk));
-        }
-
-        if !remaining.is_empty() {
-            left -= 1;
-            segments.push(MessageSegment::new(left, remaining));
-        }
-
-        debug_assert_eq!(left, 0);
-
-        Ok(segments)
+    /// Encodes wire fragments directly from a borrowed body without temporary descriptors.
+    #[inline]
+    pub fn encode_segments(
+        data: &[u8],
+        maximum_payload: usize,
+    ) -> Result<impl ExactSizeIterator<Item = Bytes> + '_> {
+        let count = segment_count(data.len(), maximum_payload)?;
+        Ok((0..count).map(move |index| {
+            let start = index * maximum_payload;
+            let end = start.saturating_add(maximum_payload).min(data.len());
+            encode_segment((count - index - 1) as u8, &data[start..end])
+        }))
     }
 
     /// Refuses a body beyond the caller's single-segment payload limit, excluding its header.
@@ -172,6 +163,30 @@ impl Message {
         }
         Ok(MessageSegment::new(0, data).encode())
     }
+}
+
+/// Checks the shared fragment-count policy before creating descriptors or copying wire bytes.
+fn segment_count(length: usize, maximum_payload: usize) -> Result<usize> {
+    let count = if length <= maximum_payload {
+        1
+    } else if maximum_payload == 0 {
+        return Err(ProtocolError::MessageSizeExceeded(length));
+    } else {
+        length.div_ceil(maximum_payload)
+    };
+    if count > usize::from(u8::MAX) {
+        return Err(ProtocolError::MessageSizeExceeded(length));
+    }
+    Ok(count)
+}
+
+/// Copies a count byte and its body into one exactly sized wire allocation.
+#[inline]
+fn encode_segment(remaining: u8, data: &[u8]) -> Bytes {
+    let mut bytes = Vec::with_capacity(1 + data.len());
+    bytes.push(remaining);
+    bytes.extend_from_slice(data);
+    Bytes::from(bytes)
 }
 
 impl Default for Message {
@@ -218,6 +233,18 @@ mod tests {
             Err(ProtocolError::MessageSizeExceeded(1))
         ));
         assert_eq!(zero.data.capacity(), 0);
+    }
+
+    #[test]
+    fn encoded_segments_preserve_boundaries_and_validate_before_encoding() {
+        let wire: Vec<_> = Message::encode_segments(b"abcde", 2).unwrap().collect();
+        assert_eq!(wire, [b"\x02ab".as_slice(), b"\x01cd", b"\x00e"]);
+        assert_eq!(
+            Message::encode_segments(b"", 0).unwrap().next().unwrap(),
+            b"\x00".as_slice()
+        );
+        assert!(Message::encode_segments(b"x", 0).is_err());
+        assert!(Message::encode_segments(&[0; 256], 1).is_err());
     }
 
     #[test]

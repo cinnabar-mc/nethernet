@@ -18,6 +18,9 @@ use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 use tokio_rustls::TlsConnector;
 
+/// Requested receive space for an SCTP flight and the kernel overhead of its datagrams.
+const UDP_RECEIVE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+
 pub(crate) enum IceEvent {
     Datagram(Box<[u8]>, SocketAddr),
     Activated(TurnStreamId, TurnStreamRoute),
@@ -54,6 +57,7 @@ pub(crate) struct IceIo {
 }
 impl From<Arc<UdpSocket>> for IceIo {
     fn from(udp: Arc<UdpSocket>) -> Self {
+        configure_receive_buffer(udp.as_ref());
         Self {
             udp,
             streams: Vec::new(),
@@ -62,6 +66,17 @@ impl From<Arc<UdpSocket>> for IceIo {
         }
     }
 }
+/// Requests burst capacity and keeps larger buffers chosen by the caller.
+fn configure_receive_buffer(udp: &UdpSocket) {
+    let socket = socket2::SockRef::from(udp);
+    if let Ok(current) = socket.recv_buffer_size()
+        && current < UDP_RECEIVE_BUFFER_BYTES
+        && let Err(error) = socket.set_recv_buffer_size(UDP_RECEIVE_BUFFER_BYTES)
+    {
+        tracing::debug!(%error, "could not enlarge UDP receive buffer");
+    }
+}
+
 impl IceIo {
     /// Validates the complete bounded configuration before starting any independent target.
     pub fn configured(

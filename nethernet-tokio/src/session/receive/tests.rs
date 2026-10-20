@@ -90,3 +90,44 @@ fn admission_and_terminal_wake_the_receiver_without_retaining_a_dropped_receiver
     );
     assert_eq!(wake.0.load(Ordering::Relaxed), 2);
 }
+
+/// Only an otherwise empty FIFO can retain one large valid body, with credit ending at pop.
+#[test]
+fn an_exclusive_body_cannot_coexist_and_pop_keeps_first_terminal() {
+    let (producer, mut receiver) = channel(Channel::Reliable);
+    let prefix = Bytes::from_static(b"accepted prefix");
+    let body = Bytes::from(vec![0x61; MAX_ACCEPTED_BYTES + 1]);
+    producer.push(prefix.clone()).unwrap();
+    assert_eq!(producer.push(body.clone()), Err(AdmissionError::Full));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        receiver.poll_recv(&mut cx),
+        Poll::Ready(Ok(Some(received))) if received == prefix
+    ));
+    producer.push(body.clone()).unwrap();
+    assert_eq!(producer.push(prefix.clone()), Err(AdmissionError::Full));
+    assert_eq!(producer.push(body.clone()), Err(AdmissionError::Full));
+    let held = match receiver.poll_recv(&mut cx) {
+        Poll::Ready(Ok(Some(received))) => received,
+        _ => panic!("the original exclusive body was not retained"),
+    };
+    assert!(held == body, "the exclusive body changed during delivery");
+    producer.push(prefix.clone()).unwrap();
+    producer.finish(Terminal::Transport);
+    producer.finish(Terminal::Capacity);
+    assert_eq!(producer.push(prefix.clone()), Err(AdmissionError::Closed));
+    drop(producer);
+    assert!(matches!(
+        receiver.poll_recv(&mut cx),
+        Poll::Ready(Ok(Some(received))) if received == prefix
+    ));
+    assert!(matches!(
+        receiver.poll_recv(&mut cx),
+        Poll::Ready(Err(NetherError::ConnectionClosed))
+    ));
+    assert!(matches!(receiver.poll_recv(&mut cx), Poll::Ready(Ok(None))));
+    assert_eq!(
+        held, body,
+        "caller-held clones survive release of queue credit"
+    );
+}

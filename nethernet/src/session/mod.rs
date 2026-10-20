@@ -43,7 +43,7 @@ pub enum Channel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEvent {
-    /// Both data channels are open.
+    /// Both data channels completed their DCEP handshakes.
     Ready,
     /// A transport failed or establishment expired; emitted once.
     Failed,
@@ -58,6 +58,8 @@ pub struct OutputUsage {
     pub entries: usize,
     /// Total queued message and wire body lengths; sums saturate on overflow.
     pub bytes: usize,
+    /// Queued UDP and stream body lengths, excluding accepted application messages; saturates on overflow.
+    pub wire_bytes: usize,
 }
 
 pub enum SessionOutput {
@@ -98,6 +100,8 @@ struct RemoteInfo {
 struct Channels {
     reliable_stream_id: Option<StreamId>,
     unreliable_stream_id: Option<StreamId>,
+    reliable_complete: bool,
+    unreliable_complete: bool,
     reassembly: Framing,
     ready_segment_payload: Option<usize>,
     terminal_emitted: bool,
@@ -115,6 +119,14 @@ impl Channels {
         match channel {
             Channel::Reliable => self.reliable_stream_id = Some(stream_id),
             Channel::Unreliable => self.unreliable_stream_id = Some(stream_id),
+        }
+    }
+
+    /// Records the peer's ACK, or the accepted OPEN followed by a successful local ACK write.
+    fn mark_complete(&mut self, channel: Channel) {
+        match channel {
+            Channel::Reliable => self.reliable_complete = true,
+            Channel::Unreliable => self.unreliable_complete = true,
         }
     }
 }
@@ -295,19 +307,22 @@ impl<S: Phase> Session<S> {
 
     /// Derives retained output usage without moving, polling or copying its original payloads.
     pub fn pending_output_usage(&self) -> OutputUsage {
-        let bytes = self.output.iter().fold(0usize, |total, output| {
+        let mut usage = OutputUsage {
+            entries: self.output.len(),
+            ..OutputUsage::default()
+        };
+        for output in &self.output {
             let bytes = match output {
-                SessionOutput::Send(bytes, _)
-                | SessionOutput::SendStream(bytes, _)
-                | SessionOutput::Message(_, bytes) => bytes.len(),
+                SessionOutput::Send(bytes, _) | SessionOutput::SendStream(bytes, _) => {
+                    usage.wire_bytes = usage.wire_bytes.saturating_add(bytes.len());
+                    bytes.len()
+                }
+                SessionOutput::Message(_, bytes) => bytes.len(),
                 SessionOutput::Event(_) | SessionOutput::Wait(_) => 0,
             };
-            total.saturating_add(bytes)
-        });
-        OutputUsage {
-            entries: self.output.len(),
-            bytes,
+            usage.bytes = usage.bytes.saturating_add(bytes);
         }
+        usage
     }
 
     /// Time allowed from the remote description until `Ready` before `Failed` is emitted; defaults to 10 seconds.
@@ -735,6 +750,8 @@ impl<S: Phase> Session<S> {
 
         if self.channels.reliable_stream_id.is_some()
             && self.channels.unreliable_stream_id.is_some()
+            && self.channels.reliable_complete
+            && self.channels.unreliable_complete
             && self.channels.ready_segment_payload.is_none()
             && !self.channels.terminal_emitted
             && let Some(maximum) = self.segment_payload_size()
@@ -876,6 +893,7 @@ fn open_channels_if_controlling(
         let mut stream = assoc
             .open_stream(stream_id, PayloadProtocolIdentifier::Binary)
             .map_err(|e| ProtocolError::Other(format!("{e}")))?;
+        dcep::apply_reliability(&mut stream, &open)?;
         let encoded = dcep::encode_open(open)?;
         stream
             .write_with_ppi(now, &encoded, dcep::PPI_DCEP)
@@ -914,12 +932,18 @@ fn drain_dcep_and_data(
                 None
             };
             if let Some(channel) = channel {
+                let local = match channel {
+                    Channel::Reliable => dcep::reliable_open(),
+                    Channel::Unreliable => dcep::unreliable_open(),
+                };
+                dcep::apply_reliability(&mut stream, &local)?;
                 let stream_id = stream.stream_identifier();
                 let ack = dcep::encode_ack()?;
                 stream
                     .write_with_ppi(now, &ack, dcep::PPI_DCEP)
                     .map_err(|e| ProtocolError::Other(format!("{e}")))?;
                 channels.set_open(channel, stream_id);
+                channels.mark_complete(channel);
             }
         }
     }
@@ -938,6 +962,9 @@ fn drain_dcep_and_data(
             };
 
             if is_dcep {
+                if matches!(dcep::decode(&data), Ok(DcepMessage::DataChannelAck(_))) {
+                    channels.mark_complete(channel);
+                }
                 continue;
             }
 

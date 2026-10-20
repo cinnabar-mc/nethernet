@@ -447,8 +447,10 @@ outbound `ClientIceConfig` does not configure accepting TURN allocations.
 The Tokio driver admits reliable messages into one FIFO shared with the application
 receiver. Its packet budget is twice the default receiver capacity; its byte budget
 is `DEFAULT_MAX_RECEIVED_BYTES` (10,240,000 bytes), independently of negotiated
-outgoing fragment sizes. Application backpressure
-does not block transport timers or signaling. Accepted messages remain available
+outgoing fragment sizes. One larger body validated by the configured incoming
+limit may occupy an otherwise empty FIFO alone. Further messages cannot exceed
+the aggregate budget until application receive consumes that body. Application
+backpressure does not block transport timers or signaling. Accepted messages remain available
 after transport retirement, followed by EOF on local cancellation or authenticated
 peer close, or one explicit error on transport failure or receive overflow. Dropping
 the reliable receiver closes the session when the next reliable message arrives;

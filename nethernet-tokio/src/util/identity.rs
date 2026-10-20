@@ -55,6 +55,7 @@ async fn write(path: &Path, pem: &str) -> Result<()> {
         .await?;
 
     tokio::io::AsyncWriteExt::write_all(&mut file, pem.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
     Ok(())
 }
 
@@ -74,6 +75,7 @@ async fn write(path: &Path, pem: &str) -> Result<()> {
         .await?;
 
     tokio::io::AsyncWriteExt::write_all(&mut file, pem.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
     Ok(())
 }
 
@@ -108,3 +110,6 @@ mod tests {
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod persistence_tests;

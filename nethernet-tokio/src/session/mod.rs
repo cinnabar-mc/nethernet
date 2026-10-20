@@ -430,7 +430,7 @@ impl Session<Connecting> {
                 );
                 let usage = connection.pending_output_usage();
                 if usage.entries > PACKET_CHANNEL_CAPACITY
-                    || usage.bytes > receive::MAX_ACCEPTED_BYTES
+                    || usage.wire_bytes > receive::MAX_ACCEPTED_BYTES
                 {
                     break Terminal::Capacity;
                 }

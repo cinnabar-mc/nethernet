@@ -20,8 +20,6 @@ const EXPECTED_DIVERGENCES: &[&str] = &[
     "pong-spectator-game-type",
     // Better than Go: pong protocol and version are kept; Go leaves them empty.
     "pong-protocol-version",
-    // NEW: Go does not see a Rust session close until its own ICE times out.
-    "rust-close-unseen",
 ];
 
 fn check(id: &str, diverges: bool) {

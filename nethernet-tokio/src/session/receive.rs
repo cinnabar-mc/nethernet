@@ -53,19 +53,23 @@ pub(super) fn channel(channel: Channel) -> (Producer, Receiver) {
 }
 
 impl Producer {
-    /// Admits an entire message synchronously; transport work never waits for application consumption.
+    /// Admits a validated body within the aggregate budget, or alone when larger.
+    /// Transport work never waits for application consumption.
     pub fn push(&self, packet: Bytes) -> std::result::Result<(), AdmissionError> {
         let wake = {
             let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
             if !state.receiver_alive || state.terminal.is_some() {
                 return Err(AdmissionError::Closed);
             }
+            let Some(bytes) = state.bytes.checked_add(packet.len()) else {
+                return Err(AdmissionError::Full);
+            };
             if state.packets.len() >= state.capacity
-                || packet.len() > MAX_ACCEPTED_BYTES.saturating_sub(state.bytes)
+                || (!state.packets.is_empty() && bytes > MAX_ACCEPTED_BYTES)
             {
                 return Err(AdmissionError::Full);
             }
-            state.bytes += packet.len();
+            state.bytes = bytes;
             state.packets.push_back(packet);
             state.waker.take()
         };

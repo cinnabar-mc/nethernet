@@ -58,6 +58,8 @@ pub struct OutputUsage {
     pub entries: usize,
     /// Total queued message and wire body lengths; sums saturate on overflow.
     pub bytes: usize,
+    /// Queued UDP and stream body lengths, excluding accepted application messages; saturates on overflow.
+    pub wire_bytes: usize,
 }
 
 pub enum SessionOutput {
@@ -295,19 +297,22 @@ impl<S: Phase> Session<S> {
 
     /// Derives retained output usage without moving, polling or copying its original payloads.
     pub fn pending_output_usage(&self) -> OutputUsage {
-        let bytes = self.output.iter().fold(0usize, |total, output| {
+        let mut usage = OutputUsage {
+            entries: self.output.len(),
+            ..OutputUsage::default()
+        };
+        for output in &self.output {
             let bytes = match output {
-                SessionOutput::Send(bytes, _)
-                | SessionOutput::SendStream(bytes, _)
-                | SessionOutput::Message(_, bytes) => bytes.len(),
+                SessionOutput::Send(bytes, _) | SessionOutput::SendStream(bytes, _) => {
+                    usage.wire_bytes = usage.wire_bytes.saturating_add(bytes.len());
+                    bytes.len()
+                }
+                SessionOutput::Message(_, bytes) => bytes.len(),
                 SessionOutput::Event(_) | SessionOutput::Wait(_) => 0,
             };
-            total.saturating_add(bytes)
-        });
-        OutputUsage {
-            entries: self.output.len(),
-            bytes,
+            usage.bytes = usage.bytes.saturating_add(bytes);
         }
+        usage
     }
 
     /// Time allowed from the remote description until `Ready` before `Failed` is emitted; defaults to 10 seconds.

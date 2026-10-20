@@ -702,9 +702,7 @@ impl<S: Phase> Session<S> {
             if let rtc::ice::agent::Event::ConnectionStateChange(state) = event
                 && matches!(
                     state,
-                    IceConnectionState::Failed
-                        | IceConnectionState::Disconnected
-                        | IceConnectionState::Closed
+                    IceConnectionState::Failed | IceConnectionState::Closed
                 )
             {
                 self.fail(now)?;

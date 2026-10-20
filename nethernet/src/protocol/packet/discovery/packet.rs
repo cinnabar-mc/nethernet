@@ -153,4 +153,48 @@ mod tests {
         assert_eq!(header.packet_id, decoded.packet_id);
         assert_eq!(header.sender_id, decoded.sender_id);
     }
+
+    /// Message data includes the complete final field when its declared length understates it.
+    #[test]
+    fn message_with_understated_length_keeps_the_complete_data() {
+        let sender = 31;
+        let recipient = 47;
+        let data = "complete signaling text beyond the declared range";
+        let original = encode(
+            &Packets::Message(MessagePacket::new(recipient, data.to_string())),
+            sender,
+        )
+        .unwrap();
+        let (Packets::Message(matched), actual_sender) = decode(&original).unwrap() else {
+            panic!("the original Message did not round-trip");
+        };
+        assert_eq!(actual_sender, sender);
+        assert_eq!(matched.recipient_id, recipient);
+        assert_eq!(matched.data, data);
+
+        let mut payload = original[compute_checksum(&[]).len()..].to_vec();
+        decrypt(&mut payload).unwrap();
+        {
+            let mut cursor = Cursor::new(payload.as_mut_slice());
+            cursor.read_u16::<LittleEndian>().unwrap();
+            Header::deserialize(&mut cursor).unwrap();
+            assert_eq!(cursor.read_u64::<LittleEndian>().unwrap(), recipient);
+            cursor
+                .write_u32::<LittleEndian>(u32::try_from(data.len() / 2).unwrap())
+                .unwrap();
+        }
+        let checksum = compute_checksum(&payload);
+        encrypt(&mut payload).unwrap();
+        let mut datagram = checksum.to_vec();
+        datagram.extend_from_slice(&payload);
+
+        let (Packets::Message(decoded), actual_sender) =
+            decode(&datagram).expect("the understated length discarded valid Message data")
+        else {
+            panic!("the complete Message decoded as another packet");
+        };
+        assert_eq!(actual_sender, sender);
+        assert_eq!(decoded.recipient_id, recipient);
+        assert_eq!(decoded.data, data);
+    }
 }

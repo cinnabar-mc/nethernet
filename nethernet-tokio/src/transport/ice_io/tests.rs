@@ -473,3 +473,26 @@ async fn tcp_and_verified_tls_turn_keep_original_sockets_through_actor_and_refre
         }
     }
 }
+
+/// The real kernel buffer is enlarged for bursts while caller-selected larger settings survive.
+#[tokio::test]
+async fn udp_receive_buffer_grows_for_bursts_and_preserves_larger_settings() {
+    let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let socket = socket2::SockRef::from(udp.as_ref());
+    socket.set_recv_buffer_size(2 * 1024 * 1024).unwrap();
+    let expected = socket.recv_buffer_size().unwrap();
+    socket.set_recv_buffer_size(16 * 1024).unwrap();
+    let small = socket.recv_buffer_size().unwrap();
+    assert!(
+        small < expected,
+        "the kernel must allow a buffer above the small fixture"
+    );
+    let io = IceIo::from(Arc::clone(&udp));
+    assert_eq!(socket.recv_buffer_size().unwrap(), expected);
+    drop(io);
+    socket.set_recv_buffer_size(4 * 1024 * 1024).unwrap();
+    let larger = socket.recv_buffer_size().unwrap();
+    let io = IceIo::from(Arc::clone(&udp));
+    assert_eq!(socket.recv_buffer_size().unwrap(), larger);
+    drop(io);
+}

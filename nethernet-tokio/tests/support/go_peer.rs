@@ -78,7 +78,14 @@ impl GoPeer {
 
     /// Waits for the next event named `name`, skipping others.
     pub async fn event(&mut self, name: &str) -> Value {
-        tokio::time::timeout(STEP, async {
+        self.event_within(name, STEP)
+            .await
+            .unwrap_or_else(|| panic!("go-peer never reported {name}"))
+    }
+
+    /// Like `event`, but None when `name` does not arrive within `wait`.
+    pub async fn event_within(&mut self, name: &str, wait: Duration) -> Option<Value> {
+        tokio::time::timeout(wait, async {
             loop {
                 let event = self.events.recv().await.expect("go-peer exited");
                 if event["event"] == name {
@@ -87,7 +94,7 @@ impl GoPeer {
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("go-peer never reported {name}"))
+        .ok()
     }
 }
 

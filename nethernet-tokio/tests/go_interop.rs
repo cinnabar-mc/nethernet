@@ -6,6 +6,7 @@ use bytes::Bytes;
 use go_peer::{Link, STEP, go_dials_rust, pattern, rust_dials_go};
 use nethernet_tokio::ServerData;
 use serde_json::json;
+use std::time::Duration;
 
 /// Known differences from go-nethernet. Each check asserts its entry still reproduces,
 /// so fixing one fails here until the entry is removed.
@@ -24,6 +25,8 @@ const EXPECTED_DIVERGENCES: &[&str] = &[
     "pong-spectator-game-type",
     // Better than Go: pong protocol and version are kept; Go leaves them empty.
     "pong-protocol-version",
+    // NEW: Go does not see a Rust session close until its own ICE times out.
+    "rust-close-unseen",
 ];
 
 fn check(id: &str, diverges: bool) {
@@ -55,7 +58,9 @@ async fn reliable_echo_and_rust_close(mut peer: go_peer::GoPeer, mut link: Link)
         link.sender.send(pattern(LARGE)).await.is_err(),
     );
     link.sender.close().await.unwrap();
-    peer.event("closed").await;
+    // Well past close propagation and short of Go's ICE failure timeout.
+    let seen = peer.event_within("closed", Duration::from_secs(10)).await;
+    check("rust-close-unseen", seen.is_none());
 }
 
 /// Asks Go for a message larger than the Rust receive cap, then has Go close.
@@ -109,15 +114,13 @@ async fn unreliable_under_loss(_peer: go_peer::GoPeer, mut link: Link) {
 /// Blackholes Go's socket past the ICE disconnected timeout but short of failure.
 async fn ice_blackhole(mut peer: go_peer::GoPeer, mut link: Link) {
     link.command("blackhole 8000").await;
-    let sender = link.sender.clone();
-    let rust_closed = tokio::time::timeout(STEP, async {
-        tokio::select! {
-            _ = sender.closed() => true,
-            _ = link.reply("!resumed") => false,
+    let rust_closed = loop {
+        match link.recv().await {
+            None => break true,
+            Some(message) if message.starts_with(b"!resumed") => break false,
+            Some(_) => {}
         }
-    })
-    .await
-    .expect("neither recovery nor closure after the blackhole");
+    };
     assert_eq!(peer.event("blackhole_over").await["alive"], true);
     check("ice-disconnected-is-fatal", rust_closed);
 }

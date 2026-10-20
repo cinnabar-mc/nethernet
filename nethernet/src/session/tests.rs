@@ -5,6 +5,7 @@ use std::time::Duration;
 
 mod framing_edges;
 mod negotiated_size;
+mod ready_retirement;
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)

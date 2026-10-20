@@ -104,11 +104,19 @@ fn a_created_identity_waits_for_its_original_file_write_before_returning() {
         let (waited_for_write, completed) = loop {
             let (result, blocked) = poll_fn(|cx| {
                 let outer = cx.waker().clone();
-                let previous = {
+                let (previous, blocker_installed) = {
                     let mut state = gate.state.lock().unwrap();
-                    std::mem::replace(&mut state.outer, outer)
+                    (
+                        std::mem::replace(&mut state.outer, outer),
+                        state.blocked.is_some(),
+                    )
                 };
                 drop(previous);
+                // The blocker task's join can wake us before the filesystem callback.
+                // Only that callback's installed successor permits advancing the writer.
+                if !blocker_installed {
+                    return Poll::Pending;
+                }
                 let result = saving.as_mut().poll(&mut Context::from_waker(&waker));
                 let blocked = gate.state.lock().unwrap().blocked.take();
                 if blocked.is_some() || result.is_ready() {

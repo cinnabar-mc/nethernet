@@ -1,5 +1,6 @@
 use crate::error::{ProtocolError, Result};
 use crate::protocol::codec::{NetherCodec, read_bytes_u32, write_bytes_u32};
+use crate::protocol::constants::MAX_BYTES;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
@@ -25,7 +26,14 @@ impl NetherCodec for MessagePacket {
 
     fn deserialize<R: Read>(reader: &mut R) -> Result<Self> {
         let recipient_id = reader.read_u64::<LittleEndian>()?;
-        let data_bytes = read_bytes_u32(reader)?;
+        let mut data_bytes = read_bytes_u32(reader)?;
+        // The signal occupies the final field even when the peer understates its length.
+        reader
+            .take((MAX_BYTES + 1 - data_bytes.len()) as u64)
+            .read_to_end(&mut data_bytes)?;
+        if data_bytes.len() > MAX_BYTES {
+            return Err(ProtocolError::MessageSizeExceeded(data_bytes.len()));
+        }
         let data = String::from_utf8(data_bytes)
             .map_err(|e| ProtocolError::Other(format!("invalid UTF-8: {}", e)))?;
         Ok(Self { recipient_id, data })

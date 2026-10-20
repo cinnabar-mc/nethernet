@@ -51,6 +51,7 @@ impl MessageSegment {
 pub struct Message {
     expected_segments: u8,
     data: BytesMut,
+    failed: bool,
 }
 
 impl Message {
@@ -58,24 +59,28 @@ impl Message {
         Self {
             expected_segments: 0,
             data: BytesMut::new(),
+            failed: false,
         }
     }
 
-    /// Returns the message on its final segment; an out-of-sequence count clears the buffer and errors.
+    /// Returns the message on its final segment; a framing rejection permanently seals reassembly.
     pub fn add_segment(&mut self, segment: MessageSegment) -> Result<Option<Bytes>> {
+        if self.failed {
+            return Err(ProtocolError::MessageParse("reassembly has failed".into()));
+        }
         if self.expected_segments == 0 && segment.remaining_segments > 0 {
-            self.expected_segments =
-                segment.remaining_segments.checked_add(1).ok_or_else(|| {
-                    ProtocolError::MessageParse("segment count out of range".to_string())
-                })?;
+            let Some(expected) = segment.remaining_segments.checked_add(1) else {
+                return self.reject(ProtocolError::MessageParse(
+                    "segment count out of range".to_string(),
+                ));
+            };
+            self.expected_segments = expected;
         }
 
         if self.expected_segments > 0 {
             let expected_remaining = self.expected_segments - 1;
             if expected_remaining != segment.remaining_segments {
-                self.data.clear();
-                self.expected_segments = 0;
-                return Err(ProtocolError::MessageParse(format!(
+                return self.reject(ProtocolError::MessageParse(format!(
                     "Invalid segment sequence: expected {}, got {}",
                     expected_remaining, segment.remaining_segments
                 )));
@@ -85,9 +90,7 @@ impl Message {
 
         let size = self.data.len() + segment.data.len();
         if size > MAX_REASSEMBLED_SIZE {
-            self.data = BytesMut::new();
-            self.expected_segments = 0;
-            return Err(ProtocolError::MessageSizeExceeded(size));
+            return self.reject(ProtocolError::MessageSizeExceeded(size));
         }
 
         self.data.put(segment.data);
@@ -99,6 +102,14 @@ impl Message {
         } else {
             Ok(None)
         }
+    }
+
+    /// Releases the incomplete message and refuses every later segment on this owner.
+    fn reject(&mut self, error: ProtocolError) -> Result<Option<Bytes>> {
+        self.failed = true;
+        self.expected_segments = 0;
+        self.data = BytesMut::new();
+        Err(error)
     }
 
     /// Fails with `MessageSizeExceeded` beyond 255 segments.
@@ -246,5 +257,24 @@ mod tests {
             Some(Err(ProtocolError::MessageSizeExceeded(_)))
         ));
         assert!(message.data.is_empty());
+    }
+
+    /// A rejected logical message cannot reopen on a later valid-looking suffix.
+    #[test]
+    fn framing_rejection_permanently_seals_reassembly() {
+        let mut message = Message::new();
+        assert!(
+            message
+                .add_segment(MessageSegment::new(2, Bytes::from_static(b"prefix")))
+                .unwrap()
+                .is_none()
+        );
+        let rejected = message.add_segment(MessageSegment::new(0, Bytes::from_static(b"gap")));
+        assert!(rejected.is_err());
+        let successor = message.add_segment(MessageSegment::new(0, Bytes::from_static(b"tail")));
+        assert!(
+            successor.is_err(),
+            "a framing rejection reopened and delivered its suffix"
+        );
     }
 }

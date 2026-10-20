@@ -3,8 +3,11 @@
 mod go_peer;
 
 use bytes::Bytes;
-use go_peer::{Link, STEP, go_dials_rust, pattern, rust_dials_go};
-use nethernet_tokio::ServerData;
+use go_peer::{
+    Link, STEP, go_dials_rust, go_dials_rust_with_incoming_limit, pattern, rust_dials_go,
+    rust_dials_go_with_incoming_limit,
+};
+use nethernet_tokio::{NetherError, ServerData};
 use serde_json::json;
 use std::time::Duration;
 
@@ -13,8 +16,6 @@ use std::time::Duration;
 const EXPECTED_DIVERGENCES: &[&str] = &[
     // Reliable messages above 2.56 MB never arrive whole (go-nethernet 535497e).
     "reliable-receive-cap",
-    // The unreliable channel retransmits lost messages although it announces zero retransmits.
-    "unreliable-channel-retransmits",
     // A "Spectator" pong game mode becomes 6; Go reads it as survival.
     "pong-spectator-game-type",
     // Better than Go: pong protocol and version are kept; Go leaves them empty.
@@ -38,26 +39,69 @@ fn check(id: &str, diverges: bool) {
 /// Reliable body used by the matched send-admission and receive-capacity probes.
 const LARGE: usize = 20_000_000;
 
+/// An explicit incoming-body policy above the default and below the unchanged final receive budget.
+const CONFIGURED_INCOMING: usize = 3 * 1024 * 1024;
+
+/// Local send admission does not authorize the default receiver to retain the echoed body.
+async fn default_large_echo_is_refused(peer: go_peer::GoPeer, mut link: Link) {
+    check(
+        "reliable-send-cap",
+        link.sender.send(pattern(LARGE)).await.is_err(),
+    );
+    let received = link.recv_result().await;
+    link.sender.close().await.unwrap();
+    drop(link);
+    drop(peer);
+    match received {
+        Err(NetherError::ConnectionClosed) => {}
+        Err(NetherError::ReceiveCapacity) => {
+            panic!("default large echo reached final receive capacity")
+        }
+        Err(NetherError::Io(error)) => {
+            panic!("default large echo returned IO kind {:?}", error.kind())
+        }
+        Err(_) => panic!("default large echo returned another transport error category"),
+        Ok(None) => panic!("default large echo returned orderly EOF instead of its refusal"),
+        Ok(Some(body)) => panic!("default receiver admitted an echo of {} bytes", body.len()),
+    }
+}
+
 /// Echoes sizes around segment boundaries, then closes from the Rust side.
 async fn reliable_echo_and_rust_close(mut peer: go_peer::GoPeer, mut link: Link) {
     for size in [
-        1, 1000, 9999, 10000, 10001, 262143, 262144, 1_000_000, 2_500_000,
+        1,
+        1000,
+        9999,
+        10000,
+        10001,
+        262143,
+        262144,
+        1_000_000,
+        2_500_000,
+        CONFIGURED_INCOMING,
     ] {
         let data = pattern(size);
         link.sender.send(data.clone()).await.unwrap();
-        assert_eq!(link.recv().await, Some(data), "echo of {size} bytes");
+        let echoed = match link.recv_result().await {
+            Ok(Some(body)) => body,
+            Ok(None) => panic!("echo of {size} bytes returned orderly EOF"),
+            Err(NetherError::ConnectionClosed) => {
+                panic!("echo of {size} bytes returned ConnectionClosed")
+            }
+            Err(NetherError::ReceiveCapacity) => {
+                panic!("echo of {size} bytes returned ReceiveCapacity")
+            }
+            Err(NetherError::Io(error)) => {
+                panic!("echo of {size} bytes returned IO kind {:?}", error.kind())
+            }
+            Err(_) => panic!("echo of {size} bytes returned another transport error category"),
+        };
+        assert!(
+            echoed == data,
+            "echo of {size} bytes differed; received {} bytes",
+            echoed.len()
+        );
     }
-    let probe = pattern(LARGE);
-    check(
-        "reliable-send-cap",
-        link.sender.send(probe.clone()).await.is_err(),
-    );
-    let echoed = link.recv().await;
-    assert!(
-        echoed.as_ref() == Some(&probe),
-        "admitted reliable capacity probe was not echoed intact; received bytes: {:?}",
-        echoed.as_ref().map(Bytes::len)
-    );
     link.sender.close().await.unwrap();
     // Well past close propagation and short of Go's ICE failure timeout.
     let seen = peer.event_within("closed", Duration::from_secs(10)).await;
@@ -119,7 +163,20 @@ async fn unreliable_under_loss(_peer: go_peer::GoPeer, mut link: Link) {
     link.reply("!resumed").await;
     link.command(&format!("count-unreliable {SENT} 5000")).await;
     let counted: usize = link.reply("!counted").await[9..].parse().unwrap();
-    check("unreliable-channel-retransmits", counted == SENT);
+    eprintln!("unreliable probes received after the original loss window: {counted}/{SENT}");
+    let healthy = Bytes::from_static(b"healthy after loss");
+    link.sender.send_unreliable(healthy.clone()).await.unwrap();
+    let echoed = tokio::time::timeout(STEP, link.unreliable.recv())
+        .await
+        .expect("unreliable recovery echo stalled")
+        .expect("unreliable recovery echo failed");
+    assert_eq!(echoed, Some(healthy));
+    // Local admission does not prove every first transmission preceded the drop cutoff.
+    // The caller-driven core test separately checks exact zero retransmission.
+    assert!(
+        counted < SENT,
+        "all {SENT} unreliable probes arrived after the original loss window: {counted}"
+    );
 }
 
 /// Blackholes Go's socket past the ICE disconnected timeout but short of failure.
@@ -150,12 +207,23 @@ async fn rust_dials_go_reliable() {
     let Some((peer, link, _)) = rust_dials_go(&[]).await else {
         return;
     };
+    default_large_echo_is_refused(peer, link).await;
+    let Some((peer, link, _)) = rust_dials_go_with_incoming_limit(&[], CONFIGURED_INCOMING).await
+    else {
+        return;
+    };
     reliable_echo_and_rust_close(peer, link).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn go_dials_rust_reliable() {
     let Some((peer, link, _)) = go_dials_rust(rust_server_data()).await else {
+        return;
+    };
+    default_large_echo_is_refused(peer, link).await;
+    let Some((peer, link, _)) =
+        go_dials_rust_with_incoming_limit(rust_server_data(), CONFIGURED_INCOMING).await
+    else {
         return;
     };
     reliable_echo_and_rust_close(peer, link).await;

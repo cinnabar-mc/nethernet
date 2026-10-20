@@ -136,13 +136,16 @@ impl Link {
             .unwrap();
     }
 
-    /// The next reliable message, or None once the session has closed.
-    pub async fn recv(&mut self) -> Option<Bytes> {
+    /// Preserves the original receiver's typed terminal under the existing step deadline.
+    pub async fn recv_result(&mut self) -> nethernet_tokio::Result<Option<Bytes>> {
         tokio::time::timeout(STEP, self.reliable.recv())
             .await
             .expect("reliable receive stalled")
-            .ok()
-            .flatten()
+    }
+
+    /// The next reliable message, or None once the session has closed.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.recv_result().await.ok().flatten()
     }
 
     /// Skips reliable messages until one starts with `prefix`.
@@ -156,8 +159,9 @@ impl Link {
     }
 }
 
-fn client_config() -> ConnectionConfig {
+fn client_config(maximum: usize) -> ConnectionConfig {
     ConnectionConfig {
+        max_incoming_message_bytes: maximum,
         client_ice: Some(ClientIceConfig {
             turn_streams: Vec::new(),
             turn_tls: None,
@@ -170,6 +174,18 @@ fn client_config() -> ConnectionConfig {
 
 /// Rust dials a listening Go peer; returns the peer, the link and what discovery reported.
 pub async fn rust_dials_go(extra: &[&str]) -> Option<(GoPeer, Link, ServerData)> {
+    rust_dials_go_with_incoming_limit(
+        extra,
+        ConnectionConfig::default().max_incoming_message_bytes,
+    )
+    .await
+}
+
+/// Uses the original LAN client with only its complete incoming-body policy selected by the caller.
+pub async fn rust_dials_go_with_incoming_limit(
+    extra: &[&str],
+    maximum: usize,
+) -> Option<(GoPeer, Link, ServerData)> {
     const GO_ID: u64 = 7001;
     let mut args = vec!["--role", "listen", "--network-id", "7001"];
     args.extend_from_slice(extra);
@@ -194,7 +210,7 @@ pub async fn rust_dials_go(extra: &[&str]) -> Option<(GoPeer, Link, ServerData)>
     let discovered = signaling.discover().await.remove(&GO_ID).unwrap();
     let client = tokio::time::timeout(
         STEP,
-        NetherClient::connect_with(signaling, GO_ID.to_string(), client_config()),
+        NetherClient::connect_with(signaling, GO_ID.to_string(), client_config(maximum)),
     )
     .await
     .expect("Rust dial stalled")
@@ -205,6 +221,15 @@ pub async fn rust_dials_go(extra: &[&str]) -> Option<(GoPeer, Link, ServerData)>
 
 /// A Go peer dials a Rust server advertising `data`; returns what Go discovered as JSON.
 pub async fn go_dials_rust(data: ServerData) -> Option<(GoPeer, Link, Value)> {
+    go_dials_rust_with_incoming_limit(data, ConnectionConfig::default().max_incoming_message_bytes)
+        .await
+}
+
+/// Uses the original LAN server with only its complete incoming-body policy selected by the caller.
+pub async fn go_dials_rust_with_incoming_limit(
+    data: ServerData,
+    maximum: usize,
+) -> Option<(GoPeer, Link, Value)> {
     const RUST_ID: u64 = 7003;
     // A probed port can be taken by a parallel test before it is rebound, so retry.
     let (port, signaling) = 'bind: {
@@ -228,6 +253,7 @@ pub async fn go_dials_rust(data: ServerData) -> Option<(GoPeer, Link, Value)> {
     let mut server = NetherServer::bind_with(
         signaling,
         ConnectionConfig {
+            max_incoming_message_bytes: maximum,
             server_ice: Some(ServerIceConfig {
                 turn_streams: Vec::new(),
                 turn_tls: None,

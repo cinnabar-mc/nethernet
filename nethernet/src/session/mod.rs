@@ -43,7 +43,7 @@ pub enum Channel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEvent {
-    /// Both data channels are open.
+    /// Both data channels completed their DCEP handshakes.
     Ready,
     /// A transport failed or establishment expired; emitted once.
     Failed,
@@ -98,6 +98,8 @@ struct RemoteInfo {
 struct Channels {
     reliable_stream_id: Option<StreamId>,
     unreliable_stream_id: Option<StreamId>,
+    reliable_complete: bool,
+    unreliable_complete: bool,
     reassembly: Framing,
     ready_segment_payload: Option<usize>,
     terminal_emitted: bool,
@@ -115,6 +117,14 @@ impl Channels {
         match channel {
             Channel::Reliable => self.reliable_stream_id = Some(stream_id),
             Channel::Unreliable => self.unreliable_stream_id = Some(stream_id),
+        }
+    }
+
+    /// Records the peer's ACK, or the accepted OPEN followed by a successful local ACK write.
+    fn mark_complete(&mut self, channel: Channel) {
+        match channel {
+            Channel::Reliable => self.reliable_complete = true,
+            Channel::Unreliable => self.unreliable_complete = true,
         }
     }
 }
@@ -735,6 +745,8 @@ impl<S: Phase> Session<S> {
 
         if self.channels.reliable_stream_id.is_some()
             && self.channels.unreliable_stream_id.is_some()
+            && self.channels.reliable_complete
+            && self.channels.unreliable_complete
             && self.channels.ready_segment_payload.is_none()
             && !self.channels.terminal_emitted
             && let Some(maximum) = self.segment_payload_size()
@@ -926,6 +938,7 @@ fn drain_dcep_and_data(
                     .write_with_ppi(now, &ack, dcep::PPI_DCEP)
                     .map_err(|e| ProtocolError::Other(format!("{e}")))?;
                 channels.set_open(channel, stream_id);
+                channels.mark_complete(channel);
             }
         }
     }
@@ -944,6 +957,9 @@ fn drain_dcep_and_data(
             };
 
             if is_dcep {
+                if matches!(dcep::decode(&data), Ok(DcepMessage::DataChannelAck(_))) {
+                    channels.mark_complete(channel);
+                }
                 continue;
             }
 

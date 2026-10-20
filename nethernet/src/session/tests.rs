@@ -4,6 +4,8 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 mod framing_edges;
+mod negotiated_size;
+mod ready_retirement;
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
@@ -149,10 +151,19 @@ pub(super) fn connected_pair() -> (Session<Established>, Session<Established>, I
 
 /// Retains each actual Ready output while the same pair completes its wire handshake.
 fn connected_pair_with_pending_ready() -> (Session<Established>, Session<Established>, Instant) {
+    connected_pair_with_sctp_limit(LOCAL_SCTP_MAX_MESSAGE_SIZE)
+}
+
+/// Negotiates the supplied real SCTP limit through the original encoded descriptions.
+fn connected_pair_with_sctp_limit(
+    maximum: u32,
+) -> (Session<Established>, Session<Established>, Instant) {
     let mut now = Instant::now();
 
-    let (mut offerer, offer) = Session::new(addr(40100), true, 1, now).unwrap();
-    let (mut answerer, answer) = Session::new(addr(40101), false, 2, now).unwrap();
+    let (mut offerer, mut offer) = Session::new(addr(40100), true, 1, now).unwrap();
+    let (mut answerer, mut answer) = Session::new(addr(40101), false, 2, now).unwrap();
+    offer.sctp_max_message_size = maximum;
+    answer.sctp_max_message_size = maximum;
 
     let offer_sdp = offer.encode_full(&[offerer.local_candidate().clone()]);
     let answer_sdp = answer.encode_full(&[answerer.local_candidate().clone()]);

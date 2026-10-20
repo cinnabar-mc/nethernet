@@ -139,6 +139,14 @@ impl DrivenConnection {
         }
     }
 
+    /// Reads immutable facts from the same actual readiness, independently of later retirement.
+    pub fn max_message_size(&self, channel: Channel) -> Option<usize> {
+        match self.state.as_ref().expect("driver retains its core") {
+            ActiveConnection::Connecting(_) => None,
+            ActiveConnection::Established(core) => core.max_message_size(channel),
+        }
+    }
+
     /// Reads the original core FIFO without bypassing the actor's ownership.
     pub fn pending_output_usage(&self) -> nethernet::session::OutputUsage {
         match self.state.as_ref().expect("driver retains its core") {

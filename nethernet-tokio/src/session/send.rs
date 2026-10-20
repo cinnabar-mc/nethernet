@@ -1,6 +1,6 @@
 //! Owned admission to the existing bounded session command queue.
 
-use super::{Channel, Command, SessionSender, TaskGuard, transport_now};
+use super::{Channel, Command, Ready, SessionSender, TaskGuard, transport_now};
 use crate::error::{NetherError, Result};
 use bytes::Bytes;
 use futures::future::pending;
@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 #[must_use = "commit this reservation once or drop it to release capacity"]
 pub struct SendPermit {
     permit: mpsc::OwnedPermit<Command>,
+    ready: Ready,
     close: CancellationToken,
     deadline: Option<Instant>,
     guard: Arc<TaskGuard>,
@@ -63,6 +64,7 @@ impl SessionSender {
     /// }
     /// ```
     pub async fn reserve_send(&self, deadline: Option<Instant>) -> Result<SendPermit> {
+        let ready = self.ready.ok_or(NetherError::ConnectionClosed)?;
         let expired = async {
             match deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
@@ -80,6 +82,7 @@ impl SessionSender {
         check_open(&self.close_token, deadline)?;
         Ok(SendPermit {
             permit,
+            ready,
             close: self.close_token.clone(),
             deadline,
             guard: Arc::clone(&self._guard),
@@ -94,7 +97,9 @@ impl SessionSender {
         deadline: Option<Instant>,
     ) -> Result<()> {
         check_deadline(deadline)?;
-        check_size(channel, data.len())?;
+        self.ready
+            .ok_or(NetherError::ConnectionClosed)?
+            .check_size(channel, data.len())?;
         self.reserve_send(deadline)
             .await?
             .commit(channel, data)?
@@ -110,7 +115,7 @@ impl SendPermit {
     /// Commands retain their original commit order, not reservation order.
     pub fn commit(self, channel: Channel, data: Bytes) -> Result<SendReceipt> {
         check_open(&self.close, self.deadline)?;
-        check_size(channel, data.len())?;
+        self.ready.check_size(channel, data.len())?;
         let (reply, result) = oneshot::channel();
         drop(
             self.permit
@@ -154,11 +159,16 @@ fn check_open(close: &CancellationToken, deadline: Option<Instant>) -> Result<()
     check_deadline(deadline)
 }
 
-/// Uses the original per-channel limits for both ordinary sends and reserved commits.
-fn check_size(channel: Channel, size: usize) -> Result<()> {
-    let maximum = channel.max_message_size();
-    if size > maximum {
-        return Err(nethernet::error::ProtocolError::MessageSizeExceeded(size).into());
+impl Ready {
+    /// Checks the original installed association facts retained by this actual readiness token.
+    fn check_size(self, channel: Channel, size: usize) -> Result<()> {
+        let maximum = match channel {
+            Channel::Reliable => self.reliable_maximum,
+            Channel::Unreliable => self.unreliable_maximum,
+        };
+        if size > maximum {
+            return Err(nethernet::error::ProtocolError::MessageSizeExceeded(size).into());
+        }
+        Ok(())
     }
-    Ok(())
 }

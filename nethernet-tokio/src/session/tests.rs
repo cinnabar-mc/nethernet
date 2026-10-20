@@ -2,6 +2,8 @@ use super::*;
 use nethernet::connection::IceMode;
 use nethernet::session::Session as SansSession;
 
+mod negotiated_size;
+
 /// Establishes actual UDP/ICE/DTLS/SCTP channels through the concrete session driver.
 async fn connected_pair() -> (
     (Session, SessionReceiver),
@@ -28,15 +30,34 @@ async fn connected_pair_with_server_signaling(
     (Session, SessionReceiver),
     (Session, SessionReceiver, SessionReceiver),
 ) {
+    connected_pair_with_sctp_limit(
+        server,
+        signaling,
+        nethernet::protocol::constants::LOCAL_SCTP_MAX_MESSAGE_SIZE,
+    )
+    .await
+}
+
+/// Uses the same original actor/socket handoff with a real caller-selected SDP capability.
+async fn connected_pair_with_sctp_limit(
+    server: Option<Arc<ServerLease>>,
+    signaling: Option<CandidateSignaling>,
+    maximum: u32,
+) -> (
+    (Session, SessionReceiver),
+    (Session, SessionReceiver, SessionReceiver),
+) {
     let sockets = [
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
     ];
     let now = transport_now();
-    let (a, a_description) =
+    let (a, mut a_description) =
         SansSession::new(sockets[0].local_addr().unwrap(), true, 1, now).unwrap();
-    let (b, b_description) =
+    let (b, mut b_description) =
         SansSession::new(sockets[1].local_addr().unwrap(), false, 2, now).unwrap();
+    a_description.sctp_max_message_size = maximum;
+    b_description.sctp_max_message_size = maximum;
     let (mut a, offers) =
         SansConnection::connect(a, a_description, 1, "peer".into(), IceMode::Full);
     let (description, candidates) = SansConnection::parse_offer(&offers[0]).unwrap();

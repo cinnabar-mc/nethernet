@@ -3,12 +3,11 @@ mod dcep;
 mod dtls;
 mod ice;
 mod sctp;
+mod send;
 
 use crate::error::ProtocolError::{self, MessageParse, MessageSizeExceeded};
 use crate::phase::{Connecting, Established, Live, Phase, Retired};
-use crate::protocol::constants::{
-    LOCAL_SCTP_MAX_MESSAGE_SIZE, MAX_MESSAGE_SIZE, SCTP_MAX_MESSAGE_SIZE,
-};
+use crate::protocol::constants::{LOCAL_SCTP_MAX_MESSAGE_SIZE, SCTP_MAX_MESSAGE_SIZE};
 use crate::protocol::message::{Message as Framing, MessageSegment};
 use crate::protocol::webrtc::{Description, DtlsRole, certificate};
 use crate::sans::Sans;
@@ -40,16 +39,6 @@ const DEFAULT_ESTABLISH_DEADLINE: Duration = Duration::from_secs(10);
 pub enum Channel {
     Reliable,
     Unreliable,
-}
-
-impl Channel {
-    /// Maximum logical payload accepted by the original NetherNet segmentation format.
-    pub const fn max_message_size(self) -> usize {
-        match self {
-            Self::Reliable => MAX_MESSAGE_SIZE * u8::MAX as usize,
-            Self::Unreliable => MAX_MESSAGE_SIZE.saturating_sub(1),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +99,7 @@ struct Channels {
     reliable_stream_id: Option<StreamId>,
     unreliable_stream_id: Option<StreamId>,
     reassembly: Framing,
-    ready_emitted: bool,
+    ready_segment_payload: Option<usize>,
     terminal_emitted: bool,
 }
 
@@ -250,7 +239,7 @@ impl Session<Connecting> {
         reason = "returns the original pending allocation without boxing"
     )]
     pub fn try_establish(self) -> Result<Session<Established>, Self> {
-        if self.channels.ready_emitted {
+        if self.channels.ready_segment_payload.is_some() {
             Ok(self.rephase())
         } else {
             Err(self)
@@ -281,7 +270,7 @@ impl<S: Phase> Session<S> {
 
     /// Whether this exact owner produced the protocol's actual readiness condition.
     pub(crate) fn became_ready(&self) -> bool {
-        self.channels.ready_emitted
+        self.channels.ready_segment_payload.is_some()
     }
 
     /// Drains the original wire, accepted-message and terminal FIFO.
@@ -638,7 +627,7 @@ impl<S: Phase> Session<S> {
     }
 
     fn establish_deadline(&self) -> Option<Instant> {
-        if self.channels.ready_emitted || self.channels.terminal_emitted {
+        if self.channels.ready_segment_payload.is_some() || self.channels.terminal_emitted {
             return None;
         }
         self.establish_started.map(|at| at + self.establish_within)
@@ -654,50 +643,6 @@ impl<S: Phase> Session<S> {
         .into_iter()
         .flatten()
         .min()
-    }
-
-    fn send_message(
-        &mut self,
-        channel: Channel,
-        data: bytes::Bytes,
-        now: Instant,
-    ) -> Result<(), ProtocolError> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        let stream_id = self
-            .channels
-            .stream_id(channel)
-            .ok_or_else(|| ProtocolError::Other("channel not open yet".to_string()))?;
-
-        let sctp = self
-            .sctp
-            .as_mut()
-            .ok_or_else(|| ProtocolError::Other("transports not started".to_string()))?;
-        let assoc = sctp
-            .association_mut()
-            .ok_or_else(|| ProtocolError::Other("association not established".to_string()))?;
-        let mut stream = assoc
-            .stream(stream_id)
-            .map_err(|e| ProtocolError::Other(format!("{e}")))?;
-
-        match channel {
-            Channel::Reliable => {
-                for segment in Framing::split_into_segments(data)? {
-                    stream
-                        .write_with_ppi(now, &segment.encode(), PayloadProtocolIdentifier::Binary)
-                        .map_err(|e| ProtocolError::Other(format!("{e}")))?;
-                }
-            }
-            Channel::Unreliable => {
-                let encoded = Framing::encode_unreliable(data)?;
-                stream
-                    .write_with_ppi(now, &encoded, PayloadProtocolIdentifier::Binary)
-                    .map_err(|e| ProtocolError::Other(format!("{e}")))?;
-            }
-        }
-
-        Ok(())
     }
 
     fn pump(&mut self, now: Instant) -> Result<(), ProtocolError> {
@@ -759,10 +704,11 @@ impl<S: Phase> Session<S> {
 
         if self.channels.reliable_stream_id.is_some()
             && self.channels.unreliable_stream_id.is_some()
-            && !self.channels.ready_emitted
+            && self.channels.ready_segment_payload.is_none()
             && !self.channels.terminal_emitted
+            && let Some(maximum) = self.segment_payload_size()
         {
-            self.channels.ready_emitted = true;
+            self.channels.ready_segment_payload = Some(maximum);
             self.output
                 .push_back(SessionOutput::Event(SessionEvent::Ready));
         }
@@ -799,23 +745,6 @@ impl<S: Phase> Session<S> {
             teardown?;
         }
         Ok(())
-    }
-}
-
-impl Session<Established> {
-    /// Admits data only on actual readiness; empty payloads are successful no-ops.
-    pub fn send(
-        &mut self,
-        channel: Channel,
-        data: bytes::Bytes,
-        now: Instant,
-    ) -> Result<(), ProtocolError> {
-        self.expire_before_input(now)?;
-        if self.ice.gathering_state() == GatheringState::Closed {
-            return Err(IceError::Closed.into());
-        }
-        self.send_message(channel, data, now)?;
-        self.pump(now)
     }
 }
 

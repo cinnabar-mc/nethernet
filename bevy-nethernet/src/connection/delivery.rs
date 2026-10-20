@@ -10,6 +10,7 @@ struct Entry<K> {
     id: K,
     readiness: Readiness,
     ready: bool,
+    message_maxima: [usize; 2],
     terminal: bool,
     owner_finished: bool,
     notifications: usize,
@@ -84,6 +85,7 @@ impl<K: Clone + Eq> Delivery<K> {
             id,
             readiness: readiness.clone(),
             ready: false,
+            message_maxima: [0; 2],
             terminal: false,
             owner_finished: false,
             notifications: 0,
@@ -100,6 +102,26 @@ impl<K: Clone + Eq> Delivery<K> {
             && self.entries.iter().any(|entry| {
                 entry.id == *id && entry.readiness.matches(readiness) && !entry.terminal
             })
+    }
+
+    /// Returns installed outgoing limits only for this exact live, actually ready allocation.
+    pub(super) fn max_message_size(
+        &self,
+        id: &K,
+        readiness: &Readiness,
+        channel: Channel,
+    ) -> Option<usize> {
+        if !self.contains(id, readiness) {
+            return None;
+        }
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == *id && entry.readiness.matches(readiness) && entry.ready)?;
+        Some(match channel {
+            Channel::Reliable => entry.message_maxima[0],
+            Channel::Unreliable => entry.message_maxima[1],
+        })
     }
 
     /// Internal signaling resolves only the original currently admitted allocation.
@@ -120,7 +142,12 @@ impl<K: Clone + Eq> Delivery<K> {
     }
 
     /// Actual core Ready reserves a single notification; repetition cannot grow the owner.
-    pub(super) fn ready(&mut self, readiness: &Readiness, address: Option<SocketAddr>) {
+    pub(super) fn ready(
+        &mut self,
+        readiness: &Readiness,
+        address: Option<SocketAddr>,
+        message_maxima: [usize; 2],
+    ) {
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -132,6 +159,7 @@ impl<K: Clone + Eq> Delivery<K> {
             return;
         }
         entry.ready = true;
+        entry.message_maxima = message_maxima;
         entry.notifications += 1;
         self.lifecycle.push_back(Lifecycle {
             event: PoolEvent {

@@ -43,6 +43,20 @@ actual data channels opening, returns `Established`. If it is still pending, the
 original owner is returned unchanged. Application `send` exists only on
 `Established`; control inputs cannot bypass that boundary.
 
+`Session<Established>::max_message_size(channel)` and the corresponding
+`Connection` method report the installed outgoing body limit recorded at actual readiness.
+These immutable facts remain available after remote retirement so delayed readiness
+handoff preserves accepted output; they do not promise liveness or authorize a send.
+Reliable bodies use at most 255 fragments; each fragment reserves one byte for
+NetherNet framing. Unreliable bodies fit one fragment. Later SDP alone does not
+change the installed association's limit. The adapters retain these same facts
+from actual readiness and reject oversized sends before queueing or copying.
+Direct framing users pass their segment-body limit explicitly to
+`Message::split_into_segments` and `Message::encode_unreliable`.
+
+Incoming reliable reassembly remains capped at 2,560,000 bytes. Negotiated outgoing
+capacity does not change that receive policy or an adapter's retained-byte budget.
+
 Core `close(self, now)` consumes a live owner and returns `(Retired, teardown_result)`.
 Drain the retired owner's already accepted messages and best-effort deallocation
 output even when teardown reports an error. It cannot accept input, credentials
@@ -422,7 +436,8 @@ outbound `ClientIceConfig` does not configure accepting TURN allocations.
 
 The Tokio driver admits reliable messages into one FIFO shared with the application
 receiver. Its packet budget is twice the default receiver capacity; its byte budget
-is the default capacity times the protocol segment size. Application backpressure
+is `DEFAULT_MAX_RECEIVED_BYTES` (10,240,000 bytes), independently of negotiated
+outgoing fragment sizes. Application backpressure
 does not block transport timers or signaling. Accepted messages remain available
 after transport retirement, followed by EOF on local cancellation or authenticated
 peer close, or one explicit error on transport failure or receive overflow. Dropping

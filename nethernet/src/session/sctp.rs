@@ -17,6 +17,7 @@ pub const SCTP_PORT: u16 = 5000;
 pub struct SctpLayer {
     endpoint: Endpoint,
     remote_addr: SocketAddr,
+    max_message_size: u32,
     association: Option<(AssociationHandle, Association)>,
     pending_transmits: VecDeque<Vec<u8>>,
 }
@@ -33,6 +34,7 @@ impl SctpLayer {
             .with_sctp_port(SCTP_PORT)
             .with_max_message_size(max_message_size);
 
+        let max_message_size = transport.max_message_size();
         let mut endpoint = Endpoint::new(
             local_addr,
             TransportProtocol::UDP,
@@ -52,6 +54,7 @@ impl SctpLayer {
         Ok(Self {
             endpoint,
             remote_addr,
+            max_message_size,
             association,
             pending_transmits: VecDeque::new(),
         })
@@ -76,6 +79,11 @@ impl SctpLayer {
             }
             _ => {}
         }
+    }
+
+    /// Maximum installed in the same immutable config that created the active association.
+    pub fn max_message_size(&self) -> Option<u32> {
+        self.association.as_ref().map(|_| self.max_message_size)
     }
 
     pub fn association_mut(&mut self) -> Option<&mut Association> {

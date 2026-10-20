@@ -11,7 +11,7 @@ fn accepted_prefix_survives_lower_limits_and_precedes_its_single_terminal() {
     let mut delivery = Delivery::new();
     delivery.set_limits(limits);
     let original = delivery.reserve(1).unwrap();
-    delivery.ready(&original, None);
+    delivery.ready(&original, None, [0; 2]);
     assert!(delivery.message(&original, Channel::Reliable, Box::from(&b"ab"[..])));
     assert!(delivery.message(&original, Channel::Reliable, Box::from(&b"c"[..])));
     assert!(delivery.message(&original, Channel::Unreliable, Box::from(&b"d"[..])));
@@ -67,8 +67,8 @@ fn host_byte_overflow_preserves_the_other_entry_and_original_payload_owner() {
     });
     let first = delivery.reserve(1).unwrap();
     let second = delivery.reserve(2).unwrap();
-    delivery.ready(&first, None);
-    delivery.ready(&second, None);
+    delivery.ready(&first, None, [0; 2]);
+    delivery.ready(&second, None, [0; 2]);
     assert!(delivery.message(&first, Channel::Reliable, Box::from(&b"abc"[..])));
     assert!(!delivery.message(&second, Channel::Unreliable, Box::from(&b"xy"[..])));
     delivery.owner_finished(&second);
@@ -110,7 +110,7 @@ fn undrained_generations_hold_capacity_without_giving_stale_tokens_new_authority
             delivery.retire(old);
             assert!(delivery.contains(&1, &current));
         }
-        delivery.ready(&current, None);
+        delivery.ready(&current, None, [0; 2]);
         delivery.owner_finished(&current);
         assert!(delivery.reserve(1).is_none());
         let mut updates = Vec::new();
@@ -140,8 +140,8 @@ fn continuous_payload_promotion_cannot_starve_an_original_terminal() {
     });
     let retired = delivery.reserve(1).unwrap();
     let active = delivery.reserve(2).unwrap();
-    delivery.ready(&retired, None);
-    delivery.ready(&active, None);
+    delivery.ready(&retired, None, [0; 2]);
+    delivery.ready(&active, None, [0; 2]);
     let mut updates = Vec::new();
     delivery.advance(&mut updates, 2);
     for _ in 0..2 {
@@ -197,8 +197,8 @@ fn continuous_reliable_successors_cannot_hide_an_original_unreliable_prefix() {
     });
     let retired = delivery.reserve(1).unwrap();
     let active = delivery.reserve(2).unwrap();
-    delivery.ready(&retired, None);
-    delivery.ready(&active, None);
+    delivery.ready(&retired, None, [0; 2]);
+    delivery.ready(&active, None, [0; 2]);
     let mut updates = Vec::new();
     delivery.advance(&mut updates, 2);
     for _ in 0..2 {

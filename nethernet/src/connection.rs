@@ -386,6 +386,12 @@ pub enum ConnectionInput {
 }
 
 impl Connection<Established> {
+    /// Immutable outgoing limit recorded at actual readiness, including after remote retirement.
+    /// This is informational; sends independently check expiry and the active transport.
+    pub fn max_message_size(&self, channel: Channel) -> Option<usize> {
+        self.session.max_message_size(channel)
+    }
+
     /// Admits a message through this connection's original established session.
     pub fn send(
         &mut self,

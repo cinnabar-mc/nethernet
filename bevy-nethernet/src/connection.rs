@@ -142,6 +142,14 @@ impl ActiveConnection {
         output
     }
 
+    /// Reads the exact core's immutable readiness facts, including after remote retirement.
+    pub(crate) fn max_message_size(&self, channel: Channel) -> Option<usize> {
+        match self {
+            Self::Connecting(_) => None,
+            Self::Established(core) => core.max_message_size(channel),
+        }
+    }
+
     /// Dispatches only to the actual established core; pending state has no send method.
     pub(crate) fn send(
         &mut self,

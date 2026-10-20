@@ -56,7 +56,7 @@ pub struct ServerIceConfig {
 #[derive(Clone)]
 pub struct ConnectionConfig {
     /// Complete incoming application body; independent of negotiated outgoing and final queue limits.
-    /// Defaults to the core's 2,560,000 bytes. Zero refuses nonempty bodies.
+    /// Defaults to the core's 66,846,465 bytes. Zero refuses nonempty bodies.
     pub max_incoming_message_bytes: usize,
 
     /// Deadlines for the stages of negotiation.

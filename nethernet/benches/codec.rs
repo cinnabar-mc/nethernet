@@ -23,10 +23,9 @@ fn pattern(len: usize) -> Bytes {
 }
 
 /// Uses the current advertised SCTP default, excluding the segment-count byte.
-fn wire_segments(data: Bytes) -> Vec<Bytes> {
-    Message::segments(data, LOCAL_SCTP_MAX_MESSAGE_SIZE as usize - size_of::<u8>())
+fn wire_segments(data: &Bytes) -> Vec<Bytes> {
+    Message::encode_segments(data, LOCAL_SCTP_MAX_MESSAGE_SIZE as usize - size_of::<u8>())
         .unwrap()
-        .map(|segment| segment.encode())
         .collect()
 }
 
@@ -36,9 +35,9 @@ fn segment(c: &mut Criterion) {
         let data = pattern(size);
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(BenchmarkId::new("split", size), |b| {
-            b.iter(|| wire_segments(black_box(data.clone())))
+            b.iter(|| wire_segments(black_box(&data)))
         });
-        let wire = wire_segments(data);
+        let wire = wire_segments(&data);
         group.bench_function(BenchmarkId::new("reassemble", size), |b| {
             b.iter(|| {
                 let mut message = Message::new();

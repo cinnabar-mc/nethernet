@@ -63,13 +63,9 @@ impl<S: Phase> Session<S> {
 
         match channel {
             Channel::Reliable => {
-                for segment in Framing::segments(data, segment_payload)? {
+                for segment in Framing::encode_segments(&data, segment_payload)? {
                     stream
-                        .write_chunk_with_ppi(
-                            now,
-                            &segment.encode(),
-                            PayloadProtocolIdentifier::Binary,
-                        )
+                        .write_chunk_with_ppi(now, &segment, PayloadProtocolIdentifier::Binary)
                         .map_err(|e| ProtocolError::Other(format!("{e}")))?;
                 }
             }

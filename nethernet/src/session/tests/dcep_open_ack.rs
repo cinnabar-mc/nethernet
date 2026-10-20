@@ -77,6 +77,16 @@ fn tick<S: Live>(
 /// A held real OPEN flight cannot grant sending before the peer can acknowledge its original bytes.
 #[test]
 fn a_held_dcep_open_is_acknowledged_before_ready_and_first_channel_sends() {
+    assert_open_flight_recovery(false);
+}
+
+#[test]
+fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
+    assert_open_flight_recovery(true);
+}
+
+/// Holds or drops the same original flight, then checks actual recovery, first sends and retirement.
+fn assert_open_flight_recovery(lose_first_flight: bool) {
     let mut now = Instant::now();
     let started = now;
     let (mut offerer, offer) = Session::new(addr(40400), true, 1, now).unwrap();
@@ -126,16 +136,18 @@ fn a_held_dcep_open_is_acknowledged_before_ready_and_first_channel_sends() {
         if opening {
             held_count += withheld.len();
             early_ready = Some(ready[0]);
-            for (bytes, _) in withheld {
-                facts.input_errors += usize::from(
-                    answerer
-                        .handle(SessionInput::Packet(
-                            bytes.into(),
-                            offerer.local_candidate().addr(),
-                            now,
-                        ))
-                        .is_err(),
-                );
+            if !lose_first_flight {
+                for (bytes, _) in withheld {
+                    facts.input_errors += usize::from(
+                        answerer
+                            .handle(SessionInput::Packet(
+                                bytes.into(),
+                                offerer.local_candidate().addr(),
+                                now,
+                            ))
+                            .is_err(),
+                    );
+                }
             }
         }
         let (received, _) = route(
@@ -165,7 +177,7 @@ fn a_held_dcep_open_is_acknowledged_before_ready_and_first_channel_sends() {
         drop((offerer, answerer));
         assert!(offerer_closed.is_ok() && answerer_closed.is_ok());
         panic!(
-            "the original encrypted handshake did not complete after releasing its held OPEN flight: ready={ready:?}, held={held_count}, unopened_peer={unopened_peer}, elapsed={elapsed:?}, deadlines={deadlines:?}, input_errors={}, wrong_route={}, terminal={}, unexpected={}",
+            "the original encrypted handshake did not recover its first OPEN flight: lost={lose_first_flight}, ready={ready:?}, held={held_count}, unopened_peer={unopened_peer}, elapsed={elapsed:?}, deadlines={deadlines:?}, input_errors={}, wrong_route={}, terminal={}, unexpected={}",
             facts.input_errors, facts.wrong_route, facts.terminal, facts.unexpected
         );
     }

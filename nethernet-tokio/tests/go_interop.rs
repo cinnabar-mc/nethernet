@@ -11,12 +11,8 @@ use std::time::Duration;
 /// Known differences from go-nethernet. Each check asserts its entry still reproduces,
 /// so fixing one fails here until the entry is removed.
 const EXPECTED_DIVERGENCES: &[&str] = &[
-    // Reliable sends above 2.55 MB fail; Go sends up to 255 segments of 262143 bytes (go-nethernet a5399f4).
-    "reliable-send-cap",
     // Reliable messages above 2.56 MB never arrive whole (go-nethernet 535497e).
     "reliable-receive-cap",
-    // Stricter than Go: unreliable sends are capped at 9999 bytes; Go allows one 262143-byte segment.
-    "unreliable-send-cap",
     // The unreliable channel retransmits lost messages although it announces zero retransmits.
     "unreliable-channel-retransmits",
     // A "Spectator" pong game mode becomes 6; Go reads it as survival.
@@ -39,7 +35,7 @@ fn check(id: &str, diverges: bool) {
     }
 }
 
-/// Above both Rust caps, below Go's 255 x 262143-byte limit.
+/// Reliable body used by the matched send-admission and receive-capacity probes.
 const LARGE: usize = 20_000_000;
 
 /// Echoes sizes around segment boundaries, then closes from the Rust side.
@@ -51,9 +47,16 @@ async fn reliable_echo_and_rust_close(mut peer: go_peer::GoPeer, mut link: Link)
         link.sender.send(data.clone()).await.unwrap();
         assert_eq!(link.recv().await, Some(data), "echo of {size} bytes");
     }
+    let probe = pattern(LARGE);
     check(
         "reliable-send-cap",
-        link.sender.send(pattern(LARGE)).await.is_err(),
+        link.sender.send(probe.clone()).await.is_err(),
+    );
+    let echoed = link.recv().await;
+    assert!(
+        echoed.as_ref() == Some(&probe),
+        "admitted reliable capacity probe was not echoed intact; received bytes: {:?}",
+        echoed.as_ref().map(Bytes::len)
     );
     link.sender.close().await.unwrap();
     // Well past close propagation and short of Go's ICE failure timeout.
@@ -91,9 +94,19 @@ async fn unreliable_under_loss(_peer: go_peer::GoPeer, mut link: Link) {
         .unwrap();
     let echoed = tokio::time::timeout(STEP, link.unreliable.recv()).await;
     assert_eq!(echoed.unwrap().unwrap().as_deref(), Some(&b"ping"[..]));
+    let probe = pattern(20_000);
     check(
         "unreliable-send-cap",
-        link.sender.send_unreliable(pattern(20_000)).await.is_err(),
+        link.sender.send_unreliable(probe.clone()).await.is_err(),
+    );
+    let echoed = tokio::time::timeout(STEP, link.unreliable.recv())
+        .await
+        .expect("admitted unreliable capacity probe echo stalled")
+        .expect("admitted unreliable capacity probe echo failed");
+    assert!(
+        echoed.as_ref() == Some(&probe),
+        "admitted unreliable capacity probe was not echoed intact; received bytes: {:?}",
+        echoed.as_ref().map(Bytes::len)
     );
 
     const SENT: usize = 20;

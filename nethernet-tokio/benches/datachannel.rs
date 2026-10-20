@@ -82,10 +82,15 @@ async fn pair() -> (NetherServer, NetherClient, AcceptedSession) {
 }
 
 fn datachannel(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    // Matches the Go side's GOMAXPROCS when CI sets it.
+    if let Some(procs) = std::env::var("BENCH_GO_PROCS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        builder.worker_threads(procs);
+    }
+    let rt = builder.enable_all().build().unwrap();
     let (_server, mut client, accepted) = rt.block_on(pair());
     let AcceptedSession {
         session,

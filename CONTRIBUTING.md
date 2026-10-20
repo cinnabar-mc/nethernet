@@ -32,7 +32,7 @@ go build -C tools/go-peer -o /tmp/go-peer . && NETHERNET_GO_PEER=/tmp/go-peer ca
 ```
 
 The CI `bench` job runs `go test -C tools/go-peer -run '^$' -bench .` and the criterion benches on one runner,
-then compares them with `go tool bench-compare` from `tools/go-peer`.
+then compares them with `go tool bench-compare --go-procs N` from `tools/go-peer`, where N is the `-cpu` value.
 
 ## Pull Requests
 

@@ -10,7 +10,7 @@ require (
 
 require (
 	github.com/andreburgaud/crypt2go v1.8.0 // indirect
-	github.com/cinnabar-mc/bedrock-net/tools/bench-compare v0.0.0-20261020125603-201e797a7d39 // indirect
+	github.com/cinnabar-mc/bedrock-net/tools/bench-compare v0.0.0-20261020153447-909a3db59ce7 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.6.3 // indirect

@@ -98,6 +98,9 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
+    env:
+      # Go GOMAXPROCS and Tokio worker threads for the benches.
+      BENCH_GO_PROCS: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
@@ -117,21 +120,21 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          go test -run '^$' -bench . -benchmem -count 5 . | tee "$RUNNER_TEMP/go-bench.txt"
+          go test -run '^$' -bench . -benchmem -count 5 -cpu "$BENCH_GO_PROCS" . | tee "$RUNNER_TEMP/go-bench.txt"
 
       - name: Rust benches
         run: |
           cargo bench -p nethernet --bench codec
           cargo bench -p nethernet-tokio --bench datachannel
 
-      # Exit 1 (Rust slower beyond the margin) only warns; unreadable input (2) or a missing
-      # measurement (3) fails the job.
+      # Exit 1 (Rust slower beyond the margin) only warns; malformed input (2) or a missing or
+      # stale measurement (3) fails the job.
       - name: Compare
         working-directory: tools/go-peer
         shell: bash
         run: |
           set +e -o pipefail
-          go tool bench-compare --go "$RUNNER_TEMP/go-bench.txt" --criterion "$GITHUB_WORKSPACE/target/criterion" \
+          go tool bench-compare --go-procs "$BENCH_GO_PROCS" --go "$RUNNER_TEMP/go-bench.txt" --criterion "$GITHUB_WORKSPACE/target/criterion" \
             | tee -a "$GITHUB_STEP_SUMMARY"
           status=$?
           if [ "$status" -eq 1 ]; then

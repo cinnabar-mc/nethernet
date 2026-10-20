@@ -49,19 +49,14 @@ func runPeer(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	bind, err := freeUDPAddr(*lanAddr)
-	if err != nil {
-		return err
-	}
-	// Without a target, requests go to this listener itself, which ignores them,
-	// instead of the limited broadcast address.
-	conf := discovery.ListenConfig{NetworkID: *networkID, Log: quietLog, BroadcastAddress: bind}
+	var target *net.UDPAddr
 	if *broadcast != "" {
-		if conf.BroadcastAddress, err = net.ResolveUDPAddr("udp4", *broadcast); err != nil {
+		var err error
+		if target, err = net.ResolveUDPAddr("udp4", *broadcast); err != nil {
 			return err
 		}
 	}
-	lan, err := conf.Listen(bind.String())
+	lan, bind, err := listenLAN(*lanAddr, *networkID, target)
 	if err != nil {
 		return err
 	}
@@ -213,17 +208,31 @@ func serve(conn *nethernet.Conn, lossy *lossyConn) {
 	}
 }
 
-// freeUDPAddr resolves a zero port to a currently free one, since discovery.Listener
-// does not report the address it bound.
-func freeUDPAddr(addr string) (*net.UDPAddr, error) {
+// listenLAN binds discovery on addr. A zero port is probed first, since discovery.Listener does
+// not report what it bound, and the probe is retried if a parallel process takes the port.
+// Without a target, requests go to the listener itself, which ignores them.
+func listenLAN(addr string, networkID uint64, target *net.UDPAddr) (*discovery.Listener, *net.UDPAddr, error) {
 	udp, err := net.ResolveUDPAddr("udp4", addr)
-	if err != nil || udp.Port != 0 {
-		return udp, err
-	}
-	pc, err := net.ListenUDP("udp4", udp)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer pc.Close()
-	return pc.LocalAddr().(*net.UDPAddr), nil
+	for attempt := 0; ; attempt++ {
+		bind := udp
+		if udp.Port == 0 {
+			pc, err := net.ListenUDP("udp4", udp)
+			if err != nil {
+				return nil, nil, err
+			}
+			bind = pc.LocalAddr().(*net.UDPAddr)
+			_ = pc.Close()
+		}
+		conf := discovery.ListenConfig{NetworkID: networkID, Log: quietLog, BroadcastAddress: target}
+		if target == nil {
+			conf.BroadcastAddress = bind
+		}
+		lan, err := conf.Listen(bind.String())
+		if err == nil || udp.Port != 0 || attempt == 9 {
+			return lan, bind, err
+		}
+	}
 }

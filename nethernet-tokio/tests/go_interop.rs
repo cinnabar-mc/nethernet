@@ -19,8 +19,6 @@ const EXPECTED_DIVERGENCES: &[&str] = &[
     "unreliable-send-cap",
     // The unreliable channel retransmits lost messages although it announces zero retransmits.
     "unreliable-channel-retransmits",
-    // ICE Disconnected closes the session; Go waits for Failed (go-nethernet be65139).
-    "ice-disconnected-is-fatal",
     // A "Spectator" pong game mode becomes 6; Go reads it as survival.
     "pong-spectator-game-type",
     // Better than Go: pong protocol and version are kept; Go leaves them empty.

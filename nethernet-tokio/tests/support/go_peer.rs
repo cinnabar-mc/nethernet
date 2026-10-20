@@ -206,20 +206,24 @@ pub async fn rust_dials_go(extra: &[&str]) -> Option<(GoPeer, Link, ServerData)>
 /// A Go peer dials a Rust server advertising `data`; returns what Go discovered as JSON.
 pub async fn go_dials_rust(data: ServerData) -> Option<(GoPeer, Link, Value)> {
     const RUST_ID: u64 = 7003;
-    let port = std::net::UdpSocket::bind(loopback(0))
-        .and_then(|s| s.local_addr())
-        .unwrap()
-        .port();
-    let signaling = LanSignaling::with_config(
-        RUST_ID,
-        loopback(port),
-        LanConfig {
-            discovery_port: port,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    // A probed port can be taken by a parallel test before it is rebound, so retry.
+    let (port, signaling) = 'bind: {
+        for _ in 0..10 {
+            let port = std::net::UdpSocket::bind(loopback(0))
+                .and_then(|s| s.local_addr())
+                .unwrap()
+                .port();
+            let config = LanConfig {
+                discovery_port: port,
+                ..Default::default()
+            };
+            if let Ok(signaling) = LanSignaling::with_config(RUST_ID, loopback(port), config).await
+            {
+                break 'bind (port, signaling);
+            }
+        }
+        panic!("no free loopback discovery port");
+    };
     signaling.set_server_data(data);
     let mut server = NetherServer::bind_with(
         signaling,

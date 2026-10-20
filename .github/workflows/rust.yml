@@ -4,6 +4,7 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  workflow_dispatch:
 
 env:
   RUSTFLAGS: -Dwarnings
@@ -49,6 +50,16 @@ jobs:
           cache-on-failure: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/go-peer/go.mod
+          cache-dependency-path: tools/go-peer/go.sum
+
+      # Go golden and interop tests skip without this helper.
+      - run: |
+          go build -C tools/go-peer -o "$RUNNER_TEMP/go-peer" .
+          echo "NETHERNET_GO_PEER=$RUNNER_TEMP/go-peer" >> "$GITHUB_ENV"
+
       - run: cargo test --workspace
 
   docs:
@@ -69,3 +80,50 @@ jobs:
 
       - run: cargo doc --workspace --no-deps
 
+  go-peer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/go-peer/go.mod
+          cache-dependency-path: tools/go-peer/go.sum
+
+      - working-directory: tools/go-peer
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+
+  # Not required: some Rust paths are known to be slower than go-nethernet.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: bench
+          shared-key: stable
+          cache-on-failure: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/go-peer/go.mod
+          cache-dependency-path: tools/go-peer/go.sum
+
+      - name: Go benches
+        working-directory: tools/go-peer
+        run: go test -run '^$' -bench . -benchmem -count 5 . | tee "$RUNNER_TEMP/go-bench.txt"
+
+      - name: Rust benches
+        run: |
+          cargo bench -p nethernet --bench codec
+          cargo bench -p nethernet-tokio --bench datachannel
+
+      - name: Compare
+        working-directory: tools/go-peer
+        run: |
+          set -o pipefail
+          go tool bench-compare --go "$RUNNER_TEMP/go-bench.txt" --criterion "$GITHUB_WORKSPACE/target/criterion" \
+            | tee -a "$GITHUB_STEP_SUMMARY"

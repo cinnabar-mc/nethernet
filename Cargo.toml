@@ -33,3 +33,4 @@ rtc = "0.21.1"
 rtc-turn = { git = "https://github.com/cinnabar-mc/rtc-turn", rev = "ceef0780c54c4f5fdc08e7e343403f8026653171" }
 byteorder = "1"
 ipnet = "2"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }

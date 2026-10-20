@@ -10,7 +10,7 @@ fn retained_core_prefix_obeys_current_budget_and_original_lifecycle_order() {
         max_received_bytes: 2,
     });
     let original = delivery.reserve(1).unwrap();
-    delivery.ready(&original, None);
+    delivery.ready(&original, None, [0; 2]);
     let mut updates = Vec::new();
     delivery.advance(&mut updates, 1);
     assert!(matches!(

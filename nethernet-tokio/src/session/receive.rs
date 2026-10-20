@@ -2,12 +2,12 @@
 use super::{Channel, PACKET_CHANNEL_CAPACITY};
 use crate::error::{NetherError, Result};
 use bytes::Bytes;
-use nethernet::protocol::constants::MAX_MESSAGE_SIZE;
+use nethernet::protocol::constants::DEFAULT_MAX_RECEIVED_BYTES;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-pub(super) const MAX_ACCEPTED_BYTES: usize = PACKET_CHANNEL_CAPACITY * MAX_MESSAGE_SIZE;
+pub(super) const MAX_ACCEPTED_BYTES: usize = DEFAULT_MAX_RECEIVED_BYTES;
 pub(super) const RELIABLE_PACKET_CAPACITY: usize = PACKET_CHANNEL_CAPACITY * 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

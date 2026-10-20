@@ -36,7 +36,7 @@ fn packet_capacity_retains_fifo_before_one_terminal_error() {
 #[test]
 fn the_byte_budget_covers_all_accepted_data_and_is_released_by_consumption() {
     let (producer, mut receiver) = channel(Channel::Reliable);
-    let packet = Bytes::from(vec![0; MAX_MESSAGE_SIZE]);
+    let packet = Bytes::from(vec![0; MAX_ACCEPTED_BYTES / PACKET_CHANNEL_CAPACITY]);
     for _ in 0..MAX_ACCEPTED_BYTES / packet.len() {
         producer.push(packet.clone()).unwrap();
     }

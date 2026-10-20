@@ -9,8 +9,8 @@ pub const ID_REQUEST_PACKET: u16 = 0;
 pub const ID_RESPONSE_PACKET: u16 = 1;
 pub const ID_MESSAGE_PACKET: u16 = 2;
 
-/// Payload bytes in one data-channel segment.
-pub const MAX_MESSAGE_SIZE: usize = 10000;
+/// Default payload bytes retained by an adapter's final receive owner, independent of wire limits.
+pub const DEFAULT_MAX_RECEIVED_BYTES: usize = 10_240_000;
 
 /// Cap on any u32-length-prefixed field read or written by the codec.
 pub const MAX_BYTES: usize = 65535;

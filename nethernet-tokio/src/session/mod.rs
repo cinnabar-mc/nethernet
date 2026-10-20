@@ -66,6 +66,7 @@ pub struct SessionSender {
     local_addr: Addr,
     remote_addr: Addr,
     command_tx: mpsc::Sender<Command>,
+    ready: Option<Ready>,
     rtt: RttObservation,
     #[cfg(test)]
     pressure: pressure_observation::Observation,
@@ -90,7 +91,10 @@ pub struct Session<S: Phase = Established> {
 
 /// Produced only by the existing actor after the core's actual Ready transition.
 #[derive(Clone, Copy)]
-pub(crate) struct Ready;
+pub(crate) struct Ready {
+    reliable_maximum: usize,
+    unreliable_maximum: usize,
+}
 
 /// Incoming accepted messages, followed by EOF on orderly close or one explicit receive error.
 pub struct SessionReceiver {
@@ -266,6 +270,7 @@ impl Session<Connecting> {
                 local_addr: local,
                 remote_addr: remote,
                 command_tx,
+                ready: None,
                 rtt,
                 #[cfg(test)]
                 pressure,
@@ -448,9 +453,19 @@ impl Session<Connecting> {
                             }
                         }
                         SessionOutput::Event(SessionEvent::Ready) => {
+                            let (Some(reliable_maximum), Some(unreliable_maximum)) = (
+                                connection.max_message_size(Channel::Reliable),
+                                connection.max_message_size(Channel::Unreliable),
+                            ) else {
+                                // Historical Ready cannot mint sending authority after the core retired.
+                                continue;
+                            };
                             remote_addr = connection.remote_addr();
                             if let Some(tx) = ready_tx.take() {
-                                let _ = tx.send(Ready);
+                                let _ = tx.send(Ready {
+                                    reliable_maximum,
+                                    unreliable_maximum,
+                                });
                             }
                         }
                         SessionOutput::Event(SessionEvent::Failed) => {
@@ -516,9 +531,11 @@ impl Session<Connecting> {
     }
 
     /// Consumes the pending owner only with the exact actor's private readiness result.
-    pub(crate) fn establish(self, _ready: Ready) -> Session<Established> {
+    pub(crate) fn establish(self, ready: Ready) -> Session<Established> {
+        let mut handle = self.into_handle();
+        handle.ready = Some(ready);
         Session {
-            handle: Some(self.into_handle()),
+            handle: Some(handle),
             _phase: PhantomData,
         }
     }

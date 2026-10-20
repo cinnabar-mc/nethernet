@@ -62,6 +62,8 @@ pub struct NetherClient {
     signaler: LanSignaler,
     socket: UdpSocket,
     transport: Option<Outbound>,
+    #[cfg(test)]
+    pub(crate) offered_sctp_maximum: Option<u32>,
     ice_config: Option<ClientIceConfig>,
     turn_tls: ClientTls,
     connected: bool,
@@ -104,6 +106,8 @@ impl NetherClient {
             signaler: LanSignaler::new(network_id, config),
             socket,
             transport: None,
+            #[cfg(test)]
+            offered_sctp_maximum: None,
             ice_config: None,
             turn_tls: ClientTls::default(),
             connected: false,
@@ -225,6 +229,10 @@ impl NetherClient {
             now,
             &self.turn_tls,
         )?;
+        #[cfg(test)]
+        if let Some(maximum) = self.offered_sctp_maximum {
+            transport.set_offered_sctp_maximum(maximum);
+        }
         let signals = transport
             .connect(rand::random(), self.target.to_string(), IceMode::Trickle)
             .map_err(std::io::Error::other)?;

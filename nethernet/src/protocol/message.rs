@@ -1,8 +1,7 @@
 //! Data-channel message framing: segmentation and reassembly (guide section 6.1).
 use crate::error::{ProtocolError, Result};
-use crate::protocol::constants::MAX_MESSAGE_SIZE;
 
-const MAX_REASSEMBLED_SIZE: usize = 256 * MAX_MESSAGE_SIZE;
+const MAX_REASSEMBLED_SIZE: usize = 2_560_000;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// One data-channel payload: a count of segments still to come, then the bytes.
@@ -112,18 +111,21 @@ impl Message {
         Err(error)
     }
 
-    /// Fails with `MessageSizeExceeded` beyond 255 segments.
+    /// Splits under the caller's segment-body limit, excluding the header, with at most 255 segments.
     #[inline(always)]
-    pub fn split_into_segments(data: Bytes) -> Result<Vec<MessageSegment>> {
+    pub fn split_into_segments(data: Bytes, maximum_payload: usize) -> Result<Vec<MessageSegment>> {
         let len = data.len();
 
-        if len <= MAX_MESSAGE_SIZE {
+        if len <= maximum_payload {
             return Ok(vec![MessageSegment::new(0, data)]);
         }
 
-        let segment_count = len.div_ceil(MAX_MESSAGE_SIZE);
+        if maximum_payload == 0 {
+            return Err(ProtocolError::MessageSizeExceeded(len));
+        }
+        let segment_count = len.div_ceil(maximum_payload);
 
-        if segment_count > 255 {
+        if segment_count > usize::from(u8::MAX) {
             return Err(ProtocolError::MessageSizeExceeded(len));
         }
 
@@ -132,10 +134,10 @@ impl Message {
         let mut remaining = data;
         let mut left = segment_count as u8;
 
-        while remaining.len() > MAX_MESSAGE_SIZE {
+        while remaining.len() > maximum_payload {
             left -= 1;
 
-            let chunk = remaining.split_to(MAX_MESSAGE_SIZE);
+            let chunk = remaining.split_to(maximum_payload);
 
             segments.push(MessageSegment::new(left, chunk));
         }
@@ -150,9 +152,9 @@ impl Message {
         Ok(segments)
     }
 
-    /// Fails with `MessageSizeExceeded` unless the data fits one segment.
-    pub fn encode_unreliable(data: Bytes) -> Result<Bytes> {
-        if data.len() > MAX_MESSAGE_SIZE.saturating_sub(1) {
+    /// Refuses a body beyond the caller's single-segment payload limit, excluding its header.
+    pub fn encode_unreliable(data: Bytes, maximum_payload: usize) -> Result<Bytes> {
+        if data.len() > maximum_payload {
             return Err(ProtocolError::MessageSizeExceeded(data.len()));
         }
         Ok(MessageSegment::new(0, data).encode())
@@ -169,10 +171,23 @@ impl Default for Message {
 mod tests {
     use super::*;
 
+    const SEGMENT_PAYLOAD_BYTES: usize = 10_000;
+
+    #[test]
+    fn explicit_zero_fragment_capacity_refuses_nonempty_bodies_without_panicking() {
+        let body = Bytes::from_static(b"nonempty");
+        assert!(
+            matches!(Message::split_into_segments(body.clone(), 0), Err(ProtocolError::MessageSizeExceeded(size)) if size == body.len())
+        );
+        assert!(
+            matches!(Message::encode_unreliable(body.clone(), 0), Err(ProtocolError::MessageSizeExceeded(size)) if size == body.len())
+        );
+    }
+
     #[test]
     fn test_single_segment() {
         let data = Bytes::from("Hello, World!");
-        let segments = Message::split_into_segments(data.clone()).unwrap();
+        let segments = Message::split_into_segments(data.clone(), SEGMENT_PAYLOAD_BYTES).unwrap();
 
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].remaining_segments, 0);
@@ -181,8 +196,8 @@ mod tests {
 
     #[test]
     fn test_multiple_segments() {
-        let data = Bytes::from(vec![0u8; MAX_MESSAGE_SIZE * 2 + 100]);
-        let segments = Message::split_into_segments(data.clone()).unwrap();
+        let data = Bytes::from(vec![0u8; SEGMENT_PAYLOAD_BYTES * 2 + 100]);
+        let segments = Message::split_into_segments(data.clone(), SEGMENT_PAYLOAD_BYTES).unwrap();
 
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0].remaining_segments, 2);
@@ -192,8 +207,9 @@ mod tests {
 
     #[test]
     fn test_reassembly() {
-        let original_data = Bytes::from(vec![1u8; MAX_MESSAGE_SIZE * 2 + 100]);
-        let segments = Message::split_into_segments(original_data.clone()).unwrap();
+        let original_data = Bytes::from(vec![1u8; SEGMENT_PAYLOAD_BYTES * 2 + 100]);
+        let segments =
+            Message::split_into_segments(original_data.clone(), SEGMENT_PAYLOAD_BYTES).unwrap();
 
         let mut message = Message::new();
         for (i, segment) in segments.iter().enumerate() {
@@ -209,8 +225,8 @@ mod tests {
 
     #[test]
     fn test_out_of_order_segments_error() {
-        let data = Bytes::from(vec![42u8; MAX_MESSAGE_SIZE * 2 + 100]);
-        let segments = Message::split_into_segments(data.clone()).unwrap();
+        let data = Bytes::from(vec![42u8; SEGMENT_PAYLOAD_BYTES * 2 + 100]);
+        let segments = Message::split_into_segments(data.clone(), SEGMENT_PAYLOAD_BYTES).unwrap();
         assert!(segments.len() >= 3);
 
         let mut message = Message::new();
@@ -242,7 +258,7 @@ mod tests {
         message
             .add_segment(MessageSegment::new(254, Bytes::from_static(b"a")))
             .unwrap();
-        assert!(message.data.capacity() < MAX_MESSAGE_SIZE);
+        assert!(message.data.capacity() < SEGMENT_PAYLOAD_BYTES);
     }
 
     #[test]

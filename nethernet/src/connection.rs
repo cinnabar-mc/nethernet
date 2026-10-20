@@ -386,6 +386,11 @@ pub enum ConnectionInput {
 }
 
 impl Connection<Established> {
+    /// Maximum outgoing body under the original active association's installed limit.
+    pub fn max_message_size(&self, channel: Channel) -> Option<usize> {
+        self.session.max_message_size(channel)
+    }
+
     /// Admits a message through this connection's original established session.
     pub fn send(
         &mut self,

@@ -1,7 +1,9 @@
 use super::*;
 use crate::client::NetherClient;
 use nethernet::error::ProtocolError;
-use nethernet::protocol::constants::MAX_MESSAGE_SIZE;
+use nethernet::protocol::constants::{DEFAULT_MAX_RECEIVED_BYTES, DEFAULT_PACKET_CHANNEL_CAPACITY};
+
+const OFFERED_SCTP_MESSAGE_BYTES: u32 = 64;
 
 /// Real Ready capabilities report impossible message sizes before claiming local admission.
 #[test]
@@ -13,6 +15,7 @@ fn established_server_refuses_oversized_messages_without_losing_valid_delivery()
         config.broadcast_interval = Duration::from_millis(20);
     })
     .unwrap();
+    client.offered_sctp_maximum = Some(OFFERED_SCTP_MESSAGE_BYTES);
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut established = None;
     let observations = (|| {
@@ -48,9 +51,10 @@ fn established_server_refuses_oversized_messages_without_losing_valid_delivery()
             return Err("the original established path did not deliver its baseline");
         }
 
-        let reliable_size = MAX_MESSAGE_SIZE * usize::from(u8::MAX) + 1;
+        let reliable_size = (OFFERED_SCTP_MESSAGE_BYTES as usize - 1) * usize::from(u8::MAX) + 1;
         let reliable = server.send(&session, &vec![0x51; reliable_size]);
-        let unreliable = server.send_unreliable(&session, &vec![0x72; MAX_MESSAGE_SIZE]);
+        let unreliable =
+            server.send_unreliable(&session, &vec![0x72; OFFERED_SCTP_MESSAGE_BYTES as usize]);
         server.send(&session, b"after refusal").unwrap();
         let mut delivered = None;
         while Instant::now() < deadline && delivered.is_none() {
@@ -79,7 +83,7 @@ fn established_server_refuses_oversized_messages_without_losing_valid_delivery()
     assert!(
         matches!(
             unreliable,
-            Err(ProtocolError::MessageSizeExceeded(MAX_MESSAGE_SIZE))
+            Err(ProtocolError::MessageSizeExceeded(size)) if size == OFFERED_SCTP_MESSAGE_BYTES as usize
         ),
         "an oversized unreliable message falsely reported local admission"
     );
@@ -93,7 +97,7 @@ fn stalled_server_receive_preserves_its_prefix_and_the_other_real_session() {
     server.set_session_limits(ServerLimits {
         max_sessions: 2,
         max_received_packets: 1,
-        max_received_bytes: MAX_MESSAGE_SIZE,
+        max_received_bytes: DEFAULT_MAX_RECEIVED_BYTES / DEFAULT_PACKET_CHANNEL_CAPACITY,
     });
     let mut clients: Vec<_> = (2..4)
         .map(|id| {

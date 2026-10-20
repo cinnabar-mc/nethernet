@@ -3,12 +3,11 @@ mod dcep;
 mod dtls;
 mod ice;
 mod sctp;
+mod send;
 
 use crate::error::ProtocolError::{self, MessageParse, MessageSizeExceeded};
 use crate::phase::{Connecting, Established, Live, Phase, Retired};
-use crate::protocol::constants::{
-    LOCAL_SCTP_MAX_MESSAGE_SIZE, MAX_MESSAGE_SIZE, SCTP_MAX_MESSAGE_SIZE,
-};
+use crate::protocol::constants::{LOCAL_SCTP_MAX_MESSAGE_SIZE, SCTP_MAX_MESSAGE_SIZE};
 use crate::protocol::message::{Message as Framing, MessageSegment};
 use crate::protocol::webrtc::{Description, DtlsRole, certificate};
 use crate::sans::Sans;
@@ -40,16 +39,6 @@ const DEFAULT_ESTABLISH_DEADLINE: Duration = Duration::from_secs(10);
 pub enum Channel {
     Reliable,
     Unreliable,
-}
-
-impl Channel {
-    /// Maximum logical payload accepted by the original NetherNet segmentation format.
-    pub const fn max_message_size(self) -> usize {
-        match self {
-            Self::Reliable => MAX_MESSAGE_SIZE * u8::MAX as usize,
-            Self::Unreliable => MAX_MESSAGE_SIZE.saturating_sub(1),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -656,50 +645,6 @@ impl<S: Phase> Session<S> {
         .min()
     }
 
-    fn send_message(
-        &mut self,
-        channel: Channel,
-        data: bytes::Bytes,
-        now: Instant,
-    ) -> Result<(), ProtocolError> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        let stream_id = self
-            .channels
-            .stream_id(channel)
-            .ok_or_else(|| ProtocolError::Other("channel not open yet".to_string()))?;
-
-        let sctp = self
-            .sctp
-            .as_mut()
-            .ok_or_else(|| ProtocolError::Other("transports not started".to_string()))?;
-        let assoc = sctp
-            .association_mut()
-            .ok_or_else(|| ProtocolError::Other("association not established".to_string()))?;
-        let mut stream = assoc
-            .stream(stream_id)
-            .map_err(|e| ProtocolError::Other(format!("{e}")))?;
-
-        match channel {
-            Channel::Reliable => {
-                for segment in Framing::split_into_segments(data)? {
-                    stream
-                        .write_with_ppi(now, &segment.encode(), PayloadProtocolIdentifier::Binary)
-                        .map_err(|e| ProtocolError::Other(format!("{e}")))?;
-                }
-            }
-            Channel::Unreliable => {
-                let encoded = Framing::encode_unreliable(data)?;
-                stream
-                    .write_with_ppi(now, &encoded, PayloadProtocolIdentifier::Binary)
-                    .map_err(|e| ProtocolError::Other(format!("{e}")))?;
-            }
-        }
-
-        Ok(())
-    }
-
     fn pump(&mut self, now: Instant) -> Result<(), ProtocolError> {
         if self.ice.selected_route_failed() {
             self.fail(now)?;
@@ -799,23 +744,6 @@ impl<S: Phase> Session<S> {
             teardown?;
         }
         Ok(())
-    }
-}
-
-impl Session<Established> {
-    /// Admits data only on actual readiness; empty payloads are successful no-ops.
-    pub fn send(
-        &mut self,
-        channel: Channel,
-        data: bytes::Bytes,
-        now: Instant,
-    ) -> Result<(), ProtocolError> {
-        self.expire_before_input(now)?;
-        if self.ice.gathering_state() == GatheringState::Closed {
-            return Err(IceError::Closed.into());
-        }
-        self.send_message(channel, data, now)?;
-        self.pump(now)
     }
 }
 

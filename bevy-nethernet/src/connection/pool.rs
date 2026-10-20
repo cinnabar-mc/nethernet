@@ -177,16 +177,14 @@ where
         data: impl AsRef<[u8]>,
     ) -> Result<(), ProtocolError> {
         let data = data.as_ref();
-        if data.len() > channel.max_message_size() {
-            return Err(ProtocolError::MessageSizeExceeded(data.len()));
-        }
-        if !self
+        let maximum = self
             .delivery
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(&id, &readiness)
-        {
-            return Err(ProtocolError::Other("unknown session".into()));
+            .max_message_size(&id, &readiness, channel)
+            .ok_or_else(|| ProtocolError::Other("unknown session".into()))?;
+        if data.len() > maximum {
+            return Err(ProtocolError::MessageSizeExceeded(data.len()));
         }
         if self.commands.is_closed() {
             return Err(io::Error::from(ErrorKind::BrokenPipe).into());
@@ -501,10 +499,21 @@ fn drive<K: Eq + Hash + Clone + Send + 'static>(
                         break;
                     }
                     SessionOutput::Event(SessionEvent::Ready) => {
+                        let (Some(reliable), Some(unreliable)) = (
+                            entry.connection.max_message_size(Channel::Reliable),
+                            entry.connection.max_message_size(Channel::Unreliable),
+                        ) else {
+                            // Retain the original prefix and terminal without publishing stale authority.
+                            continue;
+                        };
                         delivery
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
-                            .ready(&entry.readiness, entry.connection.remote_addr());
+                            .ready(
+                                &entry.readiness,
+                                entry.connection.remote_addr(),
+                                [reliable, unreliable],
+                            );
                     }
                     SessionOutput::Message(channel, data) => {
                         let bytes = data.into_boxed_slice();

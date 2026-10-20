@@ -5,7 +5,7 @@ use super::*;
 fn terminal_waits_for_the_original_owner_to_finish_discovering_its_prefix() {
     let mut delivery = Delivery::new();
     let original = delivery.reserve(1).unwrap();
-    delivery.ready(&original, None);
+    delivery.ready(&original, None, [0; 2]);
     let mut updates = Vec::new();
     delivery.advance(&mut updates, 1);
     let ready = delivery.next_event();

@@ -1,6 +1,6 @@
 use nethernet::protocol::constants::{
-    DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_NETWORK_ID, DEFAULT_PACKET_CHANNEL_CAPACITY,
-    MAX_MESSAGE_SIZE,
+    DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_NETWORK_ID, DEFAULT_MAX_RECEIVED_BYTES,
+    DEFAULT_PACKET_CHANNEL_CAPACITY,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -66,7 +66,7 @@ impl Default for ServerLimits {
         Self {
             max_sessions: DEFAULT_MAX_PENDING,
             max_received_packets: DEFAULT_PACKET_CHANNEL_CAPACITY,
-            max_received_bytes: DEFAULT_PACKET_CHANNEL_CAPACITY * MAX_MESSAGE_SIZE,
+            max_received_bytes: DEFAULT_MAX_RECEIVED_BYTES,
         }
     }
 }

@@ -156,6 +156,15 @@ impl Outbound {
         })
     }
 
+    /// Changes only this fixture's original pending offer before normal connection/signing.
+    #[cfg(test)]
+    pub(crate) fn set_offered_sctp_maximum(&mut self, maximum: u32) {
+        let Some(State::Gathering(_, description)) = self.state.get() else {
+            panic!("fixture must configure its original pending offer");
+        };
+        description.sctp_max_message_size = maximum;
+    }
+
     /// Full SDP may be produced only after gathering completes.
     pub(crate) fn gathering_complete(&mut self) -> bool {
         matches!(self.state.get(), Some(State::Gathering(session, _))
@@ -475,6 +484,12 @@ impl Outbound {
         }
         let result = match self.state.get() {
             Some(State::Connected(connection)) => {
+                let maximum = connection
+                    .max_message_size(channel)
+                    .ok_or_else(|| ProtocolError::Other("not connected".into()))?;
+                if data.len() > maximum {
+                    return Err(ProtocolError::MessageSizeExceeded(data.len()));
+                }
                 connection.send(channel, data.to_vec().into(), now)
             }
             _ => Err(ProtocolError::Other("not connected".into())),

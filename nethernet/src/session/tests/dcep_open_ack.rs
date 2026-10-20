@@ -75,6 +75,7 @@ fn tick<S: Live>(
 #[test]
 fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
     let mut now = Instant::now();
+    let started = now;
     let (mut offerer, offer) = Session::new(addr(40400), true, 1, now).unwrap();
     let (mut answerer, answer) = Session::new(addr(40401), false, 2, now).unwrap();
     let (offer, offer_candidates) =
@@ -140,13 +141,19 @@ fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
         }
     }
     if ready != [1, 1] || dropped == 0 || facts.terminal {
+        let elapsed = now.saturating_duration_since(started);
+        let deadlines = [offerer.poll_timeout(), answerer.poll_timeout()]
+            .map(|deadline| deadline.map(|at| at.saturating_duration_since(started)));
         let (mut offerer, offerer_closed) = offerer.close(now);
         let (mut answerer, answerer_closed) = answerer.close(now);
         while offerer.poll().is_some() {}
         while answerer.poll().is_some() {}
         drop((offerer, answerer));
         assert!(offerer_closed.is_ok() && answerer_closed.is_ok());
-        panic!("the original encrypted handshake did not recover its lost OPEN flight");
+        panic!(
+            "the original encrypted handshake did not recover its lost OPEN flight: ready={ready:?}, dropped={dropped}, unopened_peer={unopened_peer}, elapsed={elapsed:?}, deadlines={deadlines:?}, input_errors={}, wrong_route={}, terminal={}, unexpected={}",
+            facts.input_errors, facts.wrong_route, facts.terminal, facts.unexpected
+        );
     }
     let mut offerer = offerer
         .try_establish()

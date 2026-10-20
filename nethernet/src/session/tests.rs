@@ -3,6 +3,7 @@ use bytes::Bytes;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+mod dcep_open_ack;
 mod framing_edges;
 mod incoming_size;
 mod local_close;

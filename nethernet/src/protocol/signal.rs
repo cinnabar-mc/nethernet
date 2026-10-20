@@ -104,11 +104,7 @@ impl Signal {
             .parse::<u64>()
             .map_err(|e| ProtocolError::Other(format!("Failed to parse connection ID: {}", e)))?;
         if signal_type == SignalType::Error {
-            decimal_prefix(parts[2], true)
-                .parse::<i32>()
-                .map_err(|error| {
-                    ProtocolError::Other(format!("Failed to parse error code: {error}"))
-                })?;
+            parse_error_code(parts[2])?;
         }
         let data = parts[2].to_string();
 
@@ -131,6 +127,16 @@ impl fmt::Display for Signal {
             self.data
         )
     }
+}
+
+/// Parses a signed 32-bit decimal prefix without changing the original signal text.
+///
+/// # Errors
+/// Rejects missing digits, leading whitespace or plus, and signed overflow.
+pub fn parse_error_code(data: &str) -> Result<i32, ProtocolError> {
+    decimal_prefix(data, true)
+        .parse::<i32>()
+        .map_err(|error| ProtocolError::Other(format!("Failed to parse error code: {error}")))
 }
 
 /// Reads an ASCII decimal prefix, allowing a leading minus only for signed fields.

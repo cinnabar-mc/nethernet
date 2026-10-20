@@ -3,6 +3,8 @@ use bytes::Bytes;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+mod framing_edges;
+
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
 }
@@ -922,4 +924,132 @@ fn consuming_close_retains_the_actual_ready_and_reliable_output_prefix() {
         ))
     );
     assert!(retired.poll().is_none());
+}
+
+/// Real SCTP framing rejection retains complete accepted messages before one terminal.
+#[test]
+fn framing_rejection_retains_only_accepted_prefix_before_terminal() {
+    let malformed = [
+        MessageSegment::new(0, Bytes::from_static(b"wrong count")).encode(),
+        MessageSegment::new(1, Bytes::new()).encode(),
+    ];
+    let mut observations = Vec::new();
+    for malformed in malformed {
+        let (mut receiver, mut peer, mut now) = connected_pair();
+        let receiver_addr = receiver.ice.selected_local_addr().unwrap();
+        let peer_addr = peer.ice.selected_local_addr().unwrap();
+        let accepted = b"accepted before framing rejection";
+        peer.send(Channel::Reliable, Bytes::from_static(accepted), now)
+            .unwrap();
+        while let Some(output) = peer.poll() {
+            if let SessionOutput::Send(data, to) = output {
+                assert_eq!(to, receiver_addr);
+                receiver
+                    .handle(SessionInput::Packet(data.into(), peer_addr, now))
+                    .unwrap();
+            }
+        }
+        assert!(receiver.output.iter().any(|output| matches!(
+            output,
+            SessionOutput::Message(Channel::Reliable, data) if data == accepted
+        )));
+
+        {
+            let stream_id = peer.channels.stream_id(Channel::Reliable).unwrap();
+            let mut stream = peer
+                .sctp
+                .as_mut()
+                .unwrap()
+                .association_mut()
+                .unwrap()
+                .stream(stream_id)
+                .unwrap();
+            for segment in [
+                MessageSegment::new(2, Bytes::from_static(b"incomplete")).encode(),
+                malformed,
+                MessageSegment::new(1, Bytes::from_static(b"middle")).encode(),
+                MessageSegment::new(0, Bytes::from_static(b"tail")).encode(),
+            ] {
+                stream
+                    .write_with_ppi(now, &segment, PayloadProtocolIdentifier::Binary)
+                    .unwrap();
+            }
+        }
+        peer.pump(now).unwrap();
+        let mut output = Vec::new();
+        let mut input_datagrams = 0;
+        let mut unexpected_errors = 0;
+        for _ in 0..200 {
+            let mut progressed = false;
+            let packets: Vec<_> = std::iter::from_fn(|| peer.poll()).collect();
+            for packet in packets {
+                if let SessionOutput::Send(data, to) = packet {
+                    assert_eq!(to, receiver_addr);
+                    input_datagrams += 1;
+                    progressed = true;
+                    if !matches!(
+                        receiver.handle(SessionInput::Packet(data.into(), peer_addr, now)),
+                        Ok(())
+                            | Err(ProtocolError::MessageParse(_))
+                            | Err(ProtocolError::MessageSizeExceeded(_))
+                    ) {
+                        unexpected_errors += 1;
+                    }
+                }
+            }
+            let packets: Vec<_> = std::iter::from_fn(|| receiver.poll()).collect();
+            for packet in packets {
+                progressed = true;
+                match packet {
+                    SessionOutput::Send(data, to) => {
+                        assert_eq!(to, peer_addr);
+                        peer.handle(SessionInput::Packet(data.into(), receiver_addr, now))
+                            .unwrap();
+                    }
+                    SessionOutput::Message(..) | SessionOutput::Event(..) => output.push(packet),
+                    _ => {}
+                }
+            }
+            if receiver.gathering_state() == GatheringState::Closed {
+                break;
+            }
+            if !progressed {
+                now += Duration::from_millis(5);
+                receiver.handle(SessionInput::Timeout(now)).unwrap();
+                peer.handle(SessionInput::Timeout(now)).unwrap();
+            }
+        }
+        let retired_on_rejection = receiver.gathering_state() == GatheringState::Closed;
+        let (mut receiver, receiver_closed) = receiver.close(now);
+        let (mut peer, peer_closed) = peer.close(now);
+        while receiver.poll().is_some() {}
+        while peer.poll().is_some() {}
+        drop((receiver, peer));
+        assert!(receiver_closed.is_ok() && peer_closed.is_ok());
+        assert!(input_datagrams > 0 && unexpected_errors == 0);
+        observations.push((output, retired_on_rejection, accepted));
+    }
+
+    for (output, retired_on_rejection, accepted) in observations {
+        let messages: Vec<_> = output
+            .iter()
+            .filter_map(|item| match item {
+                SessionOutput::Message(Channel::Reliable, data) => Some(data.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            [accepted.as_slice()],
+            "logical framing rejection delivered an unaccepted suffix"
+        );
+        assert!(retired_on_rejection);
+        assert!(matches!(
+            output.as_slice(),
+            [
+                SessionOutput::Message(Channel::Reliable, _),
+                SessionOutput::Event(SessionEvent::Failed)
+            ]
+        ));
+    }
 }

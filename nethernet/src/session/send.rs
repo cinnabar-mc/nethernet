@@ -18,7 +18,7 @@ impl Channel {
 
 impl<S: Phase> Session<S> {
     /// Ignores later SDP changes that did not reconfigure the original association.
-    fn segment_payload_size(&self) -> Option<usize> {
+    pub(super) fn segment_payload_size(&self) -> Option<usize> {
         if self.channels.terminal_emitted {
             return None;
         }

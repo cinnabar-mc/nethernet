@@ -30,16 +30,6 @@ const EXPECTED_DIVERGENCES: &[&str] = &[
     "server-data-u8-fields",
     // Error codes 27 to 37 read as SignalingUnknownError (go-nethernet 20af621, f0d2dac).
     "error-codes-27-to-37",
-    // Stricter than Go: a connection id must be all digits; Go reads a decimal prefix.
-    "signal-connection-id-prefix",
-    // NEW: a connection id may start with '+'; Go refuses it.
-    "signal-connection-id-plus",
-    // NEW: CONNECTERROR data is not checked as a signed 32-bit decimal; Go refuses it.
-    "signal-error-code-unchecked",
-    // Non-trickle SDP keeps 0.0.0.0 port 9 instead of the default candidate (go-nethernet 5856e79).
-    "sdp-default-candidate",
-    // Non-trickle SDP drops ice-options:trickle and adds end-of-candidates (go-nethernet a08efb4).
-    "sdp-non-trickle-attributes",
     // NEW: inline candidates are written `a=candidate:<foundation>`; Go writes `a=candidate:candidate:<foundation>`.
     "sdp-inline-candidate-prefix",
 ];
@@ -355,6 +345,14 @@ fn signal_text_matches_go() {
         ("CONNECTERROR 9 15", None),
         ("CONNECTERROR 9 -1", None),
         ("CONNECTERROR 9 5x", None),
+        ("CONNECTERROR 0x10 -2147483648suffix", None),
+        ("CONNECTERROR 1 2147483647suffix", None),
+        ("CONNECTERROR 1 -2147483649suffix", None),
+        ("CONNECTERROR 1 +7", None),
+        ("CONNECTERROR 1 -", None),
+        ("CONNECTERROR 1  7", None),
+        ("CONNECTERROR 1 ", None),
+        ("CONNECTREQUEST 18446744073709551616suffix data", None),
         ("CONNECTREQUEST 1 ", None),
         ("CONNECTREQUEST 1 a b  c", None),
         ("CONNECTREQUEST 007 x", None),

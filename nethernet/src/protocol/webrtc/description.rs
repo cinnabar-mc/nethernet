@@ -3,16 +3,17 @@ use crate::error::ProtocolError;
 use crate::protocol::constants::SCTP_MAX_MESSAGE_SIZE;
 use crate::protocol::webrtc::candidate;
 use rtc::ice::agent::Credentials;
-use rtc::ice::candidate::Candidate;
+use rtc::ice::candidate::{Candidate, CandidateType};
 use rtc::sdp::description::common::{Address, Attribute, ConnectionInformation};
 use rtc::sdp::description::media::{MediaDescription, MediaName, RangedPort};
 use rtc::sdp::description::session::{
-    ATTR_KEY_CONNECTION_SETUP, ATTR_KEY_END_OF_CANDIDATES, ATTR_KEY_EXTMAP_ALLOW_MIXED,
-    ATTR_KEY_GROUP, ATTR_KEY_IDENTITY, ATTR_KEY_MAX_MESSAGE_SIZE, ATTR_KEY_MID,
-    ATTR_KEY_MSID_SEMANTIC, Origin, SessionDescription, TimeDescription,
+    ATTR_KEY_CONNECTION_SETUP, ATTR_KEY_EXTMAP_ALLOW_MIXED, ATTR_KEY_GROUP, ATTR_KEY_IDENTITY,
+    ATTR_KEY_MAX_MESSAGE_SIZE, ATTR_KEY_MID, ATTR_KEY_MSID_SEMANTIC, Origin, SessionDescription,
+    TimeDescription,
 };
 use rtc::sdp::util::ConnectionRole;
 use std::io::Cursor;
+use std::net::IpAddr;
 
 pub const SCTP_PORT: u16 = 5000;
 
@@ -48,17 +49,27 @@ impl Description {
         self.session(media).marshal()
     }
 
-    /// Embeds the candidates and ends the list with `end-of-candidates`.
+    /// Embeds candidates and uses the preferred UDP candidate as the media address.
     pub fn encode_full(&self, candidates: &[Candidate]) -> String {
-        let mut media = self.base_media();
+        let mut media = self
+            .base_media()
+            .with_value_attribute("ice-options".to_string(), "trickle".to_string());
+        if let Some(candidate) = default_candidate(candidates)
+            && let Ok(address) = candidate.address().parse::<IpAddr>()
+        {
+            media.media_name.port.value = candidate.port() as isize;
+            if let Some(connection) = &mut media.connection_information {
+                connection.address_type = if address.is_ipv4() { "IP4" } else { "IP6" }.into();
+                connection.address.as_mut().unwrap().address = address.to_string();
+            }
+        }
         for (index, c) in candidates.iter().enumerate() {
             media = media.with_candidate(candidate::attribute_value(index, c, &self.ice.ufrag));
         }
-        media = media.with_value_attribute(ATTR_KEY_END_OF_CANDIDATES.to_string(), "".to_string());
         self.session(media).marshal()
     }
 
-    /// Needs exactly one media section and a setup of `active` or `actpass`; unparsable candidates are skipped.
+    /// Reads one media section, including session-level fingerprints and candidates.
     pub fn parse(sdp: &str) -> Result<(Description, Vec<Candidate>), ProtocolError> {
         let session = SessionDescription::unmarshal(&mut Cursor::new(sdp))
             .map_err(|e| ProtocolError::Other(format!("decode session description: {e}")))?;
@@ -74,7 +85,14 @@ impl Description {
         let ufrag = attribute(media, "ice-ufrag")?.to_string();
         let pwd = attribute(media, "ice-pwd")?.to_string();
 
-        let fingerprint_attr = attribute(media, "fingerprint")?;
+        let fingerprint_attr = if media.attribute("fingerprint").is_some() {
+            attribute(media, "fingerprint")?
+        } else {
+            session
+                .attribute("fingerprint")
+                .map(String::as_str)
+                .ok_or_else(|| ProtocolError::Other("missing fingerprint attribute".into()))?
+        };
         let (algorithm, value) = fingerprint_attr.split_once(' ').ok_or_else(|| {
             ProtocolError::Other(format!("invalid fingerprint: {fingerprint_attr}"))
         })?;
@@ -82,7 +100,7 @@ impl Description {
         let setup = attribute(media, ATTR_KEY_CONNECTION_SETUP)?;
         let dtls_role = match setup {
             "active" => DtlsRole::Client,
-            "actpass" => DtlsRole::Server,
+            "actpass" | "passive" => DtlsRole::Server,
             _ => {
                 return Err(ProtocolError::Other(format!(
                     "invalid setup attribute: {setup}"
@@ -98,7 +116,7 @@ impl Description {
         };
 
         let mut candidates = Vec::new();
-        for attr in &media.attributes {
+        for attr in session.attributes.iter().chain(&media.attributes) {
             if attr.key == "candidate"
                 && let Some(value) = &attr.value
                 && let Ok(parsed) = candidate::parse_ice_candidate(value)
@@ -203,6 +221,39 @@ impl Description {
     }
 }
 
+/// Prefers IPv4 and then relay, reflexive and host candidates within the same family.
+fn default_candidate(candidates: &[Candidate]) -> Option<&Candidate> {
+    let mut selected = None;
+    let mut family = 0;
+    let mut preference = 0;
+    for candidate in candidates {
+        if !candidate.network_type().is_udp() || candidate.component() != 1 {
+            continue;
+        }
+        let next_family = match candidate.address().parse::<IpAddr>() {
+            Ok(IpAddr::V4(_)) => 4,
+            Ok(IpAddr::V6(_)) => 6,
+            Err(_) => 0,
+        };
+        let next_preference = match candidate.candidate_type() {
+            CandidateType::Relay => 3,
+            CandidateType::ServerReflexive => 2,
+            CandidateType::Host => 1,
+            _ => 0,
+        };
+        if selected.is_some()
+            && ((family == next_family && next_preference <= preference)
+                || (family == 4 && next_family == 6))
+        {
+            continue;
+        }
+        selected = Some(candidate);
+        family = next_family;
+        preference = next_preference;
+    }
+    selected
+}
+
 fn attribute<'a>(media: &'a MediaDescription, key: &str) -> Result<&'a str, ProtocolError> {
     match media.attribute(key) {
         Some(Some(value)) => Ok(value),
@@ -280,6 +331,58 @@ mod tests {
     }
 
     #[test]
+    fn sdp_full_uses_the_default_candidate_and_keeps_trickle() {
+        let local = description(DtlsRole::Server);
+        let candidates = vec![host_candidate("192.0.2.1", 54321)];
+        let encoded = local.encode_full(&candidates);
+        assert!(encoded.contains("m=application 54321 UDP/DTLS/SCTP"));
+        assert!(encoded.contains("c=IN IP4 192.0.2.1"));
+        assert!(encoded.contains("a=ice-options:trickle"));
+        assert!(!encoded.contains("a=end-of-candidates"));
+        assert!(!encoded.contains("a=candidate:candidate:"));
+    }
+
+    #[test]
+    fn sdp_default_candidate_prefers_ipv4_then_relay_without_using_ice_priority() {
+        let candidates = [
+            "candidate:1 1 udp 9999 2001:db8::1 1111 typ relay",
+            "candidate:2 1 udp 9999 192.0.2.1 2222 typ host",
+            "candidate:3 1 udp 1 192.0.2.2 3333 typ relay raddr 192.0.2.1 rport 2222",
+            "candidate:4 1 udp 99999 192.0.2.3 4444 typ relay raddr 192.0.2.1 rport 2222",
+            "candidate:5 2 udp 99999 192.0.2.4 5555 typ relay raddr 192.0.2.1 rport 2222",
+        ]
+        .map(|line| candidate::parse_ice_candidate(line).unwrap());
+        let encoded = description(DtlsRole::Server).encode_full(&candidates);
+        assert!(encoded.contains("m=application 3333 UDP/DTLS/SCTP"));
+        assert!(encoded.contains("c=IN IP4 192.0.2.2"));
+        let ipv6 = description(DtlsRole::Server).encode_full(&candidates[..1]);
+        assert!(ipv6.contains("c=IN IP6 2001:db8::1"));
+    }
+
+    #[test]
+    fn sdp_session_fingerprint_candidates_and_passive_setup_are_accepted() {
+        let local = description(DtlsRole::Server);
+        let encoded = local.encode_full(&[host_candidate("192.0.2.1", 54321)]);
+        let mut before_media = String::new();
+        let mut rest = String::new();
+        for line in encoded.lines() {
+            if line.starts_with("a=fingerprint:") || line.starts_with("a=candidate:") {
+                before_media.push_str(&format!("{line}\r\n"));
+            } else {
+                rest.push_str(&format!("{line}\r\n"));
+            }
+        }
+        let encoded = rest
+            .replace("m=application", &format!("{before_media}m=application"))
+            .replace("a=setup:actpass", "a=setup:passive");
+        let (parsed, candidates) = Description::parse(&encoded).unwrap();
+        assert_eq!(parsed.dtls_role, DtlsRole::Server);
+        assert_eq!(parsed.fingerprint, local.fingerprint);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].address(), "192.0.2.1");
+    }
+
+    #[test]
     fn full_ice_embeds_candidates() {
         let candidates = vec![host_candidate("192.168.1.10", 54321)];
         let local = description(DtlsRole::Server);
@@ -289,8 +392,8 @@ mod tests {
 
         assert!(encoded.contains("a=candidate:"));
         assert!(encoded.contains("192.168.1.10"));
-        assert!(encoded.contains("a=end-of-candidates"));
-        assert!(!encoded.contains("a=ice-options:trickle"));
+        assert!(!encoded.contains("a=end-of-candidates"));
+        assert!(encoded.contains("a=ice-options:trickle"));
 
         let (_, parsed_candidates) = Description::parse(&encoded).unwrap();
         assert_eq!(parsed_candidates.len(), 1);

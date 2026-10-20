@@ -245,6 +245,14 @@ impl NetherClient {
                 NetherError::from(error),
             )
         })?;
+        session
+            .set_max_incoming_message_size(config.max_incoming_message_bytes)
+            .map_err(|error| {
+                (
+                    Some(SignalErrorCode::FailedToCreatePeerConnection),
+                    NetherError::from(error),
+                )
+            })?;
         session.set_establish_deadline(config.timeouts.establish());
         let ice_mode = if signaling.disable_trickle_ice() {
             IceMode::Full

@@ -165,6 +165,17 @@ impl Outbound {
         description.sctp_max_message_size = maximum;
     }
 
+    /// Applies caller policy to the original pending allocation before any remote description.
+    pub(crate) fn set_max_incoming_message_size(
+        &mut self,
+        maximum: usize,
+    ) -> Result<(), ProtocolError> {
+        match self.state.get() {
+            Some(State::Gathering(session, _)) => session.set_max_incoming_message_size(maximum),
+            _ => Err(ProtocolError::Other("offer already created".into())),
+        }
+    }
+
     /// Full SDP may be produced only after gathering completes.
     pub(crate) fn gathering_complete(&mut self) -> bool {
         matches!(self.state.get(), Some(State::Gathering(session, _))

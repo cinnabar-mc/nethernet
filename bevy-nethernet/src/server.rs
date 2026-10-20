@@ -110,6 +110,7 @@ pub struct NetherServer {
     infer_peer_candidates: bool,
     timeouts: Timeouts,
     pending_limits: PendingLimits,
+    max_incoming_message_bytes: usize,
     sessions: HashMap<NetherSessionId, SessionEntry>,
     buf: Box<[u8]>,
 }
@@ -137,6 +138,8 @@ impl NetherServer {
             infer_peer_candidates: true,
             timeouts: Timeouts::default(),
             pending_limits: PendingLimits::default(),
+            max_incoming_message_bytes:
+                nethernet::protocol::constants::DEFAULT_MAX_INCOMING_MESSAGE_BYTES,
             sessions: HashMap::new(),
             buf: vec![0u8; MAX_DATAGRAM_SIZE].into_boxed_slice(),
         })
@@ -166,6 +169,12 @@ impl NetherServer {
 
     pub fn set_pending_limits(&mut self, limits: PendingLimits) {
         self.pending_limits = limits;
+    }
+
+    /// Selects the complete incoming body limit for future offers; existing allocations retain theirs.
+    /// Zero refuses nonempty bodies; final delivery budgets remain independent.
+    pub fn set_max_incoming_message_size(&mut self, maximum: usize) {
+        self.max_incoming_message_bytes = maximum;
     }
 
     /// Bounds all sessions and final retained payloads together; accepted prefixes are preserved.
@@ -445,6 +454,7 @@ impl NetherServer {
             .ok()
             .and_then(|network_id| self.signaler.address(network_id));
         let mut policy = OfferPolicy::new(IceMode::Trickle)
+            .with_max_incoming_message_size(self.max_incoming_message_bytes)
             .with_inferred_peer_candidates(self.infer_peer_candidates);
         policy = policy.with_establish_deadline(self.timeouts.establish());
         if let Some(identity) = &self.identity {

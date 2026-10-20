@@ -54,8 +54,18 @@ from actual readiness and reject oversized sends before queueing or copying.
 Direct framing users pass their segment-body limit explicitly to
 `Message::split_into_segments` and `Message::encode_unreliable`.
 
-Incoming reliable reassembly remains capped at 2,560,000 bytes. Negotiated outgoing
-capacity does not change that receive policy or an adapter's retained-byte budget.
+Incoming application bodies default to `DEFAULT_MAX_INCOMING_MESSAGE_BYTES`
+(2,560,000 bytes), independently of negotiated outgoing capacity and retained queues.
+Before accepting a remote description, a pending core can select a different bound
+with `set_max_incoming_message_size`; zero refuses nonempty bodies without reserving
+payload storage. An `OfferPolicy` can set the same bound for its original answering
+session. Tokio's `ConnectionConfig.max_incoming_message_bytes` applies it to clients
+and both accepting ICE paths. The four Bevy client/server resources expose the same
+setter for future attempts or offers; active allocations keep their original policy.
+A refusal preserves complete accepted messages before one terminal outcome and never
+publishes a rejected message's suffix. Final delivery count/byte budgets are unchanged.
+The existing first-segment count and 1 MiB single-SCTP-record read policies are unchanged;
+selecting a larger logical body bound does not increase either one.
 
 Core `close(self, now)` consumes a live owner and returns `(Retired, teardown_result)`.
 Drain the retired owner's already accepted messages and best-effort deallocation

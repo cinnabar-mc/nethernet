@@ -1,7 +1,6 @@
 //! Data-channel message framing: segmentation and reassembly (guide section 6.1).
 use crate::error::{ProtocolError, Result};
-
-const MAX_REASSEMBLED_SIZE: usize = 2_560_000;
+use crate::protocol::constants::DEFAULT_MAX_INCOMING_MESSAGE_BYTES;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// One data-channel payload: a count of segments still to come, then the bytes.
@@ -51,15 +50,27 @@ pub struct Message {
     expected_segments: u8,
     data: BytesMut,
     failed: bool,
+    maximum: usize,
 }
 
 impl Message {
     pub fn new() -> Self {
+        Self::with_maximum(DEFAULT_MAX_INCOMING_MESSAGE_BYTES)
+    }
+
+    /// Selects this allocation's complete-body bound without reserving payload storage.
+    pub(crate) fn with_maximum(maximum: usize) -> Self {
         Self {
             expected_segments: 0,
             data: BytesMut::new(),
             failed: false,
+            maximum,
         }
+    }
+
+    /// Shares the selected body bound with the unreliable channel's complete-message check.
+    pub(crate) fn maximum(&self) -> usize {
+        self.maximum
     }
 
     /// Returns the message on its final segment; a framing rejection permanently seals reassembly.
@@ -87,8 +98,10 @@ impl Message {
             self.expected_segments -= 1;
         }
 
-        let size = self.data.len() + segment.data.len();
-        if size > MAX_REASSEMBLED_SIZE {
+        let Some(size) = self.data.len().checked_add(segment.data.len()) else {
+            return self.reject(ProtocolError::MessageSizeExceeded(usize::MAX));
+        };
+        if size > self.maximum {
             return self.reject(ProtocolError::MessageSizeExceeded(size));
         }
 
@@ -172,6 +185,40 @@ mod tests {
     use super::*;
 
     const SEGMENT_PAYLOAD_BYTES: usize = 10_000;
+
+    /// A selected limit reserves no space and a rejected partial message cannot reopen on its suffix.
+    #[test]
+    fn configured_incoming_limit_is_checked_before_append_and_permanently_seals_overflow() {
+        let mut message = Message::with_maximum(3 * 1024 * 1024);
+        assert_eq!(message.data.capacity(), 0);
+        message
+            .add_segment(MessageSegment::new(254, Bytes::from_static(b"a")))
+            .unwrap();
+        assert!(message.data.capacity() < SEGMENT_PAYLOAD_BYTES);
+        let mut message = Message::with_maximum(2);
+        assert!(
+            message
+                .add_segment(MessageSegment::new(1, Bytes::from_static(b"ab")))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            message.add_segment(MessageSegment::new(0, Bytes::from_static(b"c"))),
+            Err(ProtocolError::MessageSizeExceeded(3))
+        ));
+        assert_eq!(message.data.capacity(), 0);
+        assert!(
+            message
+                .add_segment(MessageSegment::new(0, Bytes::from_static(b"d")))
+                .is_err()
+        );
+        let mut zero = Message::with_maximum(0);
+        assert!(matches!(
+            zero.add_segment(MessageSegment::new(0, Bytes::from_static(b"a"))),
+            Err(ProtocolError::MessageSizeExceeded(1))
+        ));
+        assert_eq!(zero.data.capacity(), 0);
+    }
 
     #[test]
     fn explicit_zero_fragment_capacity_refuses_nonempty_bodies_without_panicking() {

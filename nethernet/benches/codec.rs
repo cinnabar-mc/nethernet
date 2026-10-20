@@ -2,6 +2,7 @@
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nethernet::protocol::codec::NetherCodec;
+use nethernet::protocol::constants::LOCAL_SCTP_MAX_MESSAGE_SIZE;
 use nethernet::protocol::packet::discovery::{
     MessagePacket, Packets, RequestPacket, ResponsePacket, ServerData, decode, encode,
 };
@@ -22,8 +23,9 @@ fn pattern(len: usize) -> Bytes {
     (0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>().into()
 }
 
+/// Uses the current advertised SCTP default, excluding the segment-count byte.
 fn wire_segments(data: Bytes) -> Vec<Bytes> {
-    Message::split_into_segments(data)
+    Message::split_into_segments(data, LOCAL_SCTP_MAX_MESSAGE_SIZE as usize - size_of::<u8>())
         .unwrap()
         .iter()
         .map(MessageSegment::encode)

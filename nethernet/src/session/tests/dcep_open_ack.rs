@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Original UDP payloads and routes retained only across the readiness observation.
+type Flight = Vec<(Vec<u8>, SocketAddr)>;
+
 #[derive(Default)]
 struct Facts {
     input_errors: usize,
@@ -10,27 +13,27 @@ struct Facts {
     unexpected: bool,
 }
 
-/// Routes the original encrypted flight, or drops it without decoding or replacing its bytes.
+/// Routes the original encrypted flight, or returns the same bytes for a caller-owned hold.
 fn route<S: Live>(
     source: &mut Session<S>,
     target: &mut Session<S>,
     now: Instant,
     ready: &mut usize,
     messages: &mut Vec<(Channel, Vec<u8>)>,
-    discard: bool,
+    hold: bool,
     facts: &mut Facts,
-) -> (bool, usize) {
+) -> (bool, Flight) {
     let local = source.local_candidate().addr();
     let remote = target.local_candidate().addr();
     let mut progressed = false;
-    let mut discarded = 0;
+    let mut held = Vec::new();
     while let Some(output) = source.poll() {
         progressed = true;
         match output {
             SessionOutput::Send(bytes, to) => {
                 facts.wrong_route |= to != remote;
-                if discard {
-                    discarded += 1;
+                if hold {
+                    held.push((bytes, to));
                 } else {
                     facts.input_errors += usize::from(
                         target
@@ -48,7 +51,7 @@ fn route<S: Live>(
             SessionOutput::SendStream(..) => facts.unexpected = true,
         }
     }
-    (progressed, discarded)
+    (progressed, held)
 }
 
 /// Uses only the original two owners' requested deadlines to progress an otherwise idle exchange.
@@ -71,9 +74,9 @@ fn tick<S: Live>(
     facts.input_errors += usize::from(answerer.handle(SessionInput::Timeout(*now)).is_err());
 }
 
-/// A lost real OPEN flight must not grant the public sending phase before its peer can acknowledge it.
+/// A held real OPEN flight cannot grant sending before the peer can acknowledge its original bytes.
 #[test]
-fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
+fn a_held_dcep_open_is_acknowledged_before_ready_and_first_channel_sends() {
     let mut now = Instant::now();
     let started = now;
     let (mut offerer, offer) = Session::new(addr(40400), true, 1, now).unwrap();
@@ -99,19 +102,19 @@ fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
     let mut facts = Facts::default();
     let mut ready = [0, 0];
     let mut early_ready = None;
-    let mut dropped = 0;
+    let mut held_count = 0;
     let mut unopened_peer = false;
     let mut offerer_messages = Vec::new();
     let mut answerer_messages = Vec::new();
     for _ in 0..5000 {
-        let opening = dropped == 0
+        let opening = held_count == 0
             && offerer.channels.reliable_stream_id.is_some()
             && offerer.channels.unreliable_stream_id.is_some();
         if opening {
             unopened_peer = answerer.channels.reliable_stream_id.is_none()
                 && answerer.channels.unreliable_stream_id.is_none();
         }
-        let (sent, lost) = route(
+        let (sent, withheld) = route(
             &mut offerer,
             &mut answerer,
             now,
@@ -121,8 +124,19 @@ fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
             &mut facts,
         );
         if opening {
-            dropped += lost;
+            held_count += withheld.len();
             early_ready = Some(ready[0]);
+            for (bytes, _) in withheld {
+                facts.input_errors += usize::from(
+                    answerer
+                        .handle(SessionInput::Packet(
+                            bytes.into(),
+                            offerer.local_candidate().addr(),
+                            now,
+                        ))
+                        .is_err(),
+                );
+            }
         }
         let (received, _) = route(
             &mut answerer,
@@ -133,14 +147,14 @@ fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
             false,
             &mut facts,
         );
-        if ready == [1, 1] && dropped > 0 || facts.terminal {
+        if ready == [1, 1] && held_count > 0 || facts.terminal {
             break;
         }
         if !sent && !received {
             tick(&mut offerer, &mut answerer, &mut now, &mut facts);
         }
     }
-    if ready != [1, 1] || dropped == 0 || facts.terminal {
+    if ready != [1, 1] || held_count == 0 || facts.terminal {
         let elapsed = now.saturating_duration_since(started);
         let deadlines = [offerer.poll_timeout(), answerer.poll_timeout()]
             .map(|deadline| deadline.map(|at| at.saturating_duration_since(started)));
@@ -151,7 +165,7 @@ fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
         drop((offerer, answerer));
         assert!(offerer_closed.is_ok() && answerer_closed.is_ok());
         panic!(
-            "the original encrypted handshake did not recover its lost OPEN flight: ready={ready:?}, dropped={dropped}, unopened_peer={unopened_peer}, elapsed={elapsed:?}, deadlines={deadlines:?}, input_errors={}, wrong_route={}, terminal={}, unexpected={}",
+            "the original encrypted handshake did not complete after releasing its held OPEN flight: ready={ready:?}, held={held_count}, unopened_peer={unopened_peer}, elapsed={elapsed:?}, deadlines={deadlines:?}, input_errors={}, wrong_route={}, terminal={}, unexpected={}",
             facts.input_errors, facts.wrong_route, facts.terminal, facts.unexpected
         );
     }
@@ -208,8 +222,8 @@ fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
 
     assert!(offerer_closed.is_ok() && answerer_closed.is_ok());
     assert!(
-        unopened_peer && dropped > 0,
-        "the fixture did not lose the original unopened channel flight"
+        unopened_peer && held_count > 0,
+        "the fixture did not hold the original unopened channel flight"
     );
     assert_eq!(facts.input_errors, 0);
     assert!(!facts.wrong_route && !facts.terminal && !facts.unexpected);
@@ -224,6 +238,6 @@ fn a_lost_dcep_open_recovers_before_ready_and_first_channel_sends() {
     assert_eq!(
         early_ready,
         Some(0),
-        "the lost OPEN granted sending before the peer could acknowledge it"
+        "the held OPEN granted sending before the peer could acknowledge it"
     );
 }

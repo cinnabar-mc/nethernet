@@ -918,6 +918,10 @@ fn drain_dcep_and_data(
     let Some(assoc) = sctp.association_mut() else {
         return Ok(());
     };
+    // An OPEN may precede COOKIE-ACK; retain its stream and data until ACK writes are legal.
+    if assoc.is_handshaking() {
+        return Ok(());
+    }
 
     while let Some(mut stream) = assoc.accept_stream() {
         if let Ok(Some(chunks)) = stream.read()

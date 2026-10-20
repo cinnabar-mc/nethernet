@@ -5,6 +5,7 @@ use std::time::Duration;
 
 mod framing_edges;
 mod incoming_size;
+mod local_close;
 mod negotiated_size;
 mod ready_retirement;
 

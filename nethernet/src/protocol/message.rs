@@ -247,4 +247,23 @@ mod tests {
         ));
         assert!(message.data.is_empty());
     }
+
+    /// A rejected logical message cannot reopen on a later valid-looking suffix.
+    #[test]
+    fn framing_rejection_permanently_seals_reassembly() {
+        let mut message = Message::new();
+        assert!(
+            message
+                .add_segment(MessageSegment::new(2, Bytes::from_static(b"prefix")))
+                .unwrap()
+                .is_none()
+        );
+        let rejected = message.add_segment(MessageSegment::new(0, Bytes::from_static(b"gap")));
+        assert!(rejected.is_err());
+        let successor = message.add_segment(MessageSegment::new(0, Bytes::from_static(b"tail")));
+        assert!(
+            successor.is_err(),
+            "a framing rejection reopened and delivered its suffix"
+        );
+    }
 }

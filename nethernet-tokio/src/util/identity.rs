@@ -108,3 +108,6 @@ mod tests {
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod persistence_tests;

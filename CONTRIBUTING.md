@@ -22,6 +22,18 @@ Run the full test suite, including unit and integration tests:
 cargo test --workspace
 ```
 
+### Go parity tests and benchmarks
+
+Golden and interop tests compare against go-nethernet through `tools/go-peer`; they skip unless
+`NETHERNET_GO_PEER` names a built helper:
+
+```bash
+go build -C tools/go-peer -o /tmp/go-peer . && NETHERNET_GO_PEER=/tmp/go-peer cargo test --workspace
+```
+
+The CI `bench` job runs `go test -C tools/go-peer -run '^$' -bench .` and the criterion benches on one runner,
+then compares them with `go tool bench-compare --go-procs N` from `tools/go-peer`, where N is the `-cpu` value.
+
 ## Pull Requests
 
 1.  Fork the repository.

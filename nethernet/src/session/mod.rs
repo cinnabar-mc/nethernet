@@ -415,6 +415,7 @@ impl<S: Phase> Session<S> {
         self.ice.close(now);
         self.dtls = None;
         self.sctp = None;
+        self.channels.reassembly = Framing::new();
         self.establish_started = None;
         while let Some(output) = self.ice.poll_write()? {
             self.output.push_back(output);
@@ -727,7 +728,16 @@ impl<S: Phase> Session<S> {
                 }
             }
 
-            drain_dcep_and_data(sctp, &mut self.channels, &mut self.output, now)?;
+            match drain_dcep_and_data(sctp, &mut self.channels, &mut self.output, now) {
+                Err(
+                    error
+                    @ (ProtocolError::MessageParse(_) | ProtocolError::MessageSizeExceeded(_)),
+                ) => {
+                    let teardown = self.fail(now);
+                    return Err::<(), _>(error).and(teardown);
+                }
+                result => result?,
+            }
 
             while let Some(packet) = sctp.poll_transmit(now) {
                 dtls.write(&packet, now)?;
@@ -963,25 +973,13 @@ fn drain_dcep_and_data(
                 continue;
             }
 
-            let Ok(segment) = MessageSegment::decode(data.freeze()) else {
-                continue;
+            let segment = MessageSegment::decode(data.freeze())?;
+            let message = match channel {
+                Channel::Reliable => channels.reassembly.add_segment(segment)?,
+                Channel::Unreliable => (segment.remaining_segments == 0).then_some(segment.data),
             };
-
-            match channel {
-                Channel::Reliable => match channels.reassembly.add_segment(segment) {
-                    Ok(Some(message)) => output
-                        .push_back(SessionOutput::Message(Channel::Reliable, message.to_vec())),
-                    Ok(None) => {}
-                    Err(e) => tracing::debug!("dropping malformed reliable segment: {e}"),
-                },
-                Channel::Unreliable => {
-                    if segment.remaining_segments == 0 {
-                        output.push_back(SessionOutput::Message(
-                            Channel::Unreliable,
-                            segment.data.to_vec(),
-                        ));
-                    }
-                }
+            if let Some(message) = message {
+                output.push_back(SessionOutput::Message(channel, message.to_vec()));
             }
         }
     }

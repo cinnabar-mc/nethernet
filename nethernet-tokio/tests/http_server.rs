@@ -11,6 +11,7 @@ use nethernet::prelude::{HttpSignalerConfig, IpRangeSet, ServerIdentity, TokenTr
 #[path = "support/signing.rs"]
 mod signing;
 
+#[path = "http_server/incoming_size.rs"]
 mod incoming_size;
 
 const NETWORK_ID: &str = "1234";

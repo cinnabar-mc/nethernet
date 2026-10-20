@@ -112,7 +112,7 @@ fn datachannel(c: &mut Criterion) {
                     for _ in 0..iters {
                         client.send(data.clone()).await.unwrap();
                         let echoed = client.recv().await.unwrap().unwrap();
-                        assert_eq!(echoed.len(), size);
+                        assert_eq!(echoed, data);
                     }
                     start.elapsed()
                 })

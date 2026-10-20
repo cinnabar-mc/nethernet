@@ -22,10 +22,10 @@ use std::time::Instant;
 const EXPECTED_DIVERGENCES: &[&str] = &[
     // Rust's LAN length prefix excludes the prefix; Go's includes it (go-nethernet 1c5981b).
     "lan-length-prefix",
-    // Message data past the declared length is rejected; Go reads it (go-nethernet 7434dd6).
-    "lan-data-past-declared-length",
     // Better than Go: ServerData versions 4 to 6 decode; Go reads only version 7.
     "server-data-legacy-versions",
+    // Stricter than Go: LAN message data must be valid UTF-8; Go keeps any bytes.
+    "lan-message-utf8",
     // Stricter than Go: game type and connection type must fit a u8.
     "server-data-u8-fields",
     // Error codes 27 to 37 read as SignalingUnknownError (go-nethernet 20af621, f0d2dac).
@@ -220,6 +220,19 @@ fn message_data_past_the_declared_length() {
         "lan-data-past-declared-length",
         rust_decoded(&wire) != go_result,
     );
+}
+
+#[test]
+fn message_data_that_is_not_utf8() {
+    let Some(mut go) = oracle() else { return };
+    let data = [b'C', 0xff, 0xfe, b'!'];
+    let wire = go.bytes(json!({
+        "op": "lan_marshal", "packet": "message", "sender_id": 1, "recipient_id": 2,
+        "data": b64(&data),
+    }));
+    let go_result = go_decoded(&mut go, &wire);
+    assert_eq!(go_result.as_ref().map(|d| d.data.as_slice()), Ok(&data[..]));
+    check("lan-message-utf8", rust_decoded(&wire).is_err());
 }
 
 fn to_go(d: &ServerData) -> Value {

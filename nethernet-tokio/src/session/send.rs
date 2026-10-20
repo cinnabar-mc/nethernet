@@ -89,7 +89,7 @@ impl SessionSender {
         })
     }
 
-    /// Keeps invalid payload rejection before capacity waits, sharing the exact commit validation.
+    /// Rejects invalid bodies before waiting and uses existing queue credit immediately when available.
     async fn send_on(
         &self,
         channel: Channel,
@@ -100,6 +100,12 @@ impl SessionSender {
         self.ready
             .ok_or(NetherError::ConnectionClosed)?
             .check_size(channel, data.len())?;
+        if let Ok(permit) = self.command_tx.try_reserve() {
+            check_open(&self.close_token, deadline)?;
+            let (reply, result) = oneshot::channel();
+            permit.send(Command::Send(channel, data, deadline, reply));
+            return result.await.map_err(|_| NetherError::ConnectionClosed)?;
+        }
         self.reserve_send(deadline)
             .await?
             .commit(channel, data)?

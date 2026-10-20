@@ -522,7 +522,7 @@ impl<S: Phase> Session<S> {
             if Some(packet.transport.local_addr) == self.ice.selected_local_addr()
                 && Some(packet.transport.peer_addr) == self.ice.selected_remote_addr()
             {
-                self.read_dtls(&packet.message, now)?;
+                self.read_dtls(packet.message, now)?;
             }
         }
         Ok(())
@@ -584,16 +584,16 @@ impl<S: Phase> Session<S> {
             } else if Some(packet.transport.local_addr) == self.ice.selected_local_addr()
                 && Some(packet.transport.peer_addr) == self.ice.selected_remote_addr()
             {
-                self.read_dtls(&packet.message, now)?;
+                self.read_dtls(packet.message, now)?;
             }
         }
         self.pump(now)?;
         Ok(())
     }
 
-    fn read_dtls(&mut self, data: &[u8], now: Instant) -> Result<(), ProtocolError> {
+    fn read_dtls(&mut self, data: bytes::BytesMut, now: Instant) -> Result<(), ProtocolError> {
         if let Some(dtls) = &mut self.dtls {
-            let events = dtls.handle_read(data, now)?;
+            let events = dtls.handle_read_owned(data, now)?;
             for event in events {
                 self.handle_dtls_event(event, now)?;
             }
@@ -609,7 +609,7 @@ impl<S: Phase> Session<S> {
         match event {
             EndpointEvent::ApplicationData(data) => {
                 if let Some(sctp) = &mut self.sctp {
-                    sctp.handle_read(&data, now);
+                    sctp.handle_read(data.freeze(), now);
                 }
                 Ok(())
             }
@@ -984,7 +984,7 @@ fn drain_dcep_and_data(
                 }
             };
             if let Some(message) = message {
-                output.push_back(SessionOutput::Message(channel, message.to_vec()));
+                output.push_back(SessionOutput::Message(channel, Vec::from(message)));
             }
         }
     }

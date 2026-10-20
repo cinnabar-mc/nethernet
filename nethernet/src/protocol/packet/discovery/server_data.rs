@@ -148,6 +148,14 @@ impl ServerData {
         })
     }
 
+    /// Encodes a version 7 record into one preallocated buffer.
+    #[inline]
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(self.size_hint());
+        self.serialize(&mut bytes)?;
+        Ok(bytes)
+    }
+
     /// Reads binary records of versions 4 to 7 and rejects trailing bytes.
     /// Encoding always writes version 7.
     pub fn decode(data: &[u8]) -> Result<Self> {
@@ -434,6 +442,7 @@ mod tests {
         let mut encoded = Vec::new();
         data.serialize(&mut encoded).unwrap();
         assert_eq!(encoded, vector);
+        assert_eq!(data.encode().unwrap(), vector);
 
         let decoded = ServerData::decode(vector).unwrap();
         assert_eq!(decoded.server_name, "server");

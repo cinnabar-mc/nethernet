@@ -4,7 +4,6 @@ pub mod error;
 pub mod input;
 pub mod output;
 
-use crate::protocol::codec::NetherCodec;
 use crate::protocol::packet::discovery::{
     MessagePacket, Packets, RequestPacket, ResponsePacket, ServerData, decode, encode,
 };
@@ -198,8 +197,7 @@ impl LanSignaler {
             return Ok(());
         };
 
-        let mut application_data = Vec::new();
-        data.serialize(&mut application_data)?;
+        let application_data = data.encode()?;
         let response = ResponsePacket::new(application_data);
         let buf = encode(&Packets::Response(response), self.network_id)?;
         self.output
@@ -685,8 +683,7 @@ mod tests {
 
     fn response_from(network_id: u64) -> Box<[u8]> {
         let data = ServerData::new("Server".to_string(), "World".to_string());
-        let mut application_data = Vec::new();
-        data.serialize(&mut application_data).unwrap();
+        let application_data = data.encode().unwrap();
         encode(
             &Packets::Response(ResponsePacket::new(application_data)),
             network_id,

@@ -19,11 +19,12 @@ impl MessageSegment {
         }
     }
 
+    #[inline]
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(1 + self.data.len());
-        buf.put_u8(self.remaining_segments);
+        let mut buf = Vec::with_capacity(1 + self.data.len());
+        buf.push(self.remaining_segments);
         buf.extend_from_slice(&self.data);
-        buf.freeze()
+        Bytes::from(buf)
     }
 
     /// Fails below two bytes, so a segment with an empty body is invalid.
@@ -105,6 +106,10 @@ impl Message {
             return self.reject(ProtocolError::MessageSizeExceeded(size));
         }
 
+        if self.data.is_empty() && segment.remaining_segments == 0 {
+            return Ok(Some(segment.data));
+        }
+
         self.data.put(segment.data);
 
         if segment.remaining_segments == 0 {
@@ -125,44 +130,32 @@ impl Message {
     }
 
     /// Splits under the caller's segment-body limit, excluding the header, with at most 255 segments.
-    #[inline(always)]
+    #[inline]
     pub fn split_into_segments(data: Bytes, maximum_payload: usize) -> Result<Vec<MessageSegment>> {
+        Ok(Self::segments(data, maximum_payload)?.collect())
+    }
+
+    /// Visits fragments without allocating a temporary collection of segment descriptors.
+    #[inline]
+    pub fn segments(
+        mut data: Bytes,
+        maximum_payload: usize,
+    ) -> Result<impl ExactSizeIterator<Item = MessageSegment>> {
         let len = data.len();
-
-        if len <= maximum_payload {
-            return Ok(vec![MessageSegment::new(0, data)]);
-        }
-
-        if maximum_payload == 0 {
+        let count = if len <= maximum_payload {
+            1
+        } else if maximum_payload == 0 {
+            return Err(ProtocolError::MessageSizeExceeded(len));
+        } else {
+            len.div_ceil(maximum_payload)
+        };
+        if count > usize::from(u8::MAX) {
             return Err(ProtocolError::MessageSizeExceeded(len));
         }
-        let segment_count = len.div_ceil(maximum_payload);
-
-        if segment_count > usize::from(u8::MAX) {
-            return Err(ProtocolError::MessageSizeExceeded(len));
-        }
-
-        let mut segments = Vec::with_capacity(segment_count);
-
-        let mut remaining = data;
-        let mut left = segment_count as u8;
-
-        while remaining.len() > maximum_payload {
-            left -= 1;
-
-            let chunk = remaining.split_to(maximum_payload);
-
-            segments.push(MessageSegment::new(left, chunk));
-        }
-
-        if !remaining.is_empty() {
-            left -= 1;
-            segments.push(MessageSegment::new(left, remaining));
-        }
-
-        debug_assert_eq!(left, 0);
-
-        Ok(segments)
+        Ok((0..count).rev().map(move |remaining| {
+            let length = data.len().min(maximum_payload);
+            MessageSegment::new(remaining as u8, data.split_to(length))
+        }))
     }
 
     /// Refuses a body beyond the caller's single-segment payload limit, excluding its header.

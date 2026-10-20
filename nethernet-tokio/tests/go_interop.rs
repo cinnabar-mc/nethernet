@@ -78,20 +78,16 @@ async fn reliable_echo_and_rust_close(mut peer: go_peer::GoPeer, mut link: Link)
 /// Receives a complete 20 MB Go message, then observes Go closing promptly.
 async fn large_inbound_and_go_close(mut peer: go_peer::GoPeer, mut link: Link) {
     link.command(&format!("send {LARGE}")).await;
-    link.command("mark").await;
-    let expected = pattern(LARGE);
-    let mut whole = false;
-    while let Some(message) = link.recv().await {
-        if &message[..] == b"!mark" {
-            break;
-        }
-        whole |= message == expected;
-    }
+    let received = link
+        .recv()
+        .await
+        .expect("Go's 20 MB message was not delivered");
+    assert!(
+        received == pattern(LARGE),
+        "Go's 20 MB message was truncated"
+    );
     assert_eq!(peer.event("sent").await["ok"], true);
-    check("reliable-receive-cap", !whole);
-    if !link.sender.is_closed().await {
-        link.command("close").await;
-    }
+    link.command("close").await;
     tokio::time::timeout(STEP, link.sender.closed())
         .await
         .expect("Go's close never reached Rust");

@@ -4,7 +4,7 @@ mod dtls;
 mod ice;
 mod sctp;
 
-use crate::error::ProtocolError;
+use crate::error::ProtocolError::{self, MessageParse, MessageSizeExceeded};
 use crate::phase::{Connecting, Established, Live, Phase, Retired};
 use crate::protocol::constants::{
     LOCAL_SCTP_MAX_MESSAGE_SIZE, MAX_MESSAGE_SIZE, SCTP_MAX_MESSAGE_SIZE,
@@ -588,10 +588,15 @@ impl<S: Phase> Session<S> {
     fn peer_closed(&mut self, now: Instant) -> Result<(), ProtocolError> {
         let mut final_output = std::mem::take(&mut self.output);
         final_output.retain(|output| !matches!(output, SessionOutput::Wait(..)));
+        let received = self.sctp.as_mut().map_or(Ok(()), |sctp| {
+            drain_dcep_and_data(sctp, &mut self.channels, &mut final_output, now)
+        });
+        let terminal = if received.as_ref().is_err_and(framing_error) {
+            SessionEvent::Failed
+        } else {
+            SessionEvent::PeerClosed
+        };
         let flush = (|| {
-            if let Some(sctp) = &mut self.sctp {
-                drain_dcep_and_data(sctp, &mut self.channels, &mut final_output, now)?;
-            }
             if let Some(dtls) = &mut self.dtls {
                 while let Some((data, to)) = dtls.poll_transmit() {
                     self.ice.send_selected(data, to, now)?;
@@ -603,10 +608,10 @@ impl<S: Phase> Session<S> {
             Ok(())
         })();
         // A best-effort reply failure must never keep a removed DTLS association alive.
-        let teardown = self.terminate(SessionEvent::PeerClosed, now);
+        let teardown = self.terminate(terminal, now);
         final_output.append(&mut self.output);
         self.output = final_output;
-        flush.and(teardown)
+        received.and(flush).and(teardown)
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), ProtocolError> {
@@ -657,6 +662,9 @@ impl<S: Phase> Session<S> {
         data: bytes::Bytes,
         now: Instant,
     ) -> Result<(), ProtocolError> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let stream_id = self
             .channels
             .stream_id(channel)
@@ -728,16 +736,11 @@ impl<S: Phase> Session<S> {
                 }
             }
 
-            match drain_dcep_and_data(sctp, &mut self.channels, &mut self.output, now) {
-                Err(
-                    error
-                    @ (ProtocolError::MessageParse(_) | ProtocolError::MessageSizeExceeded(_)),
-                ) => {
-                    let teardown = self.fail(now);
-                    return Err::<(), _>(error).and(teardown);
-                }
-                result => result?,
+            let received = drain_dcep_and_data(sctp, &mut self.channels, &mut self.output, now);
+            if received.as_ref().is_err_and(framing_error) {
+                return received.and(self.fail(now));
             }
+            received?;
 
             while let Some(packet) = sctp.poll_transmit(now) {
                 dtls.write(&packet, now)?;
@@ -800,7 +803,7 @@ impl<S: Phase> Session<S> {
 }
 
 impl Session<Established> {
-    /// Admits application data only on an owner that reached actual readiness.
+    /// Admits data only on actual readiness; empty payloads are successful no-ops.
     pub fn send(
         &mut self,
         channel: Channel,
@@ -921,6 +924,11 @@ fn open_channels_if_controlling(
     }
 
     Ok(())
+}
+
+/// Distinguishes rejected logical message framing from a best-effort transport reply error.
+fn framing_error(error: &ProtocolError) -> bool {
+    matches!(error, MessageParse(_) | MessageSizeExceeded(_))
 }
 
 fn drain_dcep_and_data(

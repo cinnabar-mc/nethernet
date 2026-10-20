@@ -5,7 +5,7 @@ use rtc::datachannel::message::message_channel_ack::DataChannelAck;
 use rtc::datachannel::message::message_channel_open::{
     CHANNEL_PRIORITY_NORMAL, ChannelType, DataChannelOpen,
 };
-use rtc::sctp::PayloadProtocolIdentifier;
+use rtc::sctp::{PayloadProtocolIdentifier, ReliabilityType, Stream};
 use rtc::shared::marshal::{Marshal, Unmarshal};
 
 pub const RELIABLE_CHANNEL_LABEL: &str = "ReliableDataChannel";
@@ -32,6 +32,26 @@ pub fn unreliable_open() -> DataChannelOpen {
         label: UNRELIABLE_CHANNEL_LABEL.as_bytes().to_vec(),
         protocol: Vec::new(),
     }
+}
+
+/// Installs the same local channel declaration on its actual SCTP stream.
+/// RTC keeps DCEP control reliable independently of the binary-message policy.
+pub(super) fn apply_reliability(
+    stream: &mut Stream<'_>,
+    open: &DataChannelOpen,
+) -> Result<(), ProtocolError> {
+    let (unordered, reliability) = match open.channel_type {
+        ChannelType::Reliable => (false, ReliabilityType::Reliable),
+        ChannelType::PartialReliableRexmitUnordered => (true, ReliabilityType::Rexmit),
+        _ => {
+            return Err(ProtocolError::Other(
+                "unsupported local data-channel reliability".into(),
+            ));
+        }
+    };
+    stream
+        .set_reliability_params(unordered, reliability, open.reliability_parameter)
+        .map_err(|error| ProtocolError::Other(format!("{error}")))
 }
 
 pub fn encode_open(open: DataChannelOpen) -> Result<Vec<u8>, ProtocolError> {

@@ -876,6 +876,7 @@ fn open_channels_if_controlling(
         let mut stream = assoc
             .open_stream(stream_id, PayloadProtocolIdentifier::Binary)
             .map_err(|e| ProtocolError::Other(format!("{e}")))?;
+        dcep::apply_reliability(&mut stream, &open)?;
         let encoded = dcep::encode_open(open)?;
         stream
             .write_with_ppi(now, &encoded, dcep::PPI_DCEP)
@@ -914,6 +915,11 @@ fn drain_dcep_and_data(
                 None
             };
             if let Some(channel) = channel {
+                let local = match channel {
+                    Channel::Reliable => dcep::reliable_open(),
+                    Channel::Unreliable => dcep::unreliable_open(),
+                };
+                dcep::apply_reliability(&mut stream, &local)?;
                 let stream_id = stream.stream_identifier();
                 let ack = dcep::encode_ack()?;
                 stream

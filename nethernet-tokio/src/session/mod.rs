@@ -457,7 +457,7 @@ impl Session<Connecting> {
                                 connection.max_message_size(Channel::Reliable),
                                 connection.max_message_size(Channel::Unreliable),
                             ) else {
-                                // Historical Ready cannot mint sending authority after the core retired.
+                                // Actual Ready records these facts before it enters the core FIFO.
                                 continue;
                             };
                             remote_addr = connection.remote_addr();

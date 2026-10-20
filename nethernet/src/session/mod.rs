@@ -99,7 +99,7 @@ struct Channels {
     reliable_stream_id: Option<StreamId>,
     unreliable_stream_id: Option<StreamId>,
     reassembly: Framing,
-    ready_emitted: bool,
+    ready_segment_payload: Option<usize>,
     terminal_emitted: bool,
 }
 
@@ -239,7 +239,7 @@ impl Session<Connecting> {
         reason = "returns the original pending allocation without boxing"
     )]
     pub fn try_establish(self) -> Result<Session<Established>, Self> {
-        if self.channels.ready_emitted {
+        if self.channels.ready_segment_payload.is_some() {
             Ok(self.rephase())
         } else {
             Err(self)
@@ -270,7 +270,7 @@ impl<S: Phase> Session<S> {
 
     /// Whether this exact owner produced the protocol's actual readiness condition.
     pub(crate) fn became_ready(&self) -> bool {
-        self.channels.ready_emitted
+        self.channels.ready_segment_payload.is_some()
     }
 
     /// Drains the original wire, accepted-message and terminal FIFO.
@@ -627,7 +627,7 @@ impl<S: Phase> Session<S> {
     }
 
     fn establish_deadline(&self) -> Option<Instant> {
-        if self.channels.ready_emitted || self.channels.terminal_emitted {
+        if self.channels.ready_segment_payload.is_some() || self.channels.terminal_emitted {
             return None;
         }
         self.establish_started.map(|at| at + self.establish_within)
@@ -704,10 +704,11 @@ impl<S: Phase> Session<S> {
 
         if self.channels.reliable_stream_id.is_some()
             && self.channels.unreliable_stream_id.is_some()
-            && !self.channels.ready_emitted
+            && self.channels.ready_segment_payload.is_none()
             && !self.channels.terminal_emitted
+            && let Some(maximum) = self.segment_payload_size()
         {
-            self.channels.ready_emitted = true;
+            self.channels.ready_segment_payload = Some(maximum);
             self.output
                 .push_back(SessionOutput::Event(SessionEvent::Ready));
         }

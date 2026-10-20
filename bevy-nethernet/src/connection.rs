@@ -142,7 +142,7 @@ impl ActiveConnection {
         output
     }
 
-    /// Reads only the installed size authority of this exact established association.
+    /// Reads the exact core's immutable readiness facts, including after remote retirement.
     pub(crate) fn max_message_size(&self, channel: Channel) -> Option<usize> {
         match self {
             Self::Connecting(_) => None,

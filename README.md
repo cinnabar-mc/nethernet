@@ -44,7 +44,9 @@ original owner is returned unchanged. Application `send` exists only on
 `Established`; control inputs cannot bypass that boundary.
 
 `Session<Established>::max_message_size(channel)` and the corresponding
-`Connection` method report the outgoing body limit of the installed SCTP association.
+`Connection` method report the installed outgoing body limit recorded at actual readiness.
+These immutable facts remain available after remote retirement so delayed readiness
+handoff preserves accepted output; they do not promise liveness or authorize a send.
 Reliable bodies use at most 255 fragments; each fragment reserves one byte for
 NetherNet framing. Unreliable bodies fit one fragment. Later SDP alone does not
 change the installed association's limit. The adapters retain these same facts

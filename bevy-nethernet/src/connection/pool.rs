@@ -503,7 +503,7 @@ fn drive<K: Eq + Hash + Clone + Send + 'static>(
                             entry.connection.max_message_size(Channel::Reliable),
                             entry.connection.max_message_size(Channel::Unreliable),
                         ) else {
-                            // Retain the original prefix and terminal without publishing stale authority.
+                            // Actual Ready records these facts before it enters the core FIFO.
                             continue;
                         };
                         delivery

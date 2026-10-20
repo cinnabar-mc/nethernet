@@ -82,10 +82,12 @@ impl<S: Phase> Session<S> {
 }
 
 impl Session<Established> {
-    /// Maximum logical outgoing body for the active original association, excluding framing.
-    /// Returns None after transport retirement. Later SDP alone cannot change this authority.
+    /// Maximum logical outgoing body recorded at actual readiness, excluding framing.
+    /// These immutable facts survive remote retirement for delayed readiness/output handoff.
+    /// They do not establish liveness; sending still checks expiry and the active transport.
     pub fn max_message_size(&self, channel: Channel) -> Option<usize> {
-        self.segment_payload_size()
+        self.channels
+            .ready_segment_payload
             .map(|maximum| channel.message_capacity(maximum))
     }
 

@@ -139,7 +139,7 @@ impl DrivenConnection {
         }
     }
 
-    /// Reads only the immutable size authority of the same established association.
+    /// Reads immutable facts from the same actual readiness, independently of later retirement.
     pub fn max_message_size(&self, channel: Channel) -> Option<usize> {
         match self.state.as_ref().expect("driver retains its core") {
             ActiveConnection::Connecting(_) => None,

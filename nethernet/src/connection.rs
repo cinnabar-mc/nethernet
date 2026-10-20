@@ -386,7 +386,8 @@ pub enum ConnectionInput {
 }
 
 impl Connection<Established> {
-    /// Maximum outgoing body under the original active association's installed limit.
+    /// Immutable outgoing limit recorded at actual readiness, including after remote retirement.
+    /// This is informational; sends independently check expiry and the active transport.
     pub fn max_message_size(&self, channel: Channel) -> Option<usize> {
         self.session.max_message_size(channel)
     }

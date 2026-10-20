@@ -13,7 +13,8 @@ pub const ID_MESSAGE_PACKET: u16 = 2;
 pub const DEFAULT_MAX_RECEIVED_BYTES: usize = 10_240_000;
 
 /// Default complete incoming application body, independent of outgoing SCTP and retained queues.
-pub const DEFAULT_MAX_INCOMING_MESSAGE_BYTES: usize = 2_560_000;
+pub const DEFAULT_MAX_INCOMING_MESSAGE_BYTES: usize =
+    (LOCAL_SCTP_MAX_MESSAGE_SIZE as usize - 1) * u8::MAX as usize;
 
 /// Cap on any u32-length-prefixed field read or written by the codec.
 pub const MAX_BYTES: usize = 65535;

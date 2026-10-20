@@ -65,6 +65,7 @@ pub struct NetherClient {
     #[cfg(test)]
     pub(crate) offered_sctp_maximum: Option<u32>,
     ice_config: Option<ClientIceConfig>,
+    max_incoming_message_bytes: usize,
     turn_tls: ClientTls,
     connected: bool,
     connecting_deadline: Option<Instant>,
@@ -109,6 +110,8 @@ impl NetherClient {
             #[cfg(test)]
             offered_sctp_maximum: None,
             ice_config: None,
+            max_incoming_message_bytes:
+                nethernet::protocol::constants::DEFAULT_MAX_INCOMING_MESSAGE_BYTES,
             turn_tls: ClientTls::default(),
             connected: false,
             connecting_deadline: None,
@@ -130,6 +133,12 @@ impl NetherClient {
 
     pub fn discovered(&self) -> &HashMap<u64, ServerData> {
         self.signaler.discovered()
+    }
+
+    /// Selects the complete incoming body limit for future attempts, leaving active ones unchanged.
+    /// Zero refuses nonempty bodies; final delivery budgets remain independent.
+    pub fn set_max_incoming_message_size(&mut self, maximum: usize) {
+        self.max_incoming_message_bytes = maximum;
     }
 
     /// Signs outgoing offers with this identity.
@@ -229,6 +238,9 @@ impl NetherClient {
             now,
             &self.turn_tls,
         )?;
+        transport
+            .set_max_incoming_message_size(self.max_incoming_message_bytes)
+            .map_err(std::io::Error::other)?;
         #[cfg(test)]
         if let Some(maximum) = self.offered_sctp_maximum {
             transport.set_offered_sctp_maximum(maximum);

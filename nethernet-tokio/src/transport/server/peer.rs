@@ -213,6 +213,7 @@ impl Peer {
         };
         let establish = self.config.timeouts.establish();
         let mut policy = OfferPolicy::new(ice_mode)
+            .with_max_incoming_message_size(self.config.max_incoming_message_bytes)
             .with_anonymous_offers(self.config.allow_anonymous_offers)
             .with_inferred_peer_candidates(self.config.infer_peer_candidates)
             .with_establish_deadline(establish);

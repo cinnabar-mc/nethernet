@@ -215,6 +215,7 @@ pub struct NetherHttpClient {
     transport: Option<Outbound>,
     gathering: Option<Gathering>,
     ice_config: Option<ClientIceConfig>,
+    max_incoming_message_bytes: usize,
     turn_tls: ClientTls,
     connected: bool,
     connecting_deadline: Option<Instant>,
@@ -242,6 +243,8 @@ impl Default for NetherHttpClient {
             transport: None,
             gathering: None,
             ice_config: None,
+            max_incoming_message_bytes:
+                nethernet::protocol::constants::DEFAULT_MAX_INCOMING_MESSAGE_BYTES,
             turn_tls: ClientTls::default(),
             connected: false,
             connecting_deadline: None,
@@ -266,6 +269,12 @@ impl Default for NetherHttpClient {
 impl NetherHttpClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Selects the complete incoming body limit for future attempts, leaving active ones unchanged.
+    /// Zero refuses nonempty bodies; final delivery budgets remain independent.
+    pub fn set_max_incoming_message_size(&mut self, maximum: usize) {
+        self.max_incoming_message_bytes = maximum;
     }
 
     pub fn set_identity(&mut self, identity: ServerIdentity) {
@@ -429,12 +438,16 @@ impl NetherHttpClient {
         let (target, addr) = self.join_target.clone().ok_or_else(|| {
             std::io::Error::new(ErrorKind::InvalidInput, "join target is not configured")
         })?;
-        self.transport = Some(Outbound::new(
+        let mut transport = Outbound::new(
             self.ice_config.as_ref(),
             self.timeouts.establish(),
             now,
             &self.turn_tls,
-        )?);
+        )?;
+        transport
+            .set_max_incoming_message_size(self.max_incoming_message_bytes)
+            .map_err(std::io::Error::other)?;
+        self.transport = Some(transport);
         self.gathering = Some(Gathering { target, addr });
         self.connecting_deadline = Some(now + self.timeouts.negotiation);
         self.start_gathered_join()

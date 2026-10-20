@@ -53,6 +53,7 @@ pub struct OfferPolicy<'a> {
     infer_peer_candidates: bool,
     ice_mode: IceMode,
     establish_deadline: Option<Duration>,
+    max_incoming_message_bytes: Option<usize>,
 }
 
 impl std::fmt::Debug for OfferPolicy<'_> {
@@ -64,6 +65,10 @@ impl std::fmt::Debug for OfferPolicy<'_> {
             .field("infer_peer_candidates", &self.infer_peer_candidates)
             .field("ice_mode", &self.ice_mode)
             .field("establish_deadline", &self.establish_deadline)
+            .field(
+                "max_incoming_message_bytes",
+                &self.max_incoming_message_bytes,
+            )
             .finish()
     }
 }
@@ -77,12 +82,20 @@ impl<'a> OfferPolicy<'a> {
             infer_peer_candidates: false,
             ice_mode,
             establish_deadline: None,
+            max_incoming_message_bytes: None,
         }
     }
 
     /// Time an answered session has to become ready before it fails; the session default applies when unset.
     pub fn with_establish_deadline(mut self, within: Duration) -> Self {
         self.establish_deadline = Some(within);
+        self
+    }
+
+    /// Selects the complete incoming body bound before the original session accepts its offer.
+    /// Unset preserves that session's current setting; zero refuses nonempty application bodies.
+    pub fn with_max_incoming_message_size(mut self, maximum: usize) -> Self {
+        self.max_incoming_message_bytes = Some(maximum);
         self
     }
 
@@ -213,6 +226,11 @@ impl Admitted<'_> {
         }
         if let Some(within) = self.policy.establish_deadline {
             session.set_establish_deadline(within);
+        }
+        if let Some(maximum) = self.policy.max_incoming_message_bytes {
+            session
+                .set_max_incoming_message_size(maximum)
+                .map_err(AdmissionError::Answer)?;
         }
         let remote_identity = self.remote_description.identity.clone();
         session

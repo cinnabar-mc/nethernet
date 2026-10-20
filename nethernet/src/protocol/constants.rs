@@ -12,6 +12,9 @@ pub const ID_MESSAGE_PACKET: u16 = 2;
 /// Default payload bytes retained by an adapter's final receive owner, independent of wire limits.
 pub const DEFAULT_MAX_RECEIVED_BYTES: usize = 10_240_000;
 
+/// Default complete incoming application body, independent of outgoing SCTP and retained queues.
+pub const DEFAULT_MAX_INCOMING_MESSAGE_BYTES: usize = 2_560_000;
+
 /// Cap on any u32-length-prefixed field read or written by the codec.
 pub const MAX_BYTES: usize = 65535;
 

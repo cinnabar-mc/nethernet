@@ -4,6 +4,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 mod framing_edges;
+mod incoming_size;
 mod negotiated_size;
 mod ready_retirement;
 
@@ -158,10 +159,22 @@ fn connected_pair_with_pending_ready() -> (Session<Established>, Session<Establi
 fn connected_pair_with_sctp_limit(
     maximum: u32,
 ) -> (Session<Established>, Session<Established>, Instant) {
+    connected_pair_with_message_limits(maximum, None)
+}
+
+/// Applies caller receive policy to the original pair before either remote description.
+fn connected_pair_with_message_limits(
+    maximum: u32,
+    incoming: Option<usize>,
+) -> (Session<Established>, Session<Established>, Instant) {
     let mut now = Instant::now();
 
     let (mut offerer, mut offer) = Session::new(addr(40100), true, 1, now).unwrap();
     let (mut answerer, mut answer) = Session::new(addr(40101), false, 2, now).unwrap();
+    if let Some(maximum) = incoming {
+        offerer.set_max_incoming_message_size(maximum).unwrap();
+        answerer.set_max_incoming_message_size(maximum).unwrap();
+    }
     offer.sctp_max_message_size = maximum;
     answer.sctp_max_message_size = maximum;
 

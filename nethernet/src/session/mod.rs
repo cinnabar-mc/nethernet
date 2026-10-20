@@ -162,6 +162,20 @@ pub struct Session<S: Phase = Connecting> {
 pub use dtls::DtlsLayer;
 
 impl Session<Connecting> {
+    /// Selects the incoming complete-body bound before accepting a remote description.
+    /// Zero refuses nonempty application bodies; DCEP and final delivery budgets are independent.
+    /// Refusal leaves this original pending owner and its configuration unchanged.
+    pub fn set_max_incoming_message_size(&mut self, maximum: usize) -> Result<(), ProtocolError> {
+        if self.establish_started.is_some() || self.ice.gathering_state() == GatheringState::Closed
+        {
+            return Err(ProtocolError::Other(
+                "incoming message size must be configured before the remote description".into(),
+            ));
+        }
+        self.channels.reassembly = Framing::with_maximum(maximum);
+        Ok(())
+    }
+
     /// The controlling side is the offerer: it announces the DTLS server role and opens the data channels.
     /// The caller supplies a distinct SDP origin identifier for each local session.
     pub fn new(
@@ -913,7 +927,13 @@ fn drain_dcep_and_data(
             let segment = MessageSegment::decode(data.freeze())?;
             let message = match channel {
                 Channel::Reliable => channels.reassembly.add_segment(segment)?,
-                Channel::Unreliable => (segment.remaining_segments == 0).then_some(segment.data),
+                Channel::Unreliable if segment.remaining_segments != 0 => None,
+                Channel::Unreliable => {
+                    if segment.data.len() > channels.reassembly.maximum() {
+                        return Err(MessageSizeExceeded(segment.data.len()));
+                    }
+                    Some(segment.data)
+                }
             };
             if let Some(message) = message {
                 output.push_back(SessionOutput::Message(channel, message.to_vec()));

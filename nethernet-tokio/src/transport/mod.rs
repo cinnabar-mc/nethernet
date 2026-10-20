@@ -55,6 +55,10 @@ pub struct ServerIceConfig {
 /// Settings shared by NetherClient::connect_with and NetherServer::bind_with.
 #[derive(Clone)]
 pub struct ConnectionConfig {
+    /// Complete incoming application body; independent of negotiated outgoing and final queue limits.
+    /// Defaults to the core's 2,560,000 bytes. Zero refuses nonempty bodies.
+    pub max_incoming_message_bytes: usize,
+
     /// Deadlines for the stages of negotiation.
     pub timeouts: Timeouts,
 
@@ -111,6 +115,8 @@ pub struct ConnectionConfig {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
+            max_incoming_message_bytes:
+                nethernet::protocol::constants::DEFAULT_MAX_INCOMING_MESSAGE_BYTES,
             timeouts: Timeouts::default(),
             cancel_token: CancellationToken::new(),
             attempts: 3,
@@ -133,6 +139,10 @@ impl Default for ConnectionConfig {
 impl fmt::Debug for ConnectionConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionConfig")
+            .field(
+                "max_incoming_message_bytes",
+                &self.max_incoming_message_bytes,
+            )
             .field("timeouts", &self.timeouts)
             .field("attempts", &self.attempts)
             .field("client_ice", &self.client_ice.is_some())

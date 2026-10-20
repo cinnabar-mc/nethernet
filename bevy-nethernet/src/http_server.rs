@@ -107,6 +107,7 @@ pub struct NetherHttpServer {
     warned_unsigned_answers: bool,
     infer_peer_candidates: bool,
     pending_limits: PendingLimits,
+    max_incoming_message_bytes: usize,
     timeouts: Timeouts,
     idle_timeout: Duration,
     tls: ServerTls,
@@ -140,6 +141,8 @@ impl NetherHttpServer {
             warned_unsigned_answers: false,
             infer_peer_candidates: true,
             pending_limits: PendingLimits::default(),
+            max_incoming_message_bytes:
+                nethernet::protocol::constants::DEFAULT_MAX_INCOMING_MESSAGE_BYTES,
             timeouts: Timeouts::default(),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             tls: ServerTls::default(),
@@ -180,6 +183,12 @@ impl NetherHttpServer {
 
     pub fn set_pending_limits(&mut self, limits: PendingLimits) {
         self.pending_limits = limits;
+    }
+
+    /// Selects the complete incoming body limit for future offers; existing allocations retain theirs.
+    /// Zero refuses nonempty bodies; final delivery budgets remain independent.
+    pub fn set_max_incoming_message_size(&mut self, maximum: usize) {
+        self.max_incoming_message_bytes = maximum;
     }
 
     /// Bounds all sessions and final retained payloads together; accepted prefixes are preserved.
@@ -600,6 +609,7 @@ impl NetherHttpServer {
         }
 
         let mut policy = OfferPolicy::new(IceMode::Full)
+            .with_max_incoming_message_size(self.max_incoming_message_bytes)
             .with_inferred_peer_candidates(self.infer_peer_candidates);
         policy = policy.with_establish_deadline(self.timeouts.establish());
         if let Some(identity) = &self.identity {

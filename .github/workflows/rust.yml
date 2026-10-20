@@ -55,10 +55,11 @@ jobs:
           go-version-file: tools/go-peer/go.mod
           cache-dependency-path: tools/go-peer/go.sum
 
-      # Go golden and interop tests skip without this helper.
+      # Go golden and interop tests skip without this helper locally; CI requires it.
       - run: |
           go build -C tools/go-peer -o "$RUNNER_TEMP/go-peer" .
           echo "NETHERNET_GO_PEER=$RUNNER_TEMP/go-peer" >> "$GITHUB_ENV"
+          echo "NETHERNET_REQUIRE_GO_PEER=1" >> "$GITHUB_ENV"
 
       - run: cargo test --workspace
 
@@ -95,7 +96,6 @@ jobs:
           go vet ./...
           go test ./...
 
-  # Not required: some Rust paths are known to be slower than go-nethernet.
   bench:
     runs-on: ubuntu-latest
     steps:
@@ -114,16 +114,28 @@ jobs:
 
       - name: Go benches
         working-directory: tools/go-peer
-        run: go test -run '^$' -bench . -benchmem -count 5 . | tee "$RUNNER_TEMP/go-bench.txt"
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -run '^$' -bench . -benchmem -count 5 . | tee "$RUNNER_TEMP/go-bench.txt"
 
       - name: Rust benches
         run: |
           cargo bench -p nethernet --bench codec
           cargo bench -p nethernet-tokio --bench datachannel
 
+      # Exit 1 (Rust slower beyond the margin) only warns; unreadable input (2) or a missing
+      # measurement (3) fails the job.
       - name: Compare
         working-directory: tools/go-peer
+        shell: bash
         run: |
-          set -o pipefail
+          set +e -o pipefail
           go tool bench-compare --go "$RUNNER_TEMP/go-bench.txt" --criterion "$GITHUB_WORKSPACE/target/criterion" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+          status=$?
+          if [ "$status" -eq 1 ]; then
+            echo "::warning title=bench-compare::Rust is slower than go-nethernet beyond the margin on some paths"
+            exit 0
+          fi
+          exit "$status"

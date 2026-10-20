@@ -136,7 +136,7 @@ func BenchmarkLan(b *testing.B) {
 	}
 }
 
-func BenchmarkServerData(b *testing.B) {
+func BenchmarkServer_data(b *testing.B) {
 	wire := benchInput(b, "server_data.bin")
 	var d discovery.ServerData
 	if err := d.UnmarshalBinary(wire); err != nil {

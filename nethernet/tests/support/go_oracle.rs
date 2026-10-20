@@ -9,6 +9,18 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// Environment variable naming the built `tools/go-peer` binary.
 pub const GO_PEER_ENV: &str = "NETHERNET_GO_PEER";
 
+/// When set, a missing helper fails the test instead of skipping it.
+pub const REQUIRE_GO_PEER_ENV: &str = "NETHERNET_REQUIRE_GO_PEER";
+
+/// Prints the missing-fixture message, or panics when CI requires the helper.
+fn missing_fixture() {
+    let message = format!(
+        "missing fixture {GO_PEER_ENV} (build it with `go build -C tools/go-peer -o <path> .`)"
+    );
+    assert!(std::env::var_os(REQUIRE_GO_PEER_ENV).is_none(), "{message}");
+    eprintln!("skipping: {message}");
+}
+
 pub struct Oracle {
     _child: Child,
     stdin: ChildStdin,
@@ -37,9 +49,7 @@ pub fn oracle() -> Option<MutexGuard<'static, Oracle>> {
     match oracle {
         Some(oracle) => Some(oracle.lock().unwrap_or_else(|e| e.into_inner())),
         None => {
-            eprintln!(
-                "skipping: missing fixture {GO_PEER_ENV} (build it with `go build -C tools/go-peer -o <path> .`)"
-            );
+            missing_fixture();
             None
         }
     }

@@ -762,3 +762,6 @@ mod tests {
 
 #[cfg(test)]
 mod anonymous_answer_tests;
+
+#[cfg(test)]
+mod error_code_tests;

@@ -2,6 +2,7 @@ use super::*;
 use nethernet::connection::IceMode;
 use nethernet::session::Session as SansSession;
 
+mod configured_large_receive;
 mod negotiated_size;
 
 /// Establishes actual UDP/ICE/DTLS/SCTP channels through the concrete session driver.
@@ -47,6 +48,19 @@ async fn connected_pair_with_sctp_limit(
     (Session, SessionReceiver),
     (Session, SessionReceiver, SessionReceiver),
 ) {
+    connected_pair_with_incoming_limit(server, signaling, maximum, None).await
+}
+
+/// Selects the answerer's existing incoming policy before its original remote-description handoff.
+async fn connected_pair_with_incoming_limit(
+    server: Option<Arc<ServerLease>>,
+    signaling: Option<CandidateSignaling>,
+    maximum: u32,
+    incoming: Option<usize>,
+) -> (
+    (Session, SessionReceiver),
+    (Session, SessionReceiver, SessionReceiver),
+) {
     let sockets = [
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
@@ -54,8 +68,11 @@ async fn connected_pair_with_sctp_limit(
     let now = transport_now();
     let (a, mut a_description) =
         SansSession::new(sockets[0].local_addr().unwrap(), true, 1, now).unwrap();
-    let (b, mut b_description) =
+    let (mut b, mut b_description) =
         SansSession::new(sockets[1].local_addr().unwrap(), false, 2, now).unwrap();
+    if let Some(incoming) = incoming {
+        b.set_max_incoming_message_size(incoming).unwrap();
+    }
     a_description.sctp_max_message_size = maximum;
     b_description.sctp_max_message_size = maximum;
     let (mut a, offers) =

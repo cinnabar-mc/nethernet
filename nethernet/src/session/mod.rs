@@ -428,11 +428,12 @@ impl<S: Phase> Session<S> {
 
     /// Materializes the encrypted alert in the same output FIFO while its ICE route still exists.
     fn close_notify(&mut self, now: Instant) -> Result<(), ProtocolError> {
-        if let Some(dtls) = &mut self.dtls {
-            dtls.close(now)?;
-            while let Some((data, to)) = dtls.poll_transmit() {
-                self.ice.send_selected(data, to, now)?;
-            }
+        let Some(dtls) = &mut self.dtls else {
+            return Ok(());
+        };
+        dtls.close(now)?;
+        while let Some((data, to)) = dtls.poll_transmit() {
+            self.ice.send_selected(data, to, now)?;
         }
         while let Some(output) = self.ice.poll_write()? {
             self.output.push_back(output);

@@ -17,7 +17,8 @@ pub fn format_ice_candidate(index: usize, candidate: &Candidate, ufrag: &str) ->
 }
 
 pub fn parse_ice_candidate(data: &str) -> Result<Candidate, ProtocolError> {
-    let raw = data.strip_prefix("candidate:").unwrap_or(data);
+    let raw = data.strip_prefix("a=").unwrap_or(data);
+    let raw = raw.strip_prefix("candidate:").unwrap_or(raw);
     unmarshal_candidate(raw).map_err(|e| ProtocolError::Other(format!("decode candidate: {e}")))
 }
 
@@ -49,7 +50,7 @@ mod tests {
         assert!(formatted.contains(" 192.168.1.10 54321 typ host"));
         assert!(formatted.ends_with("ufrag abcd network-id 0 network-cost 0"));
 
-        let parsed = parse_ice_candidate(&formatted).unwrap();
+        let parsed = parse_ice_candidate(&format!("a={formatted}")).unwrap();
         assert_eq!(parsed.address(), "192.168.1.10");
         assert_eq!(parsed.port(), 54321);
     }

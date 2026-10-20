@@ -100,9 +100,16 @@ impl Signal {
         }
 
         let signal_type = SignalType::from_str(parts[0])?;
-        let connection_id = parts[1]
+        let connection_id = decimal_prefix(parts[1], false)
             .parse::<u64>()
             .map_err(|e| ProtocolError::Other(format!("Failed to parse connection ID: {}", e)))?;
+        if signal_type == SignalType::Error {
+            decimal_prefix(parts[2], true)
+                .parse::<i32>()
+                .map_err(|error| {
+                    ProtocolError::Other(format!("Failed to parse error code: {error}"))
+                })?;
+        }
         let data = parts[2].to_string();
 
         Ok(Self {
@@ -123,5 +130,48 @@ impl fmt::Display for Signal {
             self.connection_id,
             self.data
         )
+    }
+}
+
+/// Reads an ASCII decimal prefix, allowing a leading minus only for signed fields.
+fn decimal_prefix(value: &str, signed: bool) -> &str {
+    let start = usize::from(signed && value.starts_with('-'));
+    let digits = value.as_bytes()[start..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    &value[..start + digits]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_prefixes_preserve_the_original_data_and_reject_overflow() {
+        for (text, id) in [
+            ("CONNECTREQUEST 12tail data", 12),
+            ("CONNECTERROR 0x10 -2147483648suffix", 0),
+            ("CONNECTERROR 18446744073709551615 2147483647tail", u64::MAX),
+        ] {
+            let signal = Signal::from_string(text, "n".into()).unwrap();
+            assert_eq!(signal.connection_id, id);
+            assert_eq!(signal.data, text.splitn(3, ' ').nth(2).unwrap());
+        }
+        for text in [
+            "CONNECTREQUEST +7 data",
+            "CONNECTREQUEST -7 data",
+            "CONNECTREQUEST 18446744073709551616tail data",
+            "CONNECTERROR 1 abc",
+            "CONNECTERROR 1 2147483648tail",
+            "CONNECTERROR 1 -2147483649tail",
+            "CONNECTERROR 1 +7",
+            "CONNECTERROR 1 -",
+            "CONNECTERROR 1  7",
+            "CONNECTERROR 1 ",
+            "CONNECTREQUEST é7 data",
+        ] {
+            assert!(Signal::from_string(text, "n".into()).is_err(), "{text:?}");
+        }
     }
 }

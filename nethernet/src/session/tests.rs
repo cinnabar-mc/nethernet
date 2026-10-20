@@ -138,7 +138,7 @@ fn a_ready_session_never_fails_on_the_deadline() {
 }
 
 /// Returns the real pair with handshake outputs already consumed for existing exchange fixtures.
-fn connected_pair() -> (Session<Established>, Session<Established>, Instant) {
+pub(super) fn connected_pair() -> (Session<Established>, Session<Established>, Instant) {
     let (mut offerer, mut answerer, now) = connected_pair_with_pending_ready();
     while offerer.poll().is_some() {}
     while answerer.poll().is_some() {}

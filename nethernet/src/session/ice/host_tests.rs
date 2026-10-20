@@ -1,6 +1,9 @@
 use super::*;
+use crate::sans::Sans;
+use crate::session::{Channel, SessionEvent, SessionInput};
 use rtc::ice::state::ConnectionState;
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
@@ -92,4 +95,96 @@ fn stun_demux_rejects_non_stun_datagrams() {
     stun_header.extend_from_slice(&0x2112A442u32.to_be_bytes());
     stun_header.extend_from_slice(&[0u8; 12]);
     assert!(is_stun_packet(&stun_header));
+}
+
+/// A real transient ICE state preserves accepted data and the original ready transports.
+#[test]
+fn transient_ice_disconnect_preserves_the_session_and_recovers() {
+    let (mut receiver, mut peer, mut now) = crate::session::tests::connected_pair();
+    let receiver_addr = receiver.ice.selected_local_addr().unwrap();
+    let peer_addr = peer.ice.selected_local_addr().unwrap();
+    let before = b"accepted before the transient gap";
+    let after = b"received after the transient gap";
+    peer.send(Channel::Reliable, bytes::Bytes::from_static(before), now)
+        .unwrap();
+    while let Some(output) = peer.poll() {
+        if let SessionOutput::Send(data, to) = output {
+            assert_eq!(to, receiver_addr);
+            receiver
+                .handle(SessionInput::Packet(data.into(), peer_addr, now))
+                .unwrap();
+        }
+    }
+    assert!(receiver.output.iter().any(|output| matches!(
+        output,
+        SessionOutput::Message(Channel::Reliable, data) if data == before
+    )));
+
+    now += Duration::from_secs(6);
+    receiver.ice.handle_timeout(now).unwrap();
+    assert_eq!(receiver.ice.agent.state(), ConnectionState::Disconnected);
+    receiver.pump(now).unwrap();
+    let remained_live = receiver.gathering_state() != GatheringState::Closed
+        && receiver.dtls.is_some()
+        && receiver.sctp.is_some()
+        && receiver.ice.selected_remote_addr() == Some(peer_addr);
+
+    peer.send(Channel::Reliable, bytes::Bytes::from_static(after), now)
+        .unwrap();
+    let mut received = Vec::new();
+    let mut terminals = 0;
+    for _ in 0..500 {
+        let mut progressed = false;
+        let output: Vec<_> = std::iter::from_fn(|| receiver.poll()).collect();
+        for output in output {
+            progressed = true;
+            match output {
+                SessionOutput::Send(data, to) => {
+                    assert_eq!(to, peer_addr);
+                    peer.handle(SessionInput::Packet(data.into(), receiver_addr, now))
+                        .unwrap();
+                }
+                SessionOutput::Message(Channel::Reliable, data) => received.push(data),
+                SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
+                    terminals += 1;
+                }
+                _ => {}
+            }
+        }
+        let output: Vec<_> = std::iter::from_fn(|| peer.poll()).collect();
+        for output in output {
+            progressed = true;
+            if let SessionOutput::Send(data, to) = output {
+                assert_eq!(to, receiver_addr);
+                receiver
+                    .handle(SessionInput::Packet(data.into(), peer_addr, now))
+                    .unwrap();
+            }
+        }
+        if received.len() == 2 && receiver.ice.agent.state() == ConnectionState::Connected {
+            break;
+        }
+        if !progressed {
+            now += Duration::from_millis(20);
+            receiver.handle(SessionInput::Timeout(now)).unwrap();
+            peer.handle(SessionInput::Timeout(now)).unwrap();
+        }
+    }
+    let recovered = receiver.ice.agent.state() == ConnectionState::Connected;
+    let (mut receiver, receiver_closed) = receiver.close(now);
+    let (mut peer, peer_closed) = peer.close(now);
+    while receiver.poll().is_some() {}
+    while peer.poll().is_some() {}
+    let retired = receiver.gathering_state() == GatheringState::Closed
+        && peer.gathering_state() == GatheringState::Closed;
+    drop((receiver, peer));
+
+    assert!(receiver_closed.is_ok() && peer_closed.is_ok() && retired);
+    assert!(
+        remained_live,
+        "a transient ICE state retired the original session"
+    );
+    assert_eq!(received, vec![before.to_vec(), after.to_vec()]);
+    assert_eq!(terminals, 0);
+    assert!(recovered, "the original ICE agent did not recover");
 }

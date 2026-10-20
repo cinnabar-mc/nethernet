@@ -387,7 +387,8 @@ impl<S: Phase> Session<S> {
         Ok(())
     }
 
-    /// Cancels gathering, checks and relay timers immediately. Drain best-effort deallocation sends before dropping.
+    /// Queues DTLS peer closure, then cancels gathering, checks and relay timers immediately.
+    /// Drain the original best-effort close and deallocation sends before dropping.
     pub fn close(mut self, now: Instant) -> (Session<Retired>, Result<(), ProtocolError>)
     where
         S: Live,
@@ -402,10 +403,26 @@ impl<S: Phase> Session<S> {
                 SessionOutput::Message(..) | SessionOutput::Event(..)
             )
         });
-        let result = self.close_transport(now);
+        let notification = self.close_notify(now);
+        accepted.append(&mut self.output);
+        let teardown = self.close_transport(now);
         accepted.append(&mut self.output);
         self.output = accepted;
-        (self.rephase(), result)
+        (self.rephase(), notification.and(teardown))
+    }
+
+    /// Materializes the encrypted alert in the same output FIFO while its ICE route still exists.
+    fn close_notify(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        if let Some(dtls) = &mut self.dtls {
+            dtls.close(now)?;
+            while let Some((data, to)) = dtls.poll_transmit() {
+                self.ice.send_selected(data, to, now)?;
+            }
+        }
+        while let Some(output) = self.ice.poll_write()? {
+            self.output.push_back(output);
+        }
+        Ok(())
     }
 
     /// Retires the engine while keeping its owner available to drain teardown output.

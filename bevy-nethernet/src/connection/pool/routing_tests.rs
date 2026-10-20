@@ -240,6 +240,7 @@ fn two_secured_sessions_share_one_udp_socket_without_delivery_or_retirement_inte
     let mut received = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     let explicitly_retired = std::cell::Cell::new(false);
+    let retired_peer_closed = std::cell::Cell::new(false);
     let mut buffer = [0; 65536];
     // Socket delivery is real; only this test's finite scheduling loop is caller-driven.
     let mut drive = |pool: &mut SessionPool<u8>,
@@ -247,7 +248,10 @@ fn two_secured_sessions_share_one_udp_socket_without_delivery_or_retirement_inte
                      ready: &mut HashMap<u8, Readiness>,
                      received: &mut Vec<(u8, Vec<u8>)>| {
         let now = Instant::now();
-        for (socket, peer, messages) in peers {
+        for (id, (socket, peer, messages)) in peers.iter_mut().enumerate() {
+            if id == 0 && retired_peer_closed.get() {
+                continue;
+            }
             while let Ok((size, from)) = socket.recv_from(&mut buffer) {
                 peer.receive(from, buffer[..size].to_vec(), now);
             }
@@ -272,6 +276,11 @@ fn two_secured_sessions_share_one_udp_socket_without_delivery_or_retirement_inte
                         panic!("host-only pool emitted stream traffic")
                     }
                     SessionOutput::Event(SessionEvent::Ready) => peer.ready = true,
+                    SessionOutput::Event(SessionEvent::PeerClosed)
+                        if id == 0 && explicitly_retired.get() && !retired_peer_closed.get() =>
+                    {
+                        retired_peer_closed.set(true);
+                    }
                     SessionOutput::Event(SessionEvent::Failed | SessionEvent::PeerClosed) => {
                         panic!("shared-socket peer failed")
                     }
@@ -370,10 +379,16 @@ fn two_secured_sessions_share_one_udp_socket_without_delivery_or_retirement_inte
         .unwrap();
     // The retired peer's unrelated bytes must not become the survivor's data.
     peers[0].0.send_to(b"retired peer datagram", local).unwrap();
-    while Instant::now() < deadline && (received.len() != 3 || peers[1].2.len() != 2) {
+    while Instant::now() < deadline
+        && (received.len() != 3 || peers[1].2.len() != 2 || !retired_peer_closed.get())
+    {
         drive(&mut pool, &mut peers, &mut ready, &mut received);
     }
     assert_eq!(received.last(), Some(&(1, b"still active".to_vec())));
     assert_eq!(peers[1].2.last().map(Vec::as_slice), Some(&b"survivor"[..]));
     assert_eq!(peers[0].2.len(), 1);
+    assert!(
+        retired_peer_closed.get(),
+        "the explicitly removed peer did not receive its original transport close"
+    );
 }

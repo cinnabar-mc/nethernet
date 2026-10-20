@@ -3,6 +3,8 @@ use bytes::Bytes;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+mod framing_edges;
+
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
 }

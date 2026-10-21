@@ -1,5 +1,8 @@
 mod negotiation;
 
+#[cfg(test)]
+mod establish_failure_tests;
+
 use crate::addr::Addr;
 use crate::error::{NetherError, Result, SignalErrorCode};
 use crate::protocol::{Signal, SignalType};

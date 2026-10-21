@@ -21,6 +21,12 @@ use tokio_rustls::TlsConnector;
 /// Requested receive space for an SCTP flight and the kernel overhead of its datagrams.
 const UDP_RECEIVE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+#[cfg(test)]
+type HeldDatagram = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 pub(crate) enum IceEvent {
     Datagram(Box<[u8]>, SocketAddr),
     Activated(TurnStreamId, TurnStreamRoute),
@@ -54,6 +60,8 @@ pub(crate) struct IceIo {
     streams: Vec<(TurnStreamId, Carrier)>,
     buffer: Box<[u8]>,
     cursor: usize,
+    #[cfg(test)]
+    datagram_gate: std::sync::Mutex<Option<HeldDatagram>>,
 }
 impl From<Arc<UdpSocket>> for IceIo {
     fn from(udp: Arc<UdpSocket>) -> Self {
@@ -63,6 +71,8 @@ impl From<Arc<UdpSocket>> for IceIo {
             streams: Vec::new(),
             buffer: vec![0; MAX_DATAGRAM_SIZE].into_boxed_slice(),
             cursor: 0,
+            #[cfg(test)]
+            datagram_gate: std::sync::Mutex::new(None),
         }
     }
 }
@@ -78,6 +88,20 @@ fn configure_receive_buffer(udp: &UdpSocket) {
 }
 
 impl IceIo {
+    /// Holds only the next original UDP send future; no readiness, packets or terminal are supplied.
+    #[cfg(test)]
+    pub(crate) fn hold_next_datagram(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, observing) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *self.datagram_gate.get_mut().unwrap() = Some((entered, released));
+        (observing, release)
+    }
+
     /// Validates the complete bounded configuration before starting any independent target.
     pub fn configured(
         udp: Arc<UdpSocket>,
@@ -231,6 +255,14 @@ impl IceIo {
     }
 
     pub async fn send_datagram(&self, data: &[u8], to: SocketAddr) -> Result<()> {
+        #[cfg(test)]
+        {
+            let gate = self.datagram_gate.lock().unwrap().take();
+            if let Some((entered, released)) = gate {
+                let _ = entered.send(());
+                let _ = released.await;
+            }
+        }
         self.udp.send_to(data, to).await?;
         Ok(())
     }

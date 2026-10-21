@@ -2,6 +2,7 @@ use super::*;
 use nethernet::connection::IceMode;
 use nethernet::session::Session as SansSession;
 
+mod blocked_datagram;
 mod configured_large_receive;
 mod negotiated_size;
 

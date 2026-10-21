@@ -440,8 +440,14 @@ impl Session<Connecting> {
                     };
                     match output {
                         SessionOutput::Send(data, to) => {
-                            if let Err(e) = io.send_datagram(&data, to).await {
-                                tracing::debug!("send_to error: {e}");
+                            tokio::select! {
+                                biased;
+                                _ = close_token.cancelled() => break 'drive Terminal::Eof,
+                                result = io.send_datagram(&data, to) => {
+                                    if let Err(e) = result {
+                                        tracing::debug!("send_to error: {e}");
+                                    }
+                                }
                             }
                         }
                         SessionOutput::SendStream(data, route) => {

@@ -524,6 +524,8 @@ impl Session<Connecting> {
                 terminal,
                 reliable_open,
             );
+            // Release transport sockets before a terminal can wake the next connection attempt.
+            drop(guard);
             packet_tx.finish(terminal);
             unreliable_tx.finish(terminal);
             close_token.cancel();

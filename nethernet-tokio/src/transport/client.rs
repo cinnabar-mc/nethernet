@@ -341,13 +341,14 @@ impl NetherClient {
         let local = Addr::new(signaling.network_id(), connection_id);
         let remote = Addr::new(remote_network_id.to_string(), connection_id);
 
-        let (session, reliable, unreliable, ready_rx) = Session::<Connecting>::spawn_with_signaling(
-            io,
-            connection,
-            local,
-            remote,
-            Some((signaling.clone(), config.timeouts.negotiation)),
-        );
+        let (session, mut reliable, mut unreliable, ready_rx) =
+            Session::<Connecting>::spawn_with_signaling(
+                io,
+                connection,
+                local,
+                remote,
+                Some((signaling.clone(), config.timeouts.negotiation)),
+            );
 
         spawn_late_signal_forwarder(
             incoming,
@@ -365,8 +366,19 @@ impl NetherClient {
                     Some(SignalErrorCode::NegotiationTimeoutWaitingForAccept),
                     NetherError::Timeout,
                 )
-            })?
-            .map_err(|_| (None, NetherError::ConnectionClosed))?;
+            })
+            .and_then(|ready| ready.map_err(|_| (None, NetherError::ConnectionClosed)));
+        let ready = match ready {
+            Ok(ready) => ready,
+            Err(failure) => {
+                drop(session.close());
+                // Both original terminals follow actor-owned ICE destruction and its accepted prefix.
+                for receiver in [&mut reliable, &mut unreliable] {
+                    while matches!(receiver.recv().await, Ok(Some(_))) {}
+                }
+                return Err(failure);
+            }
+        };
 
         let mut client = Self::from_session(session.establish(ready), reliable, unreliable);
         client.server_public_key = server_public_key;

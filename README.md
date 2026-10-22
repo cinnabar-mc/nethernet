@@ -138,6 +138,10 @@ messages use the negotiated transport, not the HTTP connection.
 
 ## License and upstream
 
-Apache-2.0; see [LICENSE](LICENSE). This fork continues the
+The original implementation and this fork retain [Apache-2.0](LICENSE). This fork continues the
 [bedrock-crustaceans/nethernet](https://github.com/bedrock-crustaceans/nethernet)
 project.
+
+Cinnabar contributors also offer their own contributions and modifications under
+[MIT](LICENSE-MIT-CINNABAR). That grant covers their authored portions; upstream
+code and third-party material keep their original terms. See [NOTICE](NOTICE).

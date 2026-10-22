@@ -1,4 +1,28 @@
-//! Sans-io NetherNet: signaling, identity, session and framing state machines with no I/O of their own.
+//! NetherNet protocol state for applications that own their sockets and event loop.
+//!
+//! Use [`session::Session`] to exchange messages after signaling, or
+//! [`connection::Connection`] to also handle offer, answer, and candidate signals.
+//! Feed input through [`sans::Sans::handle`] and drain every output with `poll`.
+//! Your loop performs the I/O and supplies monotonic time; the core starts no tasks.
+//!
+//! # Create a host-only session
+//!
+//! ```no_run
+//! use nethernet::session::Session;
+//! use std::{net::UdpSocket, time::Instant};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let socket = UdpSocket::bind("127.0.0.1:0")?;
+//! let (session, description) = Session::new(socket.local_addr()?, true, 1, Instant::now())?;
+//! let offer_sdp = description.encode_full(session.local_candidates());
+//! // Sign and exchange the offer using your signaling channel, then drive the session.
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The [custom event-loop guide](https://github.com/cinnabar-mc/nethernet/blob/main/docs/sans-io.md)
+//! covers packets, timers, identity checks, and readiness. For socket-owning APIs,
+//! use `nethernet-tokio` or `bevy-nethernet`.
 pub mod admission;
 pub mod connection;
 pub mod error;

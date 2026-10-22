@@ -75,10 +75,12 @@ pub struct ConnectionConfig {
     /// Optional configured accepting paths; None preserves host-only HTTP/LAN behavior.
     pub server_ice: Option<ServerIceConfig>,
 
-    /// Signs local SDP: ClientIdentity for offers or ServerIdentity for answers.
+    /// Signs local SDP with an application-supplied identity.
+    /// Use SelfSignedIdentity or TokenIdentity for client offers, or ServerIdentity for answers.
     pub identity: Option<Arc<dyn SdpIdentity>>,
 
-    /// Answers without a signature, which the vanilla client refuses (guide section 5.2).
+    /// Allows HTTP and caller-signaling servers to answer without a signing identity.
+    /// The default requires one; this does not change the remote peer's trust policy.
     pub allow_unsigned_answers: bool,
 
     /// How the server authenticates offers; None skips validation.

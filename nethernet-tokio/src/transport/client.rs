@@ -113,7 +113,11 @@ impl Stream for SessionStream {
     }
 }
 
-/// Client connection; AsyncRead and AsyncWrite use the reliable channel.
+/// An established client connection with reliable and unreliable message APIs.
+///
+/// Use [`send`](Self::send) and [`recv`](Self::recv) to preserve message boundaries.
+/// `AsyncRead` and `AsyncWrite` expose the reliable channel as a byte stream.
+/// Retain this owner while using a shared [`SessionSender`]; dropping it requests closure.
 pub struct NetherClient {
     session: Session,
     server_public_key: Option<VerifyingKey>,
@@ -124,6 +128,8 @@ pub struct NetherClient {
 }
 
 impl NetherClient {
+    /// Connects to a discovered LAN network ID or an HTTP server URL with default settings.
+    /// Use [`connect_with`](Self::connect_with) to choose identity, trust, ICE, and deadlines.
     pub async fn connect(
         signaling: impl Into<ClientSignaling>,
         remote_network_id: String,
@@ -406,14 +412,17 @@ impl NetherClient {
         self.server_public_key.as_ref()
     }
 
+    /// Admits one complete reliable message; success does not acknowledge peer receipt.
     pub async fn send(&self, data: Bytes) -> Result<()> {
         self.session.send(data).await
     }
 
+    /// Admits one unordered message without retransmission; it must fit one segment.
     pub async fn send_unreliable(&self, data: Bytes) -> Result<()> {
         self.session.send_unreliable(data).await
     }
 
+    /// Receives the next complete unreliable message, or `None` after closure.
     pub async fn recv_unreliable(&mut self) -> Result<Option<Bytes>> {
         self.unreliable.recv().await
     }

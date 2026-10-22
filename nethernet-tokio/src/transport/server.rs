@@ -36,6 +36,8 @@ pub struct NetherServer {
 }
 
 impl NetherServer {
+    /// Accepts peers from this signaling backend using default connection settings.
+    /// For HTTP or caller signaling, use [`bind_with`](Self::bind_with) to supply an identity.
     pub async fn bind(signaling: impl Into<ServerSignaling>) -> Result<Self> {
         Self::bind_with(signaling, ConnectionConfig::default()).await
     }

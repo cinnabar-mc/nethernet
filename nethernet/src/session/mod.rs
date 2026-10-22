@@ -34,7 +34,7 @@ const MAX_EARLY_PACKETS: usize = 8;
 const UNRELIABLE_STREAM_ID: StreamId = 3;
 const DEFAULT_ESTABLISH_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Reliable messages are segmented; unreliable ones must fit one segment (guide section 6.1).
+/// Selects ordered reliable messages or unordered messages without retransmission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     Reliable,

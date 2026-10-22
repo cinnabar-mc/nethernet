@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
 const DEFAULT_ATTEMPTS: u32 = 3;
 
+/// Advances a LAN client and publishes its connection messages in `PreUpdate`.
 pub struct NetherClientPlugin;
 
 impl Plugin for NetherClientPlugin {
@@ -57,6 +58,7 @@ pub enum NetherClientEvent {
     Disconnected,
 }
 
+/// Discovers LAN servers and owns one outbound connection; send through `established()`.
 #[derive(Resource)]
 pub struct NetherClient {
     signaler: LanSignaler,

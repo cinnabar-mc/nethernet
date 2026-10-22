@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 const MAX_ACCEPTS_PER_TICK: usize = 64;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Advances the HTTP listener and publishes server connection messages in `PreUpdate`.
 pub struct NetherHttpServerPlugin;
 
 impl Plugin for NetherHttpServerPlugin {
@@ -95,6 +96,7 @@ struct SessionEntry {
     host: Option<String>,
 }
 
+/// Serves HTTP signaling and accepts peers with an application-selected identity policy.
 #[derive(Resource)]
 pub struct NetherHttpServer {
     listener: TcpListener,
@@ -161,12 +163,13 @@ impl NetherHttpServer {
         self.idle_timeout = idle_timeout;
     }
 
-    /// Signs answers, which the vanilla client requires (guide section 5.2).
+    /// Sets the signer for later answers; without it joins are refused by default.
     pub fn set_identity(&mut self, identity: ServerIdentity) {
         self.identity = Some(identity);
     }
 
-    /// Without an identity, answers joins unsigned instead of refusing with 503; vanilla clients refuse them.
+    /// Allows unsigned answers when no identity is set, instead of refusing joins with 503.
+    /// A configured identity still signs; the peer chooses whether to accept unsigned answers.
     pub fn allow_unsigned_answers(&mut self, allow: bool) {
         self.allow_unsigned_answers = allow;
     }

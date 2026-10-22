@@ -21,6 +21,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+/// Advances an HTTP client and publishes its connection messages in `PreUpdate`.
 pub struct NetherHttpClientPlugin;
 
 impl Plugin for NetherHttpClientPlugin {
@@ -208,6 +209,7 @@ struct Query {
 
 const DEFAULT_ATTEMPTS: u32 = 3;
 
+/// Queries a known HTTP endpoint and owns one outbound connection.
 #[derive(Resource)]
 pub struct NetherHttpClient {
     join: Option<Join>,

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 const MAX_DATAGRAMS_PER_TICK: usize = 1024;
 
+/// Advances LAN discovery and publishes server connection messages in `PreUpdate`.
 pub struct NetherServerPlugin;
 
 impl Plugin for NetherServerPlugin {
@@ -99,6 +100,7 @@ struct SessionEntry {
     player: Option<Arc<PlayerInfo>>,
 }
 
+/// Accepts LAN peers and exposes established session IDs for sending and closing.
 #[derive(Resource)]
 pub struct NetherServer {
     signaler: LanSignaler,

@@ -4,6 +4,10 @@ NetherNet connects peers and sends reliable or unreliable application messages.
 Discover a server on your LAN, connect to a known HTTP endpoint, or carry
 connection signals through your existing messaging service.
 
+This is an independently maintained hard fork of
+[bedrock-crustaceans/nethernet](https://github.com/bedrock-crustaceans/nethernet).
+Use it to build Minecraft: Bedrock Edition LAN and Xbox Live connections.
+
 Use it to add NetherNet transport to an application. For Minecraft Login,
 packet codecs, and gameplay, use a higher layer such as
 [bedrock-net](https://github.com/cinnabar-mc/bedrock-net).

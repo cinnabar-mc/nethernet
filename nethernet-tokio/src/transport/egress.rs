@@ -35,8 +35,22 @@ impl fmt::Debug for EgressPolicy {
 
 /// Reconstructs a terminal refusal without retaining an endpoint or caller closure.
 pub(crate) fn denied() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "transport destination refused",
-    )
+    io::Error::new(io::ErrorKind::PermissionDenied, PolicyRefused)
 }
+
+/// Distinguishes the caller's refusal from an OS permission error on one candidate.
+pub(crate) fn is_denied(error: &crate::error::NetherError) -> bool {
+    matches!(error, crate::error::NetherError::Io(error)
+        if error.get_ref().is_some_and(|source| source.is::<PolicyRefused>()))
+}
+
+#[derive(Debug)]
+struct PolicyRefused;
+
+impl fmt::Display for PolicyRefused {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("transport destination refused")
+    }
+}
+
+impl std::error::Error for PolicyRefused {}

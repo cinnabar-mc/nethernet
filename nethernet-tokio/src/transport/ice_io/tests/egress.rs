@@ -68,3 +68,17 @@ async fn egress_policy_checks_tcp_and_tls_before_connecting() {
         assert!(listener.accept().now_or_never().is_none(), "a denied attempt opened another connection");
     }).await.unwrap();
 }
+
+/// Revocation on the original secured TURN actor preserves accepted data and one typed terminal.
+#[tokio::test]
+async fn egress_revocation_on_tcp_and_tls_drains_prefix_before_permission_denied() {
+    for tls in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            secured_actor_pair(listener, tls, true),
+        )
+        .await
+        .expect("policy revocation did not retire the original secured TURN actor");
+    }
+}

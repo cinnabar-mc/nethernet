@@ -205,7 +205,7 @@ async fn service_pair(
     );
 }
 
-async fn secured_actor_pair(listener: TcpListener, tls: bool) {
+async fn secured_actor_pair(listener: TcpListener, tls: bool, revoke_egress: bool) {
     let addr = listener.local_addr().unwrap();
     let (server_tls, client_tls) = tls_pair();
     let security = if tls {
@@ -220,6 +220,7 @@ async fn secured_actor_pair(listener: TcpListener, tls: bool) {
     let service = service_pair(listener, tls.then_some(server_tls), done.clone(), refreshed);
     let pair = async {
         let mut gathered = Vec::new();
+        let admitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
         for controlling in [true, false] {
             // Explicit wildcard UDP is deliberately not a TCP interface selection.
             let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
@@ -227,7 +228,14 @@ async fn secured_actor_pair(listener: TcpListener, tls: bool) {
                 policy: IcePolicy::RelayOnly,
                 ..Default::default()
             };
+            let policy = (controlling && revoke_egress).then(|| {
+                let admitted = Arc::clone(&admitted);
+                crate::EgressPolicy::new(move |_| {
+                    admitted.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            });
             let (io, config) = IceIo::from(udp.clone())
+                .with_egress_policy(policy)
                 .configured(
                     &config,
                     &[target(addr, security.clone())],
@@ -443,7 +451,28 @@ async fn secured_actor_pair(listener: TcpListener, tls: bool) {
             a_rx.recv().await.unwrap().unwrap(),
             "verified original actor reply"
         );
-        a.sender().close().await.unwrap();
+        if revoke_egress {
+            b.send(Bytes::from_static(b"accepted before policy revocation"))
+                .await
+                .unwrap();
+            while a_rx.accepted_packets() == 0 {
+                assert!(!a.is_closed().await);
+                tokio::task::yield_now().await;
+            }
+            admitted.store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = a
+                .send(Bytes::from_static(b"refused after revocation"))
+                .await;
+            assert_eq!(
+                a_rx.recv().await.unwrap().unwrap(),
+                "accepted before policy revocation"
+            );
+            let error = a_rx.recv().await.unwrap_err();
+            assert!(crate::transport::egress::is_denied(&error));
+            assert!(a_rx.recv().await.unwrap().is_none());
+        } else {
+            a.sender().close().await.unwrap();
+        }
         b.sender().close().await.unwrap();
         done.cancel();
     };
@@ -468,9 +497,12 @@ async fn tcp_and_verified_tls_turn_keep_original_sockets_through_actor_and_refre
                 }
                 Err(error) => panic!("controlled loopback listener unavailable: {error}"),
             };
-            tokio::time::timeout(Duration::from_secs(10), secured_actor_pair(listener, tls))
-                .await
-                .expect("finite actual TURN actor pair stalled");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                secured_actor_pair(listener, tls, false),
+            )
+            .await
+            .expect("finite actual TURN actor pair stalled");
         }
     }
 }

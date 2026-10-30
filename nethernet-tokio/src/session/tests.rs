@@ -4,6 +4,7 @@ use nethernet::session::Session as SansSession;
 
 mod blocked_datagram;
 mod configured_large_receive;
+mod egress;
 mod negotiated_size;
 
 /// Establishes actual UDP/ICE/DTLS/SCTP channels through the concrete session driver.
@@ -62,6 +63,20 @@ async fn connected_pair_with_incoming_limit(
     (Session, SessionReceiver),
     (Session, SessionReceiver, SessionReceiver),
 ) {
+    connected_pair_with_send_error(server, signaling, maximum, incoming, None).await
+}
+
+/// Keeps the original cores and actor I/O while supplying one platform send failure.
+async fn connected_pair_with_send_error(
+    server: Option<Arc<ServerLease>>,
+    signaling: Option<CandidateSignaling>,
+    maximum: u32,
+    incoming: Option<usize>,
+    send_error: Option<std::io::Error>,
+) -> (
+    (Session, SessionReceiver),
+    (Session, SessionReceiver, SessionReceiver),
+) {
     let sockets = [
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
@@ -91,8 +106,12 @@ async fn connected_pair_with_incoming_limit(
     .unwrap();
     a.handle(ConnectionInput::Signal(answers[0].clone(), now))
         .unwrap();
+    let mut a_io = IceIo::from(sockets[0].clone());
+    if let Some(error) = send_error {
+        a_io.fail_next_datagram(error);
+    }
     let (a, a_reliable, _a_unreliable, a_ready) =
-        Session::<Connecting>::spawn(sockets[0].clone(), a, Addr::default(), Addr::default());
+        Session::<Connecting>::spawn(a_io, a, Addr::default(), Addr::default());
     let (b, b_reliable, b_unreliable, b_ready) = match (server, signaling) {
         (Some(lease), Some(signaling)) => Session::<Connecting>::spawn_for_server_with_signaling(
             sockets[1].clone(),

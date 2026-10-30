@@ -64,6 +64,8 @@ pub(crate) struct IceIo {
     cursor: usize,
     #[cfg(test)]
     datagram_gate: std::sync::Mutex<Option<HeldDatagram>>,
+    #[cfg(test)]
+    datagram_error: std::sync::Mutex<Option<std::io::Error>>,
 }
 impl From<Arc<UdpSocket>> for IceIo {
     fn from(udp: Arc<UdpSocket>) -> Self {
@@ -76,6 +78,8 @@ impl From<Arc<UdpSocket>> for IceIo {
             cursor: 0,
             #[cfg(test)]
             datagram_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            datagram_error: std::sync::Mutex::new(None),
         }
     }
 }
@@ -117,6 +121,12 @@ impl IceIo {
         let (release, released) = tokio::sync::oneshot::channel();
         *self.datagram_gate.get_mut().unwrap() = Some((entered, released));
         (observing, release)
+    }
+
+    /// Supplies one OS send error to the original actor without changing candidate output.
+    #[cfg(test)]
+    pub(crate) fn fail_next_datagram(&mut self, error: std::io::Error) {
+        *self.datagram_error.get_mut().unwrap() = Some(error);
     }
 
     /// Validates the complete bounded configuration before starting any independent target.
@@ -172,11 +182,7 @@ impl IceIo {
                     });
                     io.streams.push((id, carrier));
                 }
-                Err(crate::error::NetherError::Io(error))
-                    if error.kind() == std::io::ErrorKind::PermissionDenied =>
-                {
-                    return Err(error.into());
-                }
+                Err(error) if crate::transport::egress::is_denied(&error) => return Err(error),
                 Err(error) => tracing::debug!(%error, "TURN stream target could not start"),
             }
         }
@@ -295,6 +301,10 @@ impl IceIo {
             }
         }
         self.check_egress(to)?;
+        #[cfg(test)]
+        if let Some(error) = self.datagram_error.lock().unwrap().take() {
+            return Err(error.into());
+        }
         self.udp.send_to(data, to).await?;
         Ok(())
     }

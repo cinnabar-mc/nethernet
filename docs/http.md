@@ -176,9 +176,11 @@ HTTP answer and negotiation time for gathering to finish.
 Services that connect on behalf of untrusted users can set
 `ConnectionConfig::egress_policy` to an `EgressPolicy`. The callback receives the
 actual numeric UDP destination or TCP/TLS TURN endpoint before I/O. The same
-policy remains installed for gathering, established traffic and cleanup; a live
-refusal retires the connection while preserving already accepted input. The
-default leaves routing unrestricted for ordinary clients and LAN connections.
+policy remains installed for gathering, established traffic and cleanup. Each
+physical write rechecks it, including resumed UDP sends, retained TURN frames
+and TLS control output. A live refusal retires the connection while preserving
+already accepted input. The default leaves routing unrestricted for ordinary
+clients and LAN connections.
 
 This transport policy does not configure the HTTP signaling client. A gateway
 must separately admit and pin its HTTP resolver results, reject redirects and

@@ -239,15 +239,16 @@ impl IceIo {
             } else {
                 let (id, carrier) = &mut self.streams[index];
                 match carrier.poll(cx) {
-                    Poll::Ready(event) => Some(Ok(match event {
-                        CarrierEvent::Activated(route) => IceEvent::Activated(*id, route),
-                        CarrierEvent::Frame(data) => IceEvent::Frame(
+                    Poll::Ready(event) => Some(match event {
+                        CarrierEvent::Activated(route) => Ok(IceEvent::Activated(*id, route)),
+                        CarrierEvent::Frame(data) => Ok(IceEvent::Frame(
                             data,
                             carrier.route.expect("active stream retains actual tuple"),
-                        ),
-                        CarrierEvent::Closed => IceEvent::Closed(*id),
-                        CarrierEvent::Written => IceEvent::Written,
-                    })),
+                        )),
+                        CarrierEvent::Closed => Ok(IceEvent::Closed(*id)),
+                        CarrierEvent::Written => Ok(IceEvent::Written),
+                        CarrierEvent::Egress => Err(crate::transport::egress::denied().into()),
+                    }),
                     Poll::Pending => None,
                 }
             };
@@ -300,12 +301,15 @@ impl IceIo {
                 let _ = released.await;
             }
         }
-        self.check_egress(to)?;
         #[cfg(test)]
         if let Some(error) = self.datagram_error.lock().unwrap().take() {
             return Err(error.into());
         }
-        self.udp.send_to(data, to).await?;
+        futures::future::poll_fn(|cx| {
+            self.check_egress(to)?;
+            self.udp.poll_send_to(cx, data, to)
+        })
+        .await?;
         Ok(())
     }
     /// Transfers the original core output into its sole matching carrier without another FIFO.
@@ -315,7 +319,6 @@ impl IceIo {
         route: TurnStreamRoute,
         selected: Option<TurnStreamRoute>,
     ) -> Result<()> {
-        self.check_egress(route.remote())?;
         match self
             .streams
             .iter_mut()
@@ -325,7 +328,7 @@ impl IceIo {
                 if carrier.retiring() {
                     return Ok(());
                 }
-                if carrier.blocked() && !carrier.flush_now() {
+                if carrier.blocked() && !carrier.flush_now()? {
                     if selected == Some(route) {
                         return Err(crate::error::NetherError::InvalidState(
                             "selected TURN output polled during write backpressure".into(),
@@ -352,14 +355,11 @@ impl IceIo {
                 }
             }
             SessionOutput::SendStream(data, route) => {
-                if self.check_egress(route.remote()).is_err() {
-                    return;
-                }
                 if let Some((_, carrier)) = self
                     .streams
                     .iter_mut()
                     .find(|(_, carrier)| carrier.route == Some(route))
-                    && carrier.flush_now()
+                    && carrier.flush_now().unwrap_or(false)
                     && !carrier.retiring()
                     && carrier.send(data).is_ok()
                 {

@@ -360,7 +360,10 @@ impl Session<Connecting> {
                                 tracing::debug!(%error, "transport input rejected");
                             }
                         }
-                        Err(error) => tracing::debug!(%error, "UDP receive error"),
+                        Err(error) => {
+                            if crate::transport::egress::is_denied(&error) { break Terminal::Egress; }
+                            tracing::debug!(%error, "transport receive error");
+                        },
                     },
                     command = commands.recv(), if admit_commands => match command {
                         #[cfg(test)]

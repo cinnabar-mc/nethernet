@@ -1,4 +1,7 @@
 //! One retained connection, TLS handshake, TURN decoder and partial write.
+#[cfg(test)]
+mod egress_tests;
+mod stream;
 use crate::error::{NetherError, Result};
 use crate::session::guard::transport_now;
 use nethernet::session::{
@@ -7,7 +10,6 @@ use nethernet::session::{
 };
 use rtc::shared::turn_framing::TurnStreamDecoder;
 use rustls::pki_types::ServerName;
-use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -15,8 +17,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
+use stream::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
 pub(super) enum CarrierEvent {
@@ -24,19 +26,20 @@ pub(super) enum CarrierEvent {
     Frame(Box<[u8]>),
     Closed,
     Written,
+    Egress,
 }
 
 enum State {
-    Connecting(TcpStream, Option<(TlsConnector, ServerName<'static>)>),
-    Handshaking(Pin<Box<tokio_rustls::Connect<TcpStream>>>),
+    Connecting(Stream, Option<(TlsConnector, ServerName<'static>)>),
+    Handshaking(Pin<Box<tokio_rustls::Connect<Stream>>>),
     Active(Wire),
     Retiring,
     Closed,
 }
 
 enum Wire {
-    Tcp(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Tcp(Stream),
+    Tls(Box<TlsStream<Stream>>),
 }
 
 impl Wire {
@@ -127,27 +130,10 @@ impl Carrier {
         if transport_now() >= deadline {
             return Err(NetherError::Timeout);
         }
-        let socket = Socket::new(
-            Domain::for_address(target.remote),
-            Type::STREAM,
-            Some(Protocol::TCP),
-        )?;
-        socket.set_nonblocking(true)?;
-        if let Some(ip) = target
+        let bind = target
             .local_bind_ip(fallback)
-            .map_err(nethernet::error::ProtocolError::from)?
-        {
-            socket.bind(&SocketAddr::new(ip, 0).into())?;
-        }
-        if let Some(policy) = egress {
-            policy.check(target.remote)?;
-        }
-        match socket.connect(&target.remote.into()) {
-            Ok(()) => {}
-            Err(error) if connect_in_progress(&error) => {}
-            Err(error) => return Err(error.into()),
-        }
-        let stream = TcpStream::from_std(socket.into())?;
+            .map_err(nethernet::error::ProtocolError::from)?;
+        let stream = Stream::connect(target.remote, bind, egress.cloned())?;
         Ok(Self {
             route: None,
             identity: TargetIdentity::new(target),
@@ -175,10 +161,12 @@ impl Carrier {
     /// Sizes the same original socket before actor handoff; it does not synthesize Pending.
     #[cfg(test)]
     pub(super) fn set_send_buffer(&self, size: usize) {
-        let State::Active(Wire::Tcp(stream)) = &self.state else {
-            panic!("actual TCP carrier is not active");
+        let stream = match &self.state {
+            State::Active(Wire::Tcp(stream)) => stream,
+            State::Active(Wire::Tls(stream)) => stream.get_ref().0,
+            _ => panic!("actual TCP carrier is not active"),
         };
-        socket2::SockRef::from(stream)
+        socket2::SockRef::from(stream.socket())
             .set_send_buffer_size(size)
             .unwrap();
     }
@@ -220,11 +208,16 @@ impl Carrier {
         match self.poll_inner(cx) {
             Poll::Ready(Ok(event)) => Poll::Ready(event),
             Poll::Ready(Err(error)) => {
+                let egress = crate::transport::egress::is_denied(&error);
                 tracing::debug!(%error, "TURN stream retired");
                 self.state = State::Closed;
                 self.write = None;
                 self.decoder = TurnStreamDecoder::new();
-                Poll::Ready(CarrierEvent::Closed)
+                Poll::Ready(if egress {
+                    CarrierEvent::Egress
+                } else {
+                    CarrierEvent::Closed
+                })
             }
             Poll::Pending => Poll::Pending,
         }
@@ -243,24 +236,29 @@ impl Carrier {
     }
 
     /// Attempts the existing prefix once without adding a second retained frame.
-    pub fn flush_now(&mut self) -> bool {
+    pub fn flush_now(&mut self) -> Result<bool> {
         if self.write.is_none() {
-            return true;
+            return Ok(true);
         }
         let mut context = Context::from_waker(futures::task::noop_waker_ref());
         match self.poll_write_frame(&mut context) {
-            Poll::Ready(Ok(())) => true,
+            Poll::Ready(Ok(())) => Ok(true),
             Poll::Ready(Err(error)) => {
+                let error = NetherError::from(error);
                 tracing::debug!(%error, "TURN stream write failed");
                 self.retire();
-                false
+                if crate::transport::egress::is_denied(&error) {
+                    Err(error)
+                } else {
+                    Ok(false)
+                }
             }
             Poll::Pending => {
                 #[cfg(test)]
                 {
                     self.kernel_pending = true;
                 }
-                false
+                Ok(false)
             }
         }
     }
@@ -302,17 +300,8 @@ impl Carrier {
             return Poll::Ready(Err(NetherError::Timeout));
         }
         if let State::Connecting(stream, _) = &mut self.state {
-            ready!(stream.poll_write_ready(cx))?;
-            if let Some(error) = stream.take_error()? {
-                return Poll::Ready(Err(error.into()));
-            }
-            if stream.peer_addr()? != self.identity.remote {
-                return Poll::Ready(Err(io::Error::other(
-                    "TCP remote changed during connection",
-                )
-                .into()));
-            }
-            let route = TurnStreamRoute::new(stream.local_addr()?, stream.peer_addr()?)
+            let (local, remote) = ready!(stream.poll_connected(cx))?;
+            let route = TurnStreamRoute::new(local, remote)
                 .map_err(nethernet::error::ProtocolError::from)?;
             self.route = Some(route);
             let State::Connecting(stream, tls) = std::mem::replace(&mut self.state, State::Closed)
@@ -381,20 +370,6 @@ impl Carrier {
             Some(frame) => Poll::Ready(Ok(CarrierEvent::Frame(frame.into_boxed_slice()))),
             None => Poll::Pending,
         }
-    }
-}
-
-fn connect_in_progress(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::WouldBlock {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        error.raw_os_error() == Some(libc::EINPROGRESS)
-    }
-    #[cfg(not(unix))]
-    {
-        false
     }
 }
 
@@ -543,12 +518,7 @@ mod tests {
             );
             assert!(matches!(activated, CarrierEvent::Activated(_)));
             let (mut peer, _) = accepted.unwrap();
-            let State::Active(Wire::Tcp(stream)) = &carrier.state else {
-                panic!("actual plain carrier not active");
-            };
-            socket2::SockRef::from(stream)
-                .set_send_buffer_size(1024)
-                .unwrap();
+            carrier.set_send_buffer(1024);
             let original = frame(&vec![0x5a; 60_000]);
             let mut expected = Vec::new();
             let mut observed = false;
@@ -691,16 +661,11 @@ mod tests {
             let (mut second, _) = second.unwrap();
             // This is the wire owner's selected-policy input. The separate real actor pair asserts
             // the original core getter supplies exactly this actual retained socket identity.
-            let State::Active(Wire::Tcp(stream)) = &io.streams[0].1.state else {
-                panic!("actual pressure socket is not active");
-            };
-            socket2::SockRef::from(stream)
-                .set_send_buffer_size(1024)
-                .unwrap();
+            io.streams[0].1.set_send_buffer(1024);
             let original = frame(&vec![0x5a; 60_000]);
             let mut pressured = false;
             for _ in 0..64 {
-                if io.blocked(Some(routes[0])) && !io.streams[0].1.flush_now() {
+                if io.blocked(Some(routes[0])) && !io.streams[0].1.flush_now().unwrap() {
                     pressured = true;
                     break;
                 }

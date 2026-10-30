@@ -5,6 +5,7 @@ use std::{fmt, io, net::SocketAddr, sync::Arc};
 /// Admission for actual UDP destinations and resolved TCP/TLS TURN endpoints.
 ///
 /// The same policy stays with a connection through gathering, play and cleanup.
+/// Each physical write attempt rechecks it, including retained TURN and TLS output.
 /// It performs no name resolution and grants no signaling or player authority.
 #[derive(Clone)]
 pub struct EgressPolicy(Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>);

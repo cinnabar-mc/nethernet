@@ -142,6 +142,15 @@ async fn service(listener: TcpListener, gates: Gates, done: CancellationToken) {
 
 /// Reuses the original two-core gathering, offer and actual Ready handoff, without another runtime.
 async fn actors(addr: SocketAddr, watched: oneshot::Sender<SocketAddr>) -> (Actor, Actor) {
+    actors_with_egress(addr, watched, None).await
+}
+
+/// Installs the caller's policy before the original controlling actor gathers or opens its socket.
+async fn actors_with_egress(
+    addr: SocketAddr,
+    watched: oneshot::Sender<SocketAddr>,
+    egress: Option<crate::EgressPolicy>,
+) -> (Actor, Actor) {
     let mut gathered = Vec::new();
     for controlling in [true, false] {
         let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
@@ -151,6 +160,7 @@ async fn actors(addr: SocketAddr, watched: oneshot::Sender<SocketAddr>) -> (Acto
         };
         let now = transport_now();
         let (io, config) = IceIo::from(udp.clone())
+            .with_egress_policy(if controlling { egress.clone() } else { None })
             .configured(
                 &config,
                 &[target(addr, TurnStreamSecurity::Tcp)],
@@ -228,6 +238,71 @@ async fn actors(addr: SocketAddr, watched: oneshot::Sender<SocketAddr>) -> (Acto
         (a.establish(a_ready), a_rx, a_unreliable),
         (b.establish(b_ready), b_rx, b_unreliable),
     )
+}
+
+/// A retained original frame cannot continue after revocation merely because no new output arrives.
+#[tokio::test]
+async fn pending_turn_write_revocation_retires_the_actor_after_its_accepted_prefix() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let done = CancellationToken::new();
+        let (watch_tx, watched) = oneshot::channel();
+        let (hold_tx, hold) = oneshot::channel();
+        let (_replay_tx, replay) = oneshot::channel();
+        let (release_tx, release) = oneshot::channel();
+        let (prefix_forwarded, prefix_rx) = oneshot::channel();
+        let service = service(listener, Gates { watched, hold, replay, release, prefix_forwarded }, done.clone());
+        let exercise = async {
+            let admitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let policy = {
+                let admitted = Arc::clone(&admitted);
+                crate::EgressPolicy::new(move |_| admitted.load(std::sync::atomic::Ordering::SeqCst))
+            };
+            let ((a, mut a_rx, a_unreliable), (b, mut b_rx, b_unreliable)) =
+                actors_with_egress(address, watch_tx, Some(policy)).await;
+            let observation = a.sender().pressure_observation();
+            for _ in 0..4 {
+                a.send(Bytes::from(vec![0x41; 50 * 1024])).await.unwrap();
+                assert_eq!(b_rx.recv().await.unwrap().unwrap().len(), 50 * 1024);
+                b.send(Bytes::from_static(b"prime acknowledged")).await.unwrap();
+                assert_eq!(a_rx.recv().await.unwrap().unwrap(), "prime acknowledged");
+            }
+            let (held, acknowledged) = oneshot::channel();
+            hold_tx.send(held).unwrap();
+            assert!(acknowledged.await.unwrap(), "missing original authenticated binding");
+            {
+                let fill = async {
+                    for _ in 0..crate::session::command::COMMAND_CAPACITY {
+                        a.send(Bytes::from(vec![0x42; 50 * 1024])).await.unwrap();
+                    }
+                    futures::future::pending::<()>().await;
+                };
+                tokio::pin!(fill);
+                tokio::select! { biased; _ = observation.socket_blocked() => {}, _ = &mut fill => unreachable!() }
+            }
+            b.send(Bytes::from_static(PREFIX)).await.unwrap();
+            b.update_turn_streams_before(vec![target(address, TurnStreamSecurity::Tcp)], transport_now() + Duration::from_secs(5)).await.unwrap();
+            prefix_rx.await.unwrap();
+            while a_rx.accepted_packets() == 0 {
+                assert!(!a.is_closed().await);
+                tokio::task::yield_now().await;
+            }
+            admitted.store(false, std::sync::atomic::Ordering::SeqCst);
+            // Only the real peer resumes reading. No new output is supplied to the revoked actor.
+            release_tx.send(()).unwrap();
+            assert_eq!(a_rx.recv().await.unwrap().as_deref(), Some(PREFIX));
+            let error = a_rx.recv().await.unwrap_err();
+            assert!(crate::transport::egress::is_denied(&error));
+            assert!(a_rx.recv().await.unwrap().is_none());
+            let a = a.close();
+            let b = b.close();
+            drop((a_rx, b_rx, a_unreliable, b_unreliable));
+            done.cancel();
+            tokio::join!(a.join_original_actor(), b.join_original_actor());
+        };
+        tokio::join!(service, exercise);
+    }).await.expect("pending TURN revocation bypassed the original physical write owner");
 }
 
 /// Actual input cannot grow the original unpolled core FIFO without finite capacity retirement.

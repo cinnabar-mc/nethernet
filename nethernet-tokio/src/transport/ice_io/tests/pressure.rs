@@ -243,6 +243,7 @@ async fn actors_with_egress(
 /// A retained original frame cannot continue after revocation merely because no new output arrives.
 #[tokio::test]
 async fn pending_turn_write_revocation_retires_the_actor_after_its_accepted_prefix() {
+    let stage = std::cell::Cell::new("bind original service");
     tokio::time::timeout(Duration::from_secs(20), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -254,6 +255,7 @@ async fn pending_turn_write_revocation_retires_the_actor_after_its_accepted_pref
         let (prefix_forwarded, prefix_rx) = oneshot::channel();
         let service = service(listener, Gates { watched, hold, replay, release, prefix_forwarded }, done.clone());
         let exercise = async {
+            stage.set("gather and establish original actors");
             let admitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
             let policy = {
                 let admitted = Arc::clone(&admitted);
@@ -262,6 +264,7 @@ async fn pending_turn_write_revocation_retires_the_actor_after_its_accepted_pref
             let ((a, mut a_rx, a_unreliable), (b, mut b_rx, b_unreliable)) =
                 actors_with_egress(address, watch_tx, Some(policy)).await;
             let observation = a.sender().pressure_observation();
+            stage.set("prime original congestion window");
             for _ in 0..4 {
                 a.send(Bytes::from(vec![0x41; 50 * 1024])).await.unwrap();
                 assert_eq!(b_rx.recv().await.unwrap().unwrap().len(), 50 * 1024);
@@ -269,9 +272,11 @@ async fn pending_turn_write_revocation_retires_the_actor_after_its_accepted_pref
                 assert_eq!(a_rx.recv().await.unwrap().unwrap(), "prime acknowledged");
             }
             let (held, acknowledged) = oneshot::channel();
+            stage.set("hold peer reads");
             hold_tx.send(held).unwrap();
             assert!(acknowledged.await.unwrap(), "missing original authenticated binding");
             {
+                stage.set("reach actual selected socket pressure");
                 let fill = async {
                     for _ in 0..crate::session::command::COMMAND_CAPACITY {
                         a.send(Bytes::from(vec![0x42; 50 * 1024])).await.unwrap();
@@ -281,28 +286,33 @@ async fn pending_turn_write_revocation_retires_the_actor_after_its_accepted_pref
                 tokio::pin!(fill);
                 tokio::select! { biased; _ = observation.socket_blocked() => {}, _ = &mut fill => unreachable!() }
             }
+            stage.set("forward original live prefix");
             b.send(Bytes::from_static(PREFIX)).await.unwrap();
             b.update_turn_streams_before(vec![target(address, TurnStreamSecurity::Tcp)], transport_now() + Duration::from_secs(5)).await.unwrap();
             prefix_rx.await.unwrap();
-            while a_rx.accepted_packets() == 0 {
-                assert!(!a.is_closed().await);
-                tokio::task::yield_now().await;
-            }
+            stage.set("observe prefix accepted in original blocked core");
+            observation.pending_message_bytes(PREFIX.len()).await;
+            stage.set("revoke policy and resume original peer reads");
             admitted.store(false, std::sync::atomic::Ordering::SeqCst);
             // Only the real peer resumes reading. No new output is supplied to the revoked actor.
             release_tx.send(()).unwrap();
+            stage.set("receive preserved accepted prefix");
             assert_eq!(a_rx.recv().await.unwrap().as_deref(), Some(PREFIX));
+            stage.set("receive typed policy terminal");
             let error = a_rx.recv().await.unwrap_err();
             assert!(crate::transport::egress::is_denied(&error));
+            stage.set("receive final EOF");
             assert!(a_rx.recv().await.unwrap().is_none());
+            stage.set("join original actors");
             let a = a.close();
             let b = b.close();
             drop((a_rx, b_rx, a_unreliable, b_unreliable));
             done.cancel();
             tokio::join!(a.join_original_actor(), b.join_original_actor());
+            stage.set("original service exit");
         };
         tokio::join!(service, exercise);
-    }).await.expect("pending TURN revocation bypassed the original physical write owner");
+    }).await.unwrap_or_else(|error| panic!("pending TURN revocation stalled at {}: {error}", stage.get()));
 }
 
 /// Actual input cannot grow the original unpolled core FIFO without finite capacity retirement.

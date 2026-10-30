@@ -69,5 +69,6 @@ pub use signaling::http::{HttpServerConfig, HttpSignaling, HttpSignalingServer};
 pub use signaling::lan::{LanConfig, LanSignaling};
 pub use signaling::{ClientSignaling, ServerSignaling};
 pub use transport::{
-    ClientIceConfig, ConnectionConfig, NetherClient, NetherServer, ServerIceConfig, Timeouts,
+    ClientIceConfig, ConnectionConfig, EgressPolicy, NetherClient, NetherServer, ServerIceConfig,
+    Timeouts,
 };

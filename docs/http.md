@@ -170,3 +170,16 @@ the resulting lease. Missing or ambiguous matches fail.
 `NetherServer::set_server_ice` applies configuration to later offers. Pending and
 accepted peers keep their current configuration. In Full mode, allow enough
 HTTP answer and negotiation time for gathering to finish.
+
+## Restrict transport destinations
+
+Services that connect on behalf of untrusted users can set
+`ConnectionConfig::egress_policy` to an `EgressPolicy`. The callback receives the
+actual numeric UDP destination or TCP/TLS TURN endpoint before I/O. The same
+policy remains installed for gathering, established traffic and cleanup; a live
+refusal retires the connection while preserving already accepted input. The
+default leaves routing unrestricted for ordinary clients and LAN connections.
+
+This transport policy does not configure the HTTP signaling client. A gateway
+must separately admit and pin its HTTP resolver results, reject redirects and
+unwanted proxies, and retain normal TLS hostname verification.

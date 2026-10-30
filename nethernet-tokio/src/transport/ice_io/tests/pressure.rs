@@ -150,16 +150,16 @@ async fn actors(addr: SocketAddr, watched: oneshot::Sender<SocketAddr>) -> (Acto
             ..Default::default()
         };
         let now = transport_now();
-        let (io, config) = IceIo::configured(
-            udp.clone(),
-            &config,
-            &[target(addr, TurnStreamSecurity::Tcp)],
-            None,
-            None,
-            now,
-            now + Duration::from_secs(5),
-        )
-        .unwrap();
+        let (io, config) = IceIo::from(udp.clone())
+            .configured(
+                &config,
+                &[target(addr, TurnStreamSecurity::Tcp)],
+                None,
+                None,
+                now,
+                now + Duration::from_secs(5),
+            )
+            .unwrap();
         let (core, description) = Session::new_with_ice(
             udp.local_addr().unwrap(),
             controlling,

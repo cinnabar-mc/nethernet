@@ -1,4 +1,5 @@
 //! Finite actual TURN sockets, original RTC transactions and the original session actor.
+mod egress;
 mod lifecycle;
 mod pressure;
 #[path = "../../../../nethernet/tests/support/turn.rs"]
@@ -226,16 +227,16 @@ async fn secured_actor_pair(listener: TcpListener, tls: bool) {
                 policy: IcePolicy::RelayOnly,
                 ..Default::default()
             };
-            let (io, config) = IceIo::configured(
-                udp.clone(),
-                &config,
-                &[target(addr, security.clone())],
-                tls.then_some(&client_tls),
-                Some(udp.local_addr().unwrap().ip()),
-                transport_now(),
-                transport_now() + Duration::from_secs(5),
-            )
-            .unwrap();
+            let (io, config) = IceIo::from(udp.clone())
+                .configured(
+                    &config,
+                    &[target(addr, security.clone())],
+                    tls.then_some(&client_tls),
+                    Some(udp.local_addr().unwrap().ip()),
+                    transport_now(),
+                    transport_now() + Duration::from_secs(5),
+                )
+                .unwrap();
             assert!(
                 io.streams[0].1.route.is_none(),
                 "pending target acquired a fabricated route"

@@ -131,3 +131,25 @@ fn an_exclusive_body_cannot_coexist_and_pop_keeps_first_terminal() {
         "caller-held clones survive release of queue credit"
     );
 }
+
+/// A policy refusal preserves accepted input, then exposes one permission failure and EOF.
+#[test]
+fn egress_refusal_drains_the_accepted_prefix_before_one_terminal() {
+    let (producer, mut receiver) = channel(Channel::Reliable);
+    producer
+        .push(Bytes::from_static(b"already accepted"))
+        .unwrap();
+    producer.finish(Terminal::Egress);
+    let waker = futures::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(
+        matches!(receiver.poll_recv(&mut context), Poll::Ready(Ok(Some(body))) if body == b"already accepted"[..])
+    );
+    assert!(
+        matches!(receiver.poll_recv(&mut context), Poll::Ready(Err(NetherError::Io(error))) if error.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    assert!(matches!(
+        receiver.poll_recv(&mut context),
+        Poll::Ready(Ok(None))
+    ));
+}

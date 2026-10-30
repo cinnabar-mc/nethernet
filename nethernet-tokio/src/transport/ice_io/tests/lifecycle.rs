@@ -21,7 +21,7 @@ async fn pending_tls_keeps_udp_and_another_stream_live_and_retires_at_original_c
         let (_server_tls, client_tls) = tls_pair();
         let targets = [target(held.local_addr().unwrap(), TurnStreamSecurity::Tls { server_name: "localhost".into() }), target(ready.local_addr().unwrap(), TurnStreamSecurity::Tcp)];
         let deadline = transport_now() + Duration::from_secs(5);
-        let (mut io, _) = IceIo::configured(udp.clone(), &IceConfig::default(), &targets, Some(&client_tls), None, transport_now(), deadline).unwrap();
+        let (mut io, _) = IceIo::from(udp.clone()).configured( &IceConfig::default(), &targets, Some(&client_tls), None, transport_now(), deadline).unwrap();
         let activation = async {
             loop {
                 match io.next().await.unwrap() {
@@ -121,16 +121,16 @@ async fn tls_requires_the_original_name_and_configured_roots_before_activation()
                     server_name: name.into(),
                 },
             );
-            let (mut io, _) = IceIo::configured(
-                udp,
-                &IceConfig::default(),
-                &[target],
-                Some(&client_tls),
-                None,
-                transport_now(),
-                transport_now() + Duration::from_secs(5),
-            )
-            .unwrap();
+            let (mut io, _) = IceIo::from(udp)
+                .configured(
+                    &IceConfig::default(),
+                    &[target],
+                    Some(&client_tls),
+                    None,
+                    transport_now(),
+                    transport_now() + Duration::from_secs(5),
+                )
+                .unwrap();
             let accept = async {
                 let (socket, _) = listener.accept().await.unwrap();
                 TlsAcceptor::from(server_tls).accept(socket).await

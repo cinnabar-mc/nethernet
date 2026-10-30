@@ -445,6 +445,9 @@ impl Session<Connecting> {
                                 _ = close_token.cancelled() => break 'drive Terminal::Eof,
                                 result = io.send_datagram(&data, to) => {
                                     if let Err(e) = result {
+                                        if matches!(&e, NetherError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied) {
+                                            break 'drive Terminal::Egress;
+                                        }
                                         tracing::debug!("send_to error: {e}");
                                     }
                                 }

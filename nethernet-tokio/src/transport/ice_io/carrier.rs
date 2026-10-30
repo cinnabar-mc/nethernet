@@ -121,6 +121,7 @@ impl Carrier {
         fallback: Option<IpAddr>,
         tls: Option<(TlsConnector, ServerName<'static>)>,
         caller_deadline: Instant,
+        egress: Option<&crate::transport::EgressPolicy>,
     ) -> Result<Self> {
         let deadline = target.admission_deadline(caller_deadline);
         if transport_now() >= deadline {
@@ -137,6 +138,9 @@ impl Carrier {
             .map_err(nethernet::error::ProtocolError::from)?
         {
             socket.bind(&SocketAddr::new(ip, 0).into())?;
+        }
+        if let Some(policy) = egress {
+            policy.check(target.remote)?;
         }
         match socket.connect(&target.remote.into()) {
             Ok(()) => {}
@@ -451,6 +455,7 @@ mod tests {
                 None,
                 None,
                 transport_now() + Duration::from_secs(5),
+                None,
             )
             .unwrap();
             let (accepted, activated) = tokio::join!(
@@ -529,6 +534,7 @@ mod tests {
                 None,
                 None,
                 transport_now() + Duration::from_secs(5),
+                None,
             )
             .unwrap();
             let (accepted, activated) = tokio::join!(
@@ -619,6 +625,7 @@ mod tests {
                 None,
                 Some((connector, ServerName::try_from("localhost").unwrap())),
                 transport_now() + Duration::from_secs(4),
+                None,
             )
             .unwrap();
             let (_peer, _) = listener.accept().await.unwrap();
@@ -650,16 +657,16 @@ mod tests {
                 target(listeners[0].local_addr().unwrap(), TurnStreamSecurity::Tcp),
                 target(listeners[1].local_addr().unwrap(), TurnStreamSecurity::Tcp),
             ];
-            let (mut io, _) = IceIo::configured(
-                udp.clone(),
-                &IceConfig::default(),
-                &targets,
-                None,
-                None,
-                transport_now(),
-                transport_now() + Duration::from_secs(5),
-            )
-            .unwrap();
+            let (mut io, _) = IceIo::from(udp.clone())
+                .configured(
+                    &IceConfig::default(),
+                    &targets,
+                    None,
+                    None,
+                    transport_now(),
+                    transport_now() + Duration::from_secs(5),
+                )
+                .unwrap();
             let activate = async {
                 let mut routes = [None, None];
                 while routes.iter().any(Option::is_none) {

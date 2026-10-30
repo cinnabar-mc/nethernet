@@ -233,19 +233,25 @@ impl NetherClient {
         let now = transport_now();
         let (io, ice) = match &config.client_ice {
             Some(ice) => {
-                let (io, policy) = IceIo::configured(
-                    socket,
-                    &ice.ice,
-                    &ice.turn_streams,
-                    ice.turn_tls.as_ref(),
-                    ice.bind_addr.map(|addr| addr.ip()),
-                    now,
-                    deadline.into_std(),
-                )
-                .map_err(|error| (Some(SignalErrorCode::FailedToCreatePeerConnection), error))?;
+                let (io, policy) = IceIo::from(socket)
+                    .with_egress_policy(config.egress_policy.clone())
+                    .configured(
+                        &ice.ice,
+                        &ice.turn_streams,
+                        ice.turn_tls.as_ref(),
+                        ice.bind_addr.map(|addr| addr.ip()),
+                        now,
+                        deadline.into_std(),
+                    )
+                    .map_err(|error| {
+                        (Some(SignalErrorCode::FailedToCreatePeerConnection), error)
+                    })?;
                 (io, Some(policy))
             }
-            None => (IceIo::from(socket), None),
+            None => (
+                IceIo::from(socket).with_egress_policy(config.egress_policy.clone()),
+                None,
+            ),
         };
         let (mut session, description) = match ice {
             Some(ice) => SansSession::new_with_ice(bound_addr, true, rand::random(), ice, now),

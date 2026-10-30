@@ -10,6 +10,7 @@ use tokio::sync::Notify;
 struct State {
     kernel_blocked: AtomicBool,
     peak_entries: AtomicUsize,
+    message_bytes: AtomicUsize,
     changed: Notify,
 }
 
@@ -19,6 +20,10 @@ impl Observation {
     /// Records original FIFO usage only after an actual selected socket write returned Pending.
     pub(crate) fn record(&self, usage: OutputUsage, blocked: bool) {
         self.0.kernel_blocked.store(blocked, Ordering::Relaxed);
+        self.0.message_bytes.store(
+            usage.bytes.saturating_sub(usage.wire_bytes),
+            Ordering::Relaxed,
+        );
         if blocked {
             self.0
                 .peak_entries
@@ -49,6 +54,19 @@ impl Observation {
             tokio::pin!(changed);
             changed.as_mut().enable();
             if self.peak_entries() > limit {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Waits for application bytes already accepted into the original unpolled core FIFO.
+    pub(crate) async fn pending_message_bytes(&self, minimum: usize) {
+        loop {
+            let changed = self.0.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.0.message_bytes.load(Ordering::Relaxed) >= minimum {
                 return;
             }
             changed.await;

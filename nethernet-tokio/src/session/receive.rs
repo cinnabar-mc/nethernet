@@ -21,6 +21,7 @@ pub(super) enum Terminal {
     Eof,
     Transport,
     Capacity,
+    Egress,
 }
 
 struct State {
@@ -115,6 +116,7 @@ impl Receiver {
                 Terminal::Eof => Ok(None),
                 Terminal::Transport => Err(NetherError::ConnectionClosed),
                 Terminal::Capacity => Err(NetherError::ReceiveCapacity),
+                Terminal::Egress => Err(crate::transport::egress::denied().into()),
             });
         }
         if state

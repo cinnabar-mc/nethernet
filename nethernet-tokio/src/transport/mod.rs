@@ -1,6 +1,8 @@
 //! Client and server connections over a signaling backend.
 pub mod client;
+pub(crate) mod egress;
 mod gather;
+pub use egress::EgressPolicy;
 pub(crate) mod ice_io;
 mod pending;
 pub mod server;
@@ -55,6 +57,10 @@ pub struct ServerIceConfig {
 /// Settings shared by NetherClient::connect_with and NetherServer::bind_with.
 #[derive(Clone)]
 pub struct ConnectionConfig {
+    /// Optional numeric destination admission for UDP and TCP/TLS transport I/O.
+    /// Checked before gathering, every datagram and cleanup. None leaves routing unrestricted.
+    pub egress_policy: Option<EgressPolicy>,
+
     /// Complete incoming application body; independent of negotiated outgoing and final queue limits.
     /// Defaults to the core's 66,846,465 bytes. Zero refuses nonempty bodies.
     pub max_incoming_message_bytes: usize,
@@ -117,6 +123,7 @@ pub struct ConnectionConfig {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
+            egress_policy: None,
             max_incoming_message_bytes:
                 nethernet::protocol::constants::DEFAULT_MAX_INCOMING_MESSAGE_BYTES,
             timeouts: Timeouts::default(),
@@ -141,6 +148,7 @@ impl Default for ConnectionConfig {
 impl fmt::Debug for ConnectionConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionConfig")
+            .field("egress_policy", &self.egress_policy)
             .field(
                 "max_incoming_message_bytes",
                 &self.max_incoming_message_bytes,

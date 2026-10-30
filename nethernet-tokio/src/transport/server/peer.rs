@@ -243,19 +243,25 @@ impl Peer {
         let deadline = now.checked_add(establish).ok_or_else(timeout)?;
         let (mut io, policy) = match &self.config.server_ice {
             Some(ice) => {
-                let (io, policy) = IceIo::configured(
-                    socket,
-                    &ice.ice,
-                    &ice.turn_streams,
-                    ice.turn_tls.as_ref(),
-                    Some(ice.bind_addr.ip()),
-                    now,
-                    self.negotiation_deadline.min(deadline),
-                )
-                .map_err(|error| (Some(SignalErrorCode::FailedToCreatePeerConnection), error))?;
+                let (io, policy) = IceIo::from(socket)
+                    .with_egress_policy(self.config.egress_policy.clone())
+                    .configured(
+                        &ice.ice,
+                        &ice.turn_streams,
+                        ice.turn_tls.as_ref(),
+                        Some(ice.bind_addr.ip()),
+                        now,
+                        self.negotiation_deadline.min(deadline),
+                    )
+                    .map_err(|error| {
+                        (Some(SignalErrorCode::FailedToCreatePeerConnection), error)
+                    })?;
                 (Some(io), Some(policy))
             }
-            None => (Some(IceIo::from(socket)), None),
+            None => (
+                Some(IceIo::from(socket).with_egress_policy(self.config.egress_policy.clone())),
+                None,
+            ),
         };
         let answered = if let Some(policy) = policy {
             let (mut core, description) =

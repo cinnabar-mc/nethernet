@@ -3,6 +3,7 @@ mod carrier;
 use crate::error::Result;
 #[cfg(test)]
 use crate::session::guard::transport_now;
+use crate::transport::EgressPolicy;
 use carrier::{Carrier, CarrierEvent};
 use nethernet::connection::ConnectionInput;
 use nethernet::protocol::constants::MAX_DATAGRAM_SIZE;
@@ -57,22 +58,28 @@ impl IceEvent {
 
 pub(crate) struct IceIo {
     udp: Arc<UdpSocket>,
+    egress: Option<EgressPolicy>,
     streams: Vec<(TurnStreamId, Carrier)>,
     buffer: Box<[u8]>,
     cursor: usize,
     #[cfg(test)]
     datagram_gate: std::sync::Mutex<Option<HeldDatagram>>,
+    #[cfg(test)]
+    datagram_error: std::sync::Mutex<Option<std::io::Error>>,
 }
 impl From<Arc<UdpSocket>> for IceIo {
     fn from(udp: Arc<UdpSocket>) -> Self {
         configure_receive_buffer(udp.as_ref());
         Self {
             udp,
+            egress: None,
             streams: Vec::new(),
             buffer: vec![0; MAX_DATAGRAM_SIZE].into_boxed_slice(),
             cursor: 0,
             #[cfg(test)]
             datagram_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            datagram_error: std::sync::Mutex::new(None),
         }
     }
 }
@@ -88,6 +95,20 @@ fn configure_receive_buffer(udp: &UdpSocket) {
 }
 
 impl IceIo {
+    /// Installs one immutable admission owner before gathering or carrier construction.
+    pub(crate) fn with_egress_policy(mut self, policy: Option<EgressPolicy>) -> Self {
+        self.egress = policy;
+        self
+    }
+
+    /// Rejects a destination before the original numeric tuple reaches the OS.
+    fn check_egress(&self, remote: SocketAddr) -> std::io::Result<()> {
+        match &self.egress {
+            Some(policy) => policy.check(remote),
+            None => Ok(()),
+        }
+    }
+
     /// Holds only the next original UDP send future; no readiness, packets or terminal are supplied.
     #[cfg(test)]
     pub(crate) fn hold_next_datagram(
@@ -102,9 +123,15 @@ impl IceIo {
         (observing, release)
     }
 
+    /// Supplies one OS send error to the original actor without changing candidate output.
+    #[cfg(test)]
+    pub(crate) fn fail_next_datagram(&mut self, error: std::io::Error) {
+        *self.datagram_error.get_mut().unwrap() = Some(error);
+    }
+
     /// Validates the complete bounded configuration before starting any independent target.
     pub fn configured(
-        udp: Arc<UdpSocket>,
+        self,
         ice: &IceConfig,
         targets: &[TurnStreamTarget],
         tls: Option<&Arc<rustls::ClientConfig>>,
@@ -112,8 +139,16 @@ impl IceIo {
         now: Instant,
         deadline: Instant,
     ) -> Result<(Self, IceConfig)> {
-        ice.validate_with_stream_targets(udp.local_addr()?, targets, now)
+        ice.validate_with_stream_targets(self.udp.local_addr()?, targets, now)
             .map_err(nethernet::error::ProtocolError::from)?;
+        for remote in ice
+            .servers
+            .iter()
+            .map(IceServer::addr)
+            .chain(targets.iter().map(|target| target.remote))
+        {
+            self.check_egress(remote)?;
+        }
         let deadline = deadline.min(now + ice.gather_timeout);
         let names = carrier::tls_names(targets)?;
         let connector = if names.iter().any(Option::is_some) {
@@ -124,7 +159,7 @@ impl IceIo {
         } else {
             None
         };
-        let mut io = Self::from(udp);
+        let mut io = self;
         let mut ice = ice.clone();
         for (index, (target, name)) in targets.iter().zip(names).enumerate() {
             let id = TurnStreamId::new(index).map_err(nethernet::error::ProtocolError::from)?;
@@ -137,7 +172,7 @@ impl IceIo {
                     name,
                 )
             });
-            match Carrier::start(target, fallback, tls, deadline) {
+            match Carrier::start(target, fallback, tls, deadline, io.egress.as_ref()) {
                 Ok(carrier) => {
                     ice.servers.push(IceServer::TurnStream {
                         id,
@@ -147,6 +182,7 @@ impl IceIo {
                     });
                     io.streams.push((id, carrier));
                 }
+                Err(error) if crate::transport::egress::is_denied(&error) => return Err(error),
                 Err(error) => tracing::debug!(%error, "TURN stream target could not start"),
             }
         }
@@ -203,15 +239,16 @@ impl IceIo {
             } else {
                 let (id, carrier) = &mut self.streams[index];
                 match carrier.poll(cx) {
-                    Poll::Ready(event) => Some(Ok(match event {
-                        CarrierEvent::Activated(route) => IceEvent::Activated(*id, route),
-                        CarrierEvent::Frame(data) => IceEvent::Frame(
+                    Poll::Ready(event) => Some(match event {
+                        CarrierEvent::Activated(route) => Ok(IceEvent::Activated(*id, route)),
+                        CarrierEvent::Frame(data) => Ok(IceEvent::Frame(
                             data,
                             carrier.route.expect("active stream retains actual tuple"),
-                        ),
-                        CarrierEvent::Closed => IceEvent::Closed(*id),
-                        CarrierEvent::Written => IceEvent::Written,
-                    })),
+                        )),
+                        CarrierEvent::Closed => Ok(IceEvent::Closed(*id)),
+                        CarrierEvent::Written => Ok(IceEvent::Written),
+                        CarrierEvent::Egress => Err(crate::transport::egress::denied().into()),
+                    }),
                     Poll::Pending => None,
                 }
             };
@@ -230,6 +267,7 @@ impl IceIo {
         selected: TurnStreamRoute,
         now: Instant,
     ) -> Result<nethernet::session::TurnCredentials> {
+        self.check_egress(selected.remote())?;
         let (_, carrier) = self
             .streams
             .iter()
@@ -263,7 +301,15 @@ impl IceIo {
                 let _ = released.await;
             }
         }
-        self.udp.send_to(data, to).await?;
+        #[cfg(test)]
+        if let Some(error) = self.datagram_error.lock().unwrap().take() {
+            return Err(error.into());
+        }
+        futures::future::poll_fn(|cx| {
+            self.check_egress(to)?;
+            self.udp.poll_send_to(cx, data, to)
+        })
+        .await?;
         Ok(())
     }
     /// Transfers the original core output into its sole matching carrier without another FIFO.
@@ -282,7 +328,7 @@ impl IceIo {
                 if carrier.retiring() {
                     return Ok(());
                 }
-                if carrier.blocked() && !carrier.flush_now() {
+                if carrier.blocked() && !carrier.flush_now()? {
                     if selected == Some(route) {
                         return Err(crate::error::NetherError::InvalidState(
                             "selected TURN output polled during write backpressure".into(),
@@ -304,14 +350,16 @@ impl IceIo {
     pub fn best_effort(&mut self, output: SessionOutput) {
         match output {
             SessionOutput::Send(data, to) => {
-                let _ = self.udp.try_send_to(&data, to);
+                if self.check_egress(to).is_ok() {
+                    let _ = self.udp.try_send_to(&data, to);
+                }
             }
             SessionOutput::SendStream(data, route) => {
                 if let Some((_, carrier)) = self
                     .streams
                     .iter_mut()
                     .find(|(_, carrier)| carrier.route == Some(route))
-                    && carrier.flush_now()
+                    && carrier.flush_now().unwrap_or(false)
                     && !carrier.retiring()
                     && carrier.send(data).is_ok()
                 {

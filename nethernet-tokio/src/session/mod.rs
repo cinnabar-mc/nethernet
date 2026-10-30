@@ -105,6 +105,12 @@ pub struct SessionReceiver {
 }
 
 impl SessionReceiver {
+    /// Observes the actual accepted prefix without draining it or supplying transport events.
+    #[cfg(test)]
+    pub(crate) fn accepted_packets(&self) -> usize {
+        self.rx.len()
+    }
+
     pub async fn recv(&mut self) -> Result<Option<Bytes>> {
         futures::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
@@ -354,7 +360,10 @@ impl Session<Connecting> {
                                 tracing::debug!(%error, "transport input rejected");
                             }
                         }
-                        Err(error) => tracing::debug!(%error, "UDP receive error"),
+                        Err(error) => {
+                            if crate::transport::egress::is_denied(&error) { break Terminal::Egress; }
+                            tracing::debug!(%error, "transport receive error");
+                        },
                     },
                     command = commands.recv(), if admit_commands => match command {
                         #[cfg(test)]
@@ -445,17 +454,23 @@ impl Session<Connecting> {
                                 _ = close_token.cancelled() => break 'drive Terminal::Eof,
                                 result = io.send_datagram(&data, to) => {
                                     if let Err(e) = result {
+                                        if crate::transport::egress::is_denied(&e) {
+                                            break 'drive Terminal::Egress;
+                                        }
                                         tracing::debug!("send_to error: {e}");
                                     }
                                 }
                             }
                         }
                         SessionOutput::SendStream(data, route) => {
-                            if io
-                                .send_stream(data, route, connection.selected_turn_stream())
-                                .is_err()
+                            if let Err(error) =
+                                io.send_stream(data, route, connection.selected_turn_stream())
                             {
-                                break 'drive Terminal::Transport;
+                                break 'drive if crate::transport::egress::is_denied(&error) {
+                                    Terminal::Egress
+                                } else {
+                                    Terminal::Transport
+                                };
                             }
                         }
                         SessionOutput::Event(SessionEvent::Ready) => {

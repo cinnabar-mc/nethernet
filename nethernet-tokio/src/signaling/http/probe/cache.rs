@@ -152,9 +152,9 @@ fn key(host: &str, port: u16) -> (String, u16) {
     )
 }
 
-struct FailedDial<'a> {
-    selection: &'a ProbeSelection,
-    succeeded: bool,
+pub(super) struct FailedDial<'a> {
+    pub(super) selection: &'a ProbeSelection,
+    pub(super) succeeded: bool,
 }
 
 impl Drop for FailedDial<'_> {

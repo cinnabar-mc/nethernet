@@ -283,3 +283,42 @@ async fn cancelled_cached_attempt_preserves_the_abort_category() {
     assert!(!error.is_timeout());
     assert!(cache.lookup("h", 19132).is_none());
 }
+
+/// Dropping an actual cached GET forgets its entry while preserving a concurrent replacement.
+#[tokio::test]
+async fn cancelled_cached_recheck_forgets_only_its_original_entry() {
+    use tokio::{io::AsyncReadExt, net::TcpListener};
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for replace in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let cache = ProbeCache::default();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let _original = ProbeCache::store(Some(&cache), "fixture", 0, endpoint);
+            let probe = HttpProbe::new(Client::builder().no_proxy()).unwrap();
+            let socket = {
+                let selected = probe.select("fixture", 0, Some(&cache), Instant::now() + Duration::from_secs(5));
+                tokio::pin!(selected);
+                let receiving = async {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut head = [0; 1024];
+                    assert!(socket.read(&mut head).await.unwrap() > 0);
+                    socket
+                };
+                let socket = tokio::select! {
+                    result = &mut selected => panic!("cached request completed without a response: {}", result.is_ok()),
+                    socket = receiving => socket,
+                };
+                if replace {
+                    ProbeCache::store(Some(&cache), "fixture", 0, "http://replacement.fixture".into());
+                }
+                socket
+            };
+            if replace {
+                assert_eq!(cache.lookup("fixture", 0).unwrap().endpoint(), "http://replacement.fixture");
+            } else {
+                assert!(cache.lookup("fixture", 0).is_none(), "cancelled cached recheck retained its failed entry");
+            }
+            drop(socket);
+        }
+    }).await.unwrap();
+}

@@ -1401,7 +1401,7 @@ dependencies = [
  "rand",
  "rsa",
  "rtc",
- "rtc-turn 0.21.1 (git+https://github.com/cinnabar-mc/rtc-turn?rev=ceef0780c54c4f5fdc08e7e343403f8026653171)",
+ "rtc-turn",
  "serde",
  "serde_json",
  "sha2",
@@ -1427,7 +1427,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rtc",
- "rtc-turn 0.21.1 (git+https://github.com/cinnabar-mc/rtc-turn?rev=ceef0780c54c4f5fdc08e7e343403f8026653171)",
+ "rtc-turn",
  "rustls",
  "rustls-pemfile",
  "rustls-platform-verifier",
@@ -1917,8 +1917,7 @@ dependencies = [
 [[package]]
 name = "rtc"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e2ca201de5ccc83aa3c08d49a2f08d7ed0aeeb2052fb1ccc517a8b77a6927ce"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bytes",
  "hex",
@@ -1940,7 +1939,7 @@ dependencies = [
  "rtc-shared",
  "rtc-srtp",
  "rtc-stun",
- "rtc-turn 0.21.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rtc-turn",
  "rustls",
  "sansio",
  "serde",
@@ -1953,8 +1952,7 @@ dependencies = [
 [[package]]
 name = "rtc-crypto"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "404ea28682271626739dfb1f3a04e96c596490b948d7629d9e4651dd4ba6aaf3"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "aes 0.8.4",
  "ccm",
@@ -1972,8 +1970,7 @@ dependencies = [
 [[package]]
 name = "rtc-datachannel"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d93dd81014535ff0134c0f19dbccfbae4d5ceb6010cf917c1a6056ea2c0d9bb"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bytes",
  "log",
@@ -1985,8 +1982,7 @@ dependencies = [
 [[package]]
 name = "rtc-dtls"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a2fe5767d6caf61018d52189b3b8e37075799eeb81cd5ab452307c7e7ebd97e"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bytecheck",
  "byteorder",
@@ -2005,8 +2001,7 @@ dependencies = [
 [[package]]
 name = "rtc-ice"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "099984f1be120b2e5692f232f8cbb82e53f6b4261c5c2eeda5be6223ba1adaa9"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bytes",
  "crc",
@@ -2024,8 +2019,7 @@ dependencies = [
 [[package]]
 name = "rtc-interceptor"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43e7df85d7aacf6e3f69bb922a6c9f83b2a29461038d06285df7642206df64cf"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "log",
  "rand",
@@ -2038,8 +2032,7 @@ dependencies = [
 [[package]]
 name = "rtc-mdns"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d86ac3cafd411bef81d70aff9d59d9520331b29970f7e361180da99e7a8b5a0d"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bytes",
  "log",
@@ -2051,8 +2044,7 @@ dependencies = [
 [[package]]
 name = "rtc-media"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a76840ad2aff52efeb16a613db26c16981841a6cf50907bff950884f00f9d9a9"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2065,8 +2057,7 @@ dependencies = [
 [[package]]
 name = "rtc-rtcp"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "485aa259bdb68e550363c40c8dc30c1c453ddd80f0cf7224dd2d72dffd5e01c2"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bytes",
  "rtc-shared",
@@ -2075,8 +2066,7 @@ dependencies = [
 [[package]]
 name = "rtc-rtp"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a640f266927139a899a3a93b5cf4aa3626594ee2e5d26202b60930bb42cb445"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bytes",
  "memchr",
@@ -2088,8 +2078,7 @@ dependencies = [
 [[package]]
 name = "rtc-sctp"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eb430b379d90e7984306036d1646454a26b300c9c3256009eb8f7e0615e90b9"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bytes",
  "crc32c",
@@ -2104,8 +2093,7 @@ dependencies = [
 [[package]]
 name = "rtc-sdp"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd69b1ea06978e045f374ec19eb34177ee4e4f8349cc7d9c0b183683fa7b2d1f"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "rand",
  "rtc-shared",
@@ -2115,8 +2103,7 @@ dependencies = [
 [[package]]
 name = "rtc-shared"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1250e81796ac6d3d67bd04ecdb891b8371ff97c8a2ce0a5a1c1321f2e12b657b"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bitflags 1.3.2",
  "bytes",
@@ -2132,8 +2119,7 @@ dependencies = [
 [[package]]
 name = "rtc-srtp"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbb71f476c84763db0435bc47a598acb31abc5fdc6ca3fc84dcb274ed9b70155"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2146,8 +2132,7 @@ dependencies = [
 [[package]]
 name = "rtc-stun"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e59e5c70b7900f537ded24cfee5fa476e8fdc186b90ced528611e441f4063b4"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2163,21 +2148,7 @@ dependencies = [
 [[package]]
 name = "rtc-turn"
 version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c53078a0696df5a3a5e4947bc550c5e903b59803b252f1d39062d637ebd3d17e"
-dependencies = [
- "bytes",
- "log",
- "rtc-crypto",
- "rtc-shared",
- "rtc-stun",
- "sansio",
-]
-
-[[package]]
-name = "rtc-turn"
-version = "0.21.1"
-source = "git+https://github.com/cinnabar-mc/rtc-turn?rev=ceef0780c54c4f5fdc08e7e343403f8026653171#ceef0780c54c4f5fdc08e7e343403f8026653171"
+source = "git+https://github.com/cinnabar-mc/rtc?rev=e00c5015543287daaab65834dad70bd57467628e#e00c5015543287daaab65834dad70bd57467628e"
 dependencies = [
  "bytes",
  "log",

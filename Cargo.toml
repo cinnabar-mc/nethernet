@@ -31,7 +31,25 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 rustls-pemfile = "2"
 rtc = "0.21.1"
-rtc-turn = { git = "https://github.com/cinnabar-mc/rtc-turn", rev = "ceef0780c54c4f5fdc08e7e343403f8026653171" }
+rtc-turn = "0.21.1"
 byteorder = "1"
 ipnet = "2"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[patch.crates-io]
+rtc = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-crypto = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-datachannel = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-dtls = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-ice = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-interceptor = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-media = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-mdns = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-rtcp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-rtp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-sctp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-sdp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-shared = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-srtp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-stun = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc-turn = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }

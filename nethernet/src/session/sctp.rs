@@ -76,6 +76,16 @@ impl SctpLayer {
             }
             _ => {}
         }
+        self.drain_endpoint_events();
+    }
+
+    /// Applies association routing changes before another authenticated datagram arrives.
+    fn drain_endpoint_events(&mut self) {
+        if let Some((handle, association)) = &mut self.association {
+            while let Some(event) = association.poll_endpoint_event() {
+                self.endpoint.handle_event(*handle, event);
+            }
+        }
     }
 
     /// Maximum installed in the same immutable config that created the active association.
@@ -112,12 +122,10 @@ impl SctpLayer {
     }
 
     pub fn handle_timeout(&mut self, now: Instant) {
-        if let Some((handle, assoc)) = &mut self.association {
-            assoc.handle_timeout(now);
-            while let Some(event) = assoc.poll_endpoint_event() {
-                self.endpoint.handle_event(*handle, event);
-            }
+        if let Some((_, association)) = &mut self.association {
+            association.handle_timeout(now);
         }
+        self.drain_endpoint_events();
     }
 
     pub fn poll_timeout(&self) -> Option<Instant> {

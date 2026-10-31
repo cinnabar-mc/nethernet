@@ -9,6 +9,7 @@ mod incoming_size;
 mod local_close;
 mod negotiated_size;
 mod ready_retirement;
+mod rtc_priority;
 mod unreliable_loss;
 
 fn addr(port: u16) -> SocketAddr {

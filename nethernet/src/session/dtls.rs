@@ -327,3 +327,6 @@ mod tests {
         assert_eq!(delivered.as_deref(), Some(&b"hello from client"[..]));
     }
 }
+
+#[cfg(test)]
+mod rtc_regression;

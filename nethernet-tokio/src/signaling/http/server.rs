@@ -210,7 +210,12 @@ impl HttpSignalingServer {
                     break;
                 }
 
-                if !admitted_rx.await.unwrap_or(false) {
+                let admitted = tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => break,
+                    admitted = admitted_rx => admitted.unwrap_or(false),
+                };
+                if !admitted {
                     continue;
                 }
 
@@ -598,6 +603,37 @@ pub(crate) mod tests {
             .next()
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// Shutdown must not wait for an admission reply still held by a stopping driver.
+    #[tokio::test]
+    async fn shutdown_interrupts_pending_connection_admission() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let mut task = HttpSignalingServer::accept(
+            listener,
+            HttpServerConfig::default(),
+            commands,
+            cancel.clone(),
+        );
+        let mut peer = TcpStream::connect(addr).await.unwrap();
+        let connected = receiver.recv().await.unwrap();
+        assert!(matches!(connected, Command::Connected(..)));
+        cancel.cancel();
+        let observed = tokio::time::timeout(Duration::from_millis(100), &mut task).await;
+        let interrupted = observed.is_ok();
+        drop(connected);
+        match observed {
+            Ok(result) => result.unwrap(),
+            Err(_) => task.await.unwrap(),
+        }
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+        assert!(
+            interrupted,
+            "shutdown waited for its pending admission reply"
+        );
     }
 
     /// Unanswered offers release their metadata on disconnect and on answer expiry.

@@ -44,11 +44,13 @@ async fn close_retires_original_pending_udp_output_without_waiting_for_send_capa
             tokio::pin!(draining);
             let observed = tokio::time::timeout(Duration::from_secs(1), &mut draining).await;
             let closed_without_release = observed.is_ok();
-            // A baseline still blocked on UDP must retire before the final behavioral assertion.
-            let _ = release.send(());
+
             let terminals = match observed {
                 Ok(terminals) => terminals,
-                Err(_) => draining.await,
+                Err(_) => (
+                    Err(NetherError::ConnectionClosed),
+                    Err(NetherError::ConnectionClosed),
+                ),
             };
             (closed_without_release, terminals)
         };
@@ -56,7 +58,13 @@ async fn close_retires_original_pending_udp_output_without_waiting_for_send_capa
         let mut guard = Arc::try_unwrap(guard)
             .ok()
             .expect("fixture released every original actor capability");
-        let joined = (&mut guard.task).await;
+        let observed = tokio::time::timeout(Duration::from_secs(1), &mut guard.task).await;
+        let retired_before_release = observed.is_ok();
+        let _ = release.send(());
+        let joined = match observed {
+            Ok(joined) => joined,
+            Err(_) => (&mut guard.task).await,
+        };
         drop(guard);
         let (mut peer, peer_closed) = peer.close(transport_now());
         while peer.poll().is_some() {}
@@ -71,6 +79,10 @@ async fn close_retires_original_pending_udp_output_without_waiting_for_send_capa
         peer_closed.unwrap();
         assert!(matches!(drained.1, (Ok(None), Ok(None))));
         assert!(drained.0, "original close waited for UDP send capacity");
+        assert!(
+            retired_before_release,
+            "actor retirement waited for UDP send capacity"
+        );
     })
     .await
     .expect("finite blocked UDP retirement fixture stalled");

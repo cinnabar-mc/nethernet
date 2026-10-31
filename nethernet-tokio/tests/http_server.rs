@@ -443,6 +443,27 @@ async fn a_peer_holding_too_many_connections_is_refused() {
         .send()
         .await;
 
-    assert!(refused.is_err(), "{refused:?}");
+    let error = refused.expect_err("excess connection was admitted");
+    assert!(!error.is_timeout(), "excess connection hung: {error}");
+    assert!(
+        error.is_connect() || error.is_request(),
+        "unexpected refusal: {error}"
+    );
     drop(held);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.get(format!("{url}/v1/join")).send().await {
+                Ok(response) => {
+                    assert!(response.status().is_success());
+                    break;
+                }
+                Err(error) => {
+                    assert!(!error.is_timeout());
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("connection capacity did not recover");
 }

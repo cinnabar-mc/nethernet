@@ -100,6 +100,15 @@ async fn configured_server_gathers_before_or_during_answer_and_never_overtakes_i
                 }
             }
             if mode == IceMode::Trickle {
+                let blocked = tokio::time::timeout(Duration::from_millis(50), async {
+                    loop {
+                        tokio::select! {
+                            request = driver.recv() => break request,
+                            _ = turn_packet(&socket, &mut turn, &mut buffer) => {},
+                        }
+                    }
+                }).await;
+                assert!(blocked.is_err(), "candidate overtook unacknowledged answer");
                 answer.take().unwrap().finish(Ok(SignalDelivery::ServiceAccepted));
                 let candidate = loop {
                     tokio::select! {

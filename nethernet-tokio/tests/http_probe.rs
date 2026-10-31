@@ -142,19 +142,18 @@ async fn a_stalled_success_body_loses_at_the_probe_deadline() {
         released.await.unwrap();
     });
     let probe = HttpProbe::new(reqwest::Client::builder()).unwrap();
-    let probing = tokio::spawn(async move {
-        probe
-            .probe(
-                "127.0.0.1",
-                address.port(),
-                tokio::time::Instant::now() + std::time::Duration::from_secs(20),
-            )
-            .await
-    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let probing =
+        tokio::spawn(async move { probe.probe("127.0.0.1", address.port(), deadline).await });
     received_headers.await.unwrap();
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(6)).await;
-    assert!(matches!(probing.await.unwrap(), Err(ProbeError::TimedOut)));
+    let result =
+        tokio::time::timeout_at(deadline + std::time::Duration::from_millis(1), probing).await;
+    assert!(
+        matches!(result, Ok(Ok(Err(ProbeError::TimedOut)))),
+        "probe missed its original deadline: {result:?}"
+    );
     release.send(()).unwrap();
     server.await.unwrap();
 }

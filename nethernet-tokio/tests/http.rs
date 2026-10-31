@@ -5,6 +5,49 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// Reads through the header delimiter and the entire declared body before a fixture responds.
+async fn read_request(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
+    let mut request = Vec::new();
+    let header_end = loop {
+        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            break end + 4;
+        }
+        let mut chunk = [0; 4096];
+        let count = reader.read(&mut chunk).await.unwrap();
+        assert_ne!(count, 0, "request ended before its headers");
+        request.extend_from_slice(&chunk[..count]);
+    };
+    let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+    let length = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+    while request.len() < header_end + length {
+        let mut chunk = [0; 4096];
+        let count = reader.read(&mut chunk).await.unwrap();
+        assert_ne!(count, 0, "request ended before its body");
+        request.extend_from_slice(&chunk[..count]);
+    }
+    String::from_utf8(request).unwrap()
+}
+
+/// Fragmentation before both a header and a body cannot make the fixture answer early.
+#[tokio::test]
+async fn request_capture_waits_for_all_fragments() {
+    let (mut sender, mut reader) = tokio::io::duplex(4096);
+    let mut capture = Box::pin(read_request(&mut reader));
+    sender.write_all(b"POST / HTTP/1.1\r\n").await.unwrap();
+    assert!(futures::poll!(capture.as_mut()).is_pending());
+    sender
+        .write_all(b"Content-Type: application/sdp\r\nContent-Length: 5\r\n\r\nhe")
+        .await
+        .unwrap();
+    assert!(futures::poll!(capture.as_mut()).is_pending());
+    sender.write_all(b"llo").await.unwrap();
+    assert!(capture.await.ends_with("\r\n\r\nhello"));
+}
+
 /// Captures a complete request header and returns a finite, caller-selected HTTP response.
 async fn response_server(
     status: u16,
@@ -15,18 +58,12 @@ async fn response_server(
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-            let mut chunk = [0; 4096];
-            let n = stream.read(&mut chunk).await.unwrap();
-            assert_ne!(n, 0, "request ended before its headers");
-            request.extend_from_slice(&chunk[..n]);
-        }
+        let request = read_request(&mut stream).await;
         let response = format!(
             "HTTP/1.1 {status} Response\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n{body}"
         );
         stream.write_all(response.as_bytes()).await.unwrap();
-        String::from_utf8(request).unwrap()
+        request
     });
     (addr, server)
 }
@@ -135,8 +172,7 @@ async fn offer_is_answered_by_the_endpoint() {
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = vec![0u8; 4096];
-        let n = stream.read(&mut request).await.unwrap();
+        let request = read_request(&mut stream).await;
 
         let answer = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\n";
         let response = format!(
@@ -147,7 +183,7 @@ async fn offer_is_answered_by_the_endpoint() {
         stream.write_all(response.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
 
-        String::from_utf8_lossy(&request[..n]).to_string()
+        request
     });
 
     let signaling = HttpSignaling::new("1234".to_string()).unwrap();
@@ -193,8 +229,7 @@ async fn error_code_in_the_response_is_reported() {
 
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = vec![0u8; 4096];
-        let _ = stream.read(&mut request).await.unwrap();
+        let _request = read_request(&mut stream).await;
 
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n15")

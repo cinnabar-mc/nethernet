@@ -51,7 +51,13 @@ async fn lan_roundtrip() {
     let client_signaling = LanSignaling::with_config(5678, "0.0.0.0:0".parse().unwrap(), config())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client_signaling.discover().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server was not discovered");
 
     let servers = client_signaling.discover().await;
     assert_eq!(servers.len(), 1, "server not discovered");
@@ -109,7 +115,13 @@ async fn connection_trust_rejects_unsigned_lan_offers() {
         LanSignaling::with_config(8765, "0.0.0.0:0".parse().unwrap(), config_on(TRUST_PORT))
             .await
             .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client_signaling.discover().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server was not discovered");
 
     let connected = tokio::time::timeout(
         Duration::from_secs(20),
@@ -119,7 +131,13 @@ async fn connection_trust_rejects_unsigned_lan_offers() {
     .expect("negotiation timed out");
 
     assert!(
-        connected.is_err(),
-        "an unsigned LAN offer should be refused"
+        matches!(
+            connected,
+            Err(nethernet_tokio::NetherError::Signaled(
+                nethernet::error::SignalErrorCode::NotLoggedIn
+            ))
+        ),
+        "unsigned offer did not receive a trust rejection: {:?}",
+        connected.err()
     );
 }

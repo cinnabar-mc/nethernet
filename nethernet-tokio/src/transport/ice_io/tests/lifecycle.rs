@@ -149,3 +149,55 @@ async fn tls_requires_the_original_name_and_configured_roots_before_activation()
         .expect("finite certificate rejection control stalled");
     }
 }
+
+/// Reset while a selected frame is retained is carrier retirement, not caller backpressure misuse.
+#[tokio::test]
+async fn selected_stream_reset_during_flush_retires_the_carrier() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (mut io, _) = IceIo::from(udp)
+            .configured(
+                &IceConfig::default(),
+                &[target(
+                    listener.local_addr().unwrap(),
+                    TurnStreamSecurity::Tcp,
+                )],
+                None,
+                None,
+                transport_now(),
+                transport_now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        let (accepted, event) = tokio::join!(listener.accept(), io.next());
+        let (peer, _) = accepted.unwrap();
+        let IceEvent::Activated(_, route) = event.unwrap() else {
+            panic!("carrier did not activate")
+        };
+        io.streams[0].1.set_send_buffer(1024);
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(1024)
+            .unwrap();
+        let payload = frame(&vec![0x5a; 60_000]);
+        for _ in 0..4096 {
+            io.send_stream(payload.clone(), route, Some(route)).unwrap();
+            if !io.streams[0].1.flush_now().unwrap() {
+                break;
+            }
+        }
+        assert!(io.streams[0].1.blocked(), "fixture never retained a frame");
+        socket2::SockRef::from(&peer)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(peer);
+        io.streams[0].1.socket().readable().await.unwrap();
+        let result = io.send_stream(frame(b"after reset"), route, Some(route));
+        assert!(
+            result.is_ok(),
+            "reset was reported as backpressure: {result:?}"
+        );
+        assert!(matches!(io.next().await.unwrap(), IceEvent::Closed(_)));
+    })
+    .await
+    .expect("selected reset fixture stalled");
+}

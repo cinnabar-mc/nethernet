@@ -350,6 +350,9 @@ impl IceIo {
                     return Ok(());
                 }
                 if carrier.blocked() && !carrier.flush_now()? {
+                    if carrier.retiring() {
+                        return Ok(());
+                    }
                     if selected == Some(route) {
                         return Err(crate::error::NetherError::InvalidState(
                             "selected TURN output polled during write backpressure".into(),

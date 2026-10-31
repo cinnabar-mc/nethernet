@@ -158,6 +158,16 @@ impl Carrier {
         }
     }
 
+    /// Borrows the physical active socket for reset and transport-option fixtures.
+    #[cfg(test)]
+    pub(super) fn socket(&self) -> &tokio::net::TcpStream {
+        match &self.state {
+            State::Active(Wire::Tcp(stream)) => stream.socket(),
+            State::Active(Wire::Tls(stream)) => stream.get_ref().0.socket(),
+            _ => panic!("fixture needs an active carrier"),
+        }
+    }
+
     /// Sizes the same original socket before actor handoff; it does not synthesize Pending.
     #[cfg(test)]
     pub(super) fn set_send_buffer(&self, size: usize) {

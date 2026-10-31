@@ -30,8 +30,6 @@ const EXPECTED_DIVERGENCES: &[&str] = &[
     "server-data-u8-fields",
     // Error codes 27 to 37 read as SignalingUnknownError (go-nethernet 20af621, f0d2dac).
     "error-codes-27-to-37",
-    // NEW: inline candidates are written `a=candidate:<foundation>`; Go writes `a=candidate:candidate:<foundation>`.
-    "sdp-inline-candidate-prefix",
 ];
 
 fn check(id: &str, diverges: bool) {
@@ -537,9 +535,9 @@ fn non_trickle_sdp_layout_matches_go() {
 
     let double = |sdp: &str| sdp.contains("a=candidate:candidate:");
     assert!(sdp_has_candidate(&rust) && sdp_has_candidate(&go_offer));
-    check(
-        "sdp-inline-candidate-prefix",
-        double(&rust) != double(&go_offer),
+    assert!(
+        !double(&rust) && !double(&go_offer),
+        "inline candidates must have one prefix"
     );
 }
 

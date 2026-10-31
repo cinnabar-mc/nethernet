@@ -61,7 +61,7 @@ func reassemble(segments [][]byte) []byte {
 }
 
 // copiedFrom is the go-nethernet version the framing copies above were taken from.
-const copiedFrom = "v0.0.0-20260925121445-848ad4e0b177"
+const copiedFrom = "v1.0.27-0.20261030105925-88d6df3de353"
 
 // A go-nethernet pin change must re-check the copied framing before this passes.
 func TestCopiedFramingMatchesPin(t *testing.T) {

@@ -11,6 +11,7 @@ use nethernet::session::{
     IceConfig, IceServer, SessionInput, SessionOutput, TurnStreamId, TurnStreamRoute,
     TurnStreamTarget,
 };
+use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -21,6 +22,8 @@ use tokio_rustls::TlsConnector;
 
 /// Requested receive space for an SCTP flight and the kernel overhead of its datagrams.
 const UDP_RECEIVE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const UDP_READ_BATCH_PACKETS: usize = 128;
+const UDP_READ_BATCH_BYTES: usize = 256 * 1024;
 
 #[cfg(test)]
 type HeldDatagram = (
@@ -63,6 +66,8 @@ pub(crate) struct IceIo {
     egress: Option<EgressPolicy>,
     streams: Vec<(TurnStreamId, Carrier)>,
     buffer: Box<[u8]>,
+    pending_udp: VecDeque<Result<(Box<[u8]>, SocketAddr)>>,
+    pending_udp_bytes: usize,
     cursor: usize,
     #[cfg(test)]
     datagram_gate: std::sync::Mutex<Option<HeldDatagram>>,
@@ -79,6 +84,8 @@ impl From<Arc<UdpSocket>> for IceIo {
             egress: None,
             streams: Vec::new(),
             buffer: vec![0; MAX_DATAGRAM_SIZE].into_boxed_slice(),
+            pending_udp: VecDeque::new(),
+            pending_udp_bytes: 0,
             cursor: 0,
             #[cfg(test)]
             datagram_gate: std::sync::Mutex::new(None),
@@ -224,6 +231,9 @@ impl IceIo {
     }
 
     pub async fn next(&mut self) -> Result<IceEvent> {
+        if !self.pending_udp.is_empty() {
+            tokio::task::consume_budget().await;
+        }
         let deadline = self
             .streams
             .iter()
@@ -238,6 +248,60 @@ impl IceIo {
             } } => futures::future::poll_fn(|cx| self.poll_next(cx)).await,
         }
     }
+
+    /// Reads current kernel input even before the runtime has refreshed its readiness flag.
+    fn receive_udp_now(&mut self) -> std::io::Result<(Box<[u8]>, SocketAddr)> {
+        let mut buffer = ReadBuf::new(&mut self.buffer);
+        // The allocation is initialized. recv_from only writes initialized bytes into this range.
+        let (length, from) = socket2::SockRef::from(self.udp.as_ref())
+            .recv_from(unsafe { buffer.unfilled_mut() })?;
+        buffer.advance(length);
+        let from = from.as_socket().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid UDP source address",
+            )
+        })?;
+        Ok((buffer.filled().into(), from))
+    }
+
+    /// Frees kernel burst capacity before protocol work, retaining bounded wire input in order.
+    fn poll_udp(&mut self, cx: &mut Context<'_>) -> Poll<Result<IceEvent>> {
+        let (data, from) = match self.pending_udp.pop_front() {
+            Some(Ok((data, from))) => {
+                self.pending_udp_bytes -= data.len();
+                (data, from)
+            }
+            Some(Err(error)) => return Poll::Ready(Err(error)),
+            None => {
+                let mut buffer = ReadBuf::new(&mut self.buffer);
+                match self.udp.poll_recv_from(cx, &mut buffer) {
+                    Poll::Ready(Ok(from)) => (buffer.filled().into(), from),
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        };
+        let mut bytes = self.pending_udp_bytes + data.len();
+        while self.pending_udp.len() + 1 < UDP_READ_BATCH_PACKETS
+            && bytes <= UDP_READ_BATCH_BYTES - MAX_DATAGRAM_SIZE
+        {
+            match self.receive_udp_now() {
+                Ok((data, from)) => {
+                    bytes += data.len();
+                    self.pending_udp_bytes += data.len();
+                    self.pending_udp.push_back(Ok((data, from)));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    self.pending_udp.push_back(Err(error.into()));
+                    break;
+                }
+            }
+        }
+        Poll::Ready(Ok(IceEvent::Datagram(data, from)))
+    }
+
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<IceEvent>> {
         #[cfg(test)]
         if self.ready_inputs > 0 {
@@ -249,12 +313,8 @@ impl IceIo {
         for offset in 0..slots {
             let index = (self.cursor + offset) % slots;
             let event = if index == self.streams.len() {
-                let mut buffer = ReadBuf::new(&mut self.buffer);
-                match self.udp.poll_recv_from(cx, &mut buffer) {
-                    Poll::Ready(Ok(from)) => {
-                        Some(Ok(IceEvent::Datagram(buffer.filled().into(), from)))
-                    }
-                    Poll::Ready(Err(error)) => Some(Err(error.into())),
+                match self.poll_udp(cx) {
+                    Poll::Ready(event) => Some(event),
                     Poll::Pending => None,
                 }
             } else {

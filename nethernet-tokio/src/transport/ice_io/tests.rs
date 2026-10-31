@@ -529,3 +529,67 @@ async fn udp_receive_buffer_grows_for_bursts_and_preserves_larger_settings() {
     assert_eq!(socket.recv_buffer_size().unwrap(), larger);
     drop(io);
 }
+
+/// Reading a burst releases kernel capacity before the consumer handles its first packet.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn udp_bursts_survive_a_paused_consumer_with_a_small_kernel_queue() {
+    let receiver = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = receiver.local_addr().unwrap();
+    let mut io = IceIo::from(Arc::clone(&receiver));
+    socket2::SockRef::from(receiver.as_ref())
+        .set_recv_buffer_size(4096)
+        .unwrap();
+    for value in 0..3 {
+        sender.send_to(&[value; 1024], address).await.unwrap();
+    }
+    let first = io.next().await.unwrap();
+    for value in 3..6 {
+        sender.send_to(&[value; 1024], address).await.unwrap();
+    }
+    let second = io.next().await.unwrap();
+    for value in 6..9 {
+        sender.send_to(&[value; 1024], address).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut prefetched = [first, second].into_iter();
+        for value in 0..9 {
+            let packet = match prefetched.next() {
+                Some(packet) => packet,
+                None => io.next().await.unwrap(),
+            };
+            let IceEvent::Datagram(data, from) = packet else {
+                panic!("expected a UDP datagram");
+            };
+            assert_eq!(from, sender.local_addr().unwrap());
+            assert_eq!(data.as_ref(), &[value; 1024]);
+        }
+    })
+    .await
+    .expect("a burst overflowed the kernel queue while its consumer was paused");
+}
+
+/// Entry and byte budgets leave excess datagrams in the kernel instead of growing wire staging.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn udp_prefetch_stops_at_its_packet_and_byte_budgets() {
+    for (count, length, staged) in [(129u32, 32, 128u32), (5, 65507, 4)] {
+        let receiver = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = receiver.local_addr().unwrap();
+        let mut io = IceIo::from(Arc::clone(&receiver));
+        let mut packet = vec![0; length];
+        for value in 0..count {
+            packet[..4].copy_from_slice(&value.to_le_bytes());
+            sender.send_to(&packet, address).await.unwrap();
+        }
+        let IceEvent::Datagram(first, _) = io.next().await.unwrap() else {
+            panic!("expected a UDP datagram");
+        };
+        assert_eq!(&first[..4], &0u32.to_le_bytes());
+        let (length, _) = receiver.try_recv_from(&mut packet).unwrap();
+        assert_eq!(length, packet.len());
+        assert_eq!(&packet[..4], &staged.to_le_bytes());
+    }
+}

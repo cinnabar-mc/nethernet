@@ -819,3 +819,49 @@ async fn direct_selected_actor_needs_no_stream_target_to_keep_its_original_trans
     .await
     .expect("finite direct selected renewal control stalled");
 }
+
+/// A completed stream write must already be admitted, including after ownership conversion.
+#[tokio::test]
+async fn async_write_waits_for_admission_without_duplicating_the_buffer() {
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ((a, reliable), (b, mut received, _)) = connected_pair().await;
+        // Reuse the fixture's reliable receiver; the unreliable side is immaterial to this write.
+        let (_, rx) = receive::channel(Channel::Unreliable);
+        let unreliable = SessionReceiver {
+            rx,
+            reader_chunk: None,
+            _guard: reliable._guard.clone(),
+        };
+        for _ in 0..command::COMMAND_CAPACITY {
+            let (reply, _) = oneshot::channel();
+            a.handle()
+                .command_tx
+                .try_send(Command::RemoteAddr(reply))
+                .unwrap();
+        }
+        let mut client = crate::transport::NetherClient::from_session(a, reliable, unreliable);
+        let mut write = Box::pin(client.write(b"admitted once"));
+        assert!(
+            futures::poll!(write.as_mut()).is_pending(),
+            "write acknowledged an unpolled actor command"
+        );
+        assert_eq!(write.await.unwrap(), b"admitted once".len());
+        let accepted = client.into_accepted();
+        assert_eq!(received.recv().await.unwrap().unwrap(), "admitted once");
+        accepted
+            .session
+            .send(Bytes::from_static(b"barrier"))
+            .await
+            .unwrap();
+        assert_eq!(
+            received.recv().await.unwrap().unwrap(),
+            "barrier",
+            "write was duplicated when its future resumed"
+        );
+        drop(accepted.close());
+        drop(b.close());
+    })
+    .await
+    .expect("stream admission stalled");
+}

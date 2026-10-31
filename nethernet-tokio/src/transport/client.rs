@@ -124,6 +124,7 @@ pub struct NetherClient {
     unreliable: SessionReceiver,
     reader: Option<StreamReader<SessionStream, Bytes>>,
     send_future: Option<ReusableBoxFuture<'static, Result<()>>>,
+    reserve_future: Option<ReusableBoxFuture<'static, Result<crate::session::SendPermit>>>,
     shutdown_future: Option<ReusableBoxFuture<'static, Result<()>>>,
 }
 
@@ -415,6 +416,7 @@ impl NetherClient {
             unreliable,
             reader: Some(StreamReader::new(SessionStream { receiver: reliable })),
             send_future: None,
+            reserve_future: None,
             shutdown_future: None,
         }
     }
@@ -516,44 +518,51 @@ impl AsyncWrite for NetherClient {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if let Some(mut fut) = self.send_future.take() {
-            match fut.poll(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(io::Error::other(e)));
-                }
-                Poll::Pending => {
-                    self.send_future = Some(fut);
-                    return Poll::Pending;
-                }
-            }
-        }
-
-        let data = Bytes::copy_from_slice(buf);
-        let len = data.len();
-        let session = self.session.sender();
-        let mut fut = ReusableBoxFuture::new(async move { session.send(data).await });
-
-        match fut.poll(cx) {
+        match self.as_mut().poll_flush(cx) {
             Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => {
-                return Poll::Ready(Err(io::Error::other(e)));
-            }
-            Poll::Pending => {
-                self.send_future = Some(fut);
-            }
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
         }
-
-        Poll::Ready(Ok(len))
+        if self.reserve_future.is_none() {
+            let sender = self.session.sender();
+            self.reserve_future = Some(ReusableBoxFuture::new(async move {
+                sender.reserve_send(None).await
+            }));
+        }
+        let mut reserve = self
+            .reserve_future
+            .take()
+            .expect("write retains its reservation");
+        let permit = match reserve.poll(cx) {
+            Poll::Ready(Ok(permit)) => permit,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(io::Error::other(error))),
+            Poll::Pending => {
+                self.reserve_future = Some(reserve);
+                return Poll::Pending;
+            }
+        };
+        let receipt = match permit.commit(
+            crate::session::Channel::Reliable,
+            Bytes::copy_from_slice(buf),
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => return Poll::Ready(Err(io::Error::other(error))),
+        };
+        // The actor now owns these bytes, including if this client is converted into a session.
+        self.send_future = Some(ReusableBoxFuture::new(receipt.acknowledged()));
+        if let Poll::Ready(Err(error)) = self.as_mut().poll_flush(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(mut fut) = self.send_future.take() {
-            match fut.poll(cx) {
+        if let Some(mut future) = self.send_future.take() {
+            match future.poll(cx) {
                 Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error))),
                 Poll::Pending => {
-                    self.send_future = Some(fut);
+                    self.send_future = Some(future);
                     Poll::Pending
                 }
             }

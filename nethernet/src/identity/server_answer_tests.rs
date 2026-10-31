@@ -266,3 +266,46 @@ fn server_answer_requires_the_identity_envelope_protocol() {
     let token = self_signed(&proof, json!(EcJwk::from(proof.verifying_key())));
     assert!(verify_answer(&answer(token, &proof, "unexpected"), Some(&trust), now()).is_err());
 }
+
+#[test]
+fn minecraft_not_before_uses_numeric_date_and_clock_leeway() {
+    let proof = key(1);
+    let trust = provider(&Arc::new(AtomicUsize::new(0)));
+    for (nbf, accepted) in [
+        (json!(SECONDS + 3600), false),
+        (json!(SECONDS + 60), true),
+        (json!(SECONDS + 61), false),
+        (json!(SECONDS), true),
+        (json!("later"), false),
+        (Value::Null, false),
+    ] {
+        let mut claims = Jws::parse(&provider_token(&proof))
+            .unwrap()
+            .claims()
+            .unwrap()
+            .values()
+            .clone();
+        claims.insert("nbf".into(), nbf.clone());
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"synthetic"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let input = format!("{header}.{payload}");
+        let signature: pkcs1v15::Signature = issuer().sign(input.as_bytes());
+        let token = format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_vec()));
+        let sdp = answer(token, &proof, "default");
+        let result = validate_sdp(&sdp, &TokenTrust::Provider(Arc::clone(&trust)), now());
+        assert_eq!(result.is_ok(), accepted, "nbf={nbf}: {result:?}");
+        if nbf
+            .as_u64()
+            .is_some_and(|timestamp| timestamp > SECONDS + 60)
+        {
+            assert!(
+                validate_sdp(
+                    &sdp,
+                    &TokenTrust::Provider(Arc::clone(&trust)),
+                    now() + Duration::from_secs(3600)
+                )
+                .is_ok()
+            );
+        }
+    }
+}

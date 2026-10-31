@@ -72,6 +72,8 @@ impl TokenTrust {
             return Ok(claims);
         };
 
+        claims.check_not_before(now)?;
+
         if jws.header.alg != "RS256" {
             return Err(IdentityError::Untrusted(format!(
                 "expected RS256, got {}",

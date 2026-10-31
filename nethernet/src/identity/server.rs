@@ -176,7 +176,10 @@ fn mint_token(
         claims["iss"] = json!(domain);
     }
     if let Some(lifetime) = lifetime {
-        claims["exp"] = json!(seconds(now + lifetime));
+        let expiry = now.checked_add(lifetime).ok_or_else(|| {
+            IdentityError::Untrusted("server token expiry is out of range".into())
+        })?;
+        claims["exp"] = json!(seconds(expiry));
     }
     let der = verifying
         .to_public_key_der()

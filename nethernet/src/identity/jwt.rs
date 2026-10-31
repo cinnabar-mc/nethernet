@@ -115,6 +115,23 @@ impl Claims {
             .map_err(|e| IdentityError::ClientPublicKey(format!("not a key on P-384: {}", e)))
     }
 
+    /// Rejects a present invalid `nbf` or a start time more than 60 seconds in the future.
+    pub fn check_not_before(&self, now: SystemTime) -> Result<()> {
+        if self.values.get("nbf").is_some_and(Value::is_null) {
+            return Err(IdentityError::Untrusted("invalid nbf claim".into()));
+        }
+        if let Some(not_before) = self.numeric_date("nbf")?
+            && not_before
+                .duration_since(now)
+                .is_ok_and(|remaining| remaining > LEEWAY)
+        {
+            return Err(IdentityError::Untrusted(
+                "the token is not valid yet".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuses a token with no `exp`, or expired by more than 60 seconds.
     pub fn check_expiry(&self, now: SystemTime) -> Result<()> {
         let expiry = self

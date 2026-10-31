@@ -76,6 +76,10 @@ impl HttpProbe {
         deadline: Instant,
     ) -> Result<ProbeSelection, ProbeError> {
         if let Some(selected) = cache.and_then(|cache| cache.lookup(host, port)) {
+            let mut guard = cache::FailedDial {
+                selection: &selected,
+                succeeded: false,
+            };
             let cutoff = deadline.min(Instant::now() + PROBE_TIMEOUT);
             let result = if Instant::now() >= cutoff {
                 Err(ProbeError::TimedOut)
@@ -87,10 +91,9 @@ impl HttpProbe {
                 .await
                 .unwrap_or(Err(ProbeError::TimedOut))
             };
-            if let Err(error) = result {
-                selected.forget();
-                return Err(error);
-            }
+            result?;
+            guard.succeeded = true;
+            drop(guard);
             return Ok(selected);
         }
         let endpoint = self.probe(host, port, deadline).await?;

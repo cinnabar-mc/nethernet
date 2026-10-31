@@ -28,6 +28,7 @@ impl Stream {
             Some(Protocol::TCP),
         )?;
         socket.set_nonblocking(true)?;
+        socket.set_tcp_nodelay(true)?;
         if let Some(ip) = bind {
             socket.bind(&SocketAddr::new(ip, 0).into())?;
         }
@@ -125,5 +126,18 @@ fn connect_in_progress(error: &io::Error) -> bool {
     #[cfg(not(unix))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TCP and TLS share this original socket, which must transmit small frames immediately.
+    #[tokio::test]
+    async fn original_turn_socket_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = Stream::connect(listener.local_addr().unwrap(), None, None).unwrap();
+        assert!(stream.socket().nodelay().unwrap());
     }
 }

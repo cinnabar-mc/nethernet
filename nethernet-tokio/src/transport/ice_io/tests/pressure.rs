@@ -291,7 +291,10 @@ async fn pending_turn_write_revocation_retires_the_actor_after_its_accepted_pref
             b.update_turn_streams_before(vec![target(address, TurnStreamSecurity::Tcp)], transport_now() + Duration::from_secs(5)).await.unwrap();
             prefix_rx.await.unwrap();
             stage.set("observe prefix accepted in original blocked core");
-            observation.pending_message_bytes(PREFIX.len()).await;
+            tokio::select! {
+                _ = observation.pending_message_bytes(PREFIX.len()) => {},
+                _ = async { while a_rx.accepted_packets() == 0 { tokio::task::yield_now().await; } } => {},
+            }
             stage.set("revoke policy and resume original peer reads");
             admitted.store(false, std::sync::atomic::Ordering::SeqCst);
             // Only the real peer resumes reading. No new output is supplied to the revoked actor.

@@ -22,7 +22,7 @@
 //!
 //! The [custom event-loop guide](https://github.com/cinnabar-mc/nethernet/blob/main/docs/sans-io.md)
 //! covers packets, timers, identity checks, and readiness. For socket-owning APIs,
-//! use `nethernet-tokio` or `bevy-nethernet`.
+//! use `nethernet-tokio`.
 pub mod admission;
 pub mod connection;
 pub mod error;

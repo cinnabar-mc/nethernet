@@ -14,8 +14,8 @@ Start with the [custom event-loop guide](../docs/sans-io.md). Feed complete inpu
 packets and monotonic time, drain outputs, and perform the requested I/O yourself.
 The core performs no DNS, HTTP requests, socket I/O, or background scheduling.
 
-For socket-owning APIs, use [Tokio](../nethernet-tokio/README.md) or
-[Bevy](../bevy-nethernet/README.md). [Identity and messaging inputs](../docs/xbox-messaging.md)
+For socket-owning APIs, use [Tokio](../nethernet-tokio/README.md).
+[Identity and messaging inputs](../docs/xbox-messaging.md)
 remain application-owned with every integration.
 
 See the [workspace README](../README.md) for runnable client/server examples and

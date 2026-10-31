@@ -105,7 +105,6 @@ message APIs so that each receive returns one complete application message.
 | Task | Guide |
 | --- | --- |
 | Discover LAN servers, change the discovery port, or connect to a selected server | [LAN discovery](docs/lan.md) |
-| Add Bevy plugins and handle connection events | [Bevy](docs/bevy.md) |
 | Run a local HTTP client/server pair, then add STUN or TURN | [HTTP and ICE](docs/http.md) |
 | Carry signals over Xbox/Player Messaging with your existing account and service connection | [Messaging integration](docs/xbox-messaging.md) |
 | Drive sockets and timers yourself | [Custom event loop](docs/sans-io.md) |
@@ -118,9 +117,8 @@ message APIs so that each receive returns one complete application message.
 | --- | --- | --- |
 | [`nethernet`](nethernet/README.md) | You have your own event loop or runtime. | Your sockets and clock. The core opens no sockets and starts no tasks. |
 | [`nethernet-tokio`](nethernet-tokio/README.md) | You want async client and server APIs. | Tasks on your Tokio runtime. |
-| [`bevy-nethernet`](bevy-nethernet/README.md) | You want Bevy resources, plugins, and connection events. | Frame updates for clients; a shared UDP worker for servers. No Tokio dependency. |
 
-All three use the same protocol core. The reliable channel preserves message
+Both crates use the same protocol core. The reliable channel preserves message
 order; the unreliable channel is unordered and does not retransmit messages.
 
 ## What your application supplies

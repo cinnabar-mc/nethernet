@@ -4,10 +4,12 @@ use crate::identity::jwk::EcJwk;
 use crate::identity::jws::Jws;
 use crate::identity::jwt::Claims;
 use crate::identity::{Assertion, Identity, Idp, fingerprint_payload, sdp_fingerprints};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use p384::SecretKey;
 use p384::ecdsa::{SigningKey, VerifyingKey};
 use p384::elliptic_curve::Generate;
-use p384::pkcs8::LineEnding;
+use p384::pkcs8::{EncodePublicKey, LineEnding};
 use serde_json::json;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const DEFAULT_DOMAIN: &str = "self";
 
 /// Token validity used when no lifetime is given.
-pub const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Server key and token; keep the key stable across restarts so clients can trust it (guide section 5.2).
 #[derive(Debug, Clone)]
@@ -176,7 +178,14 @@ fn mint_token(
     if let Some(lifetime) = lifetime {
         claims["exp"] = json!(seconds(now + lifetime));
     }
-    Jws::sign(signing, &claims.to_string())
+    let der = verifying
+        .to_public_key_der()
+        .map_err(|error| IdentityError::Key(error.to_string()))?;
+    Jws::sign_with_x5u(
+        signing,
+        &claims.to_string(),
+        &STANDARD.encode(der.as_bytes()),
+    )
 }
 
 fn seconds(time: SystemTime) -> u64 {
@@ -192,12 +201,51 @@ mod tests {
     use crate::identity::{TokenTrust, validate_sdp};
     use base64::Engine;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use p384::pkcs8::EncodePublicKey;
     use serde_json::json;
 
     const ANSWER: &str = "v=0\r\n\
         o=- 1 2 IN IP4 127.0.0.1\r\n\
         m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
         a=fingerprint:sha-256 AB:CD\r\n";
+
+    #[test]
+    fn a_default_server_token_expires_after_one_minute() {
+        let now = fixture_now();
+        let identity = ServerIdentity::generate("fixture", now).unwrap();
+        let claims = Jws::parse(identity.token()).unwrap().claims().unwrap();
+        assert_eq!(claims.expiry(), Some(now + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn a_server_token_carries_the_same_public_key_as_jwk_and_der() {
+        let identity = fixture_identity();
+        let token = Jws::parse(identity.token()).unwrap();
+        let header = identity.token().split('.').next().unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).unwrap()).unwrap();
+        let der = STANDARD
+            .decode(
+                header["x5u"]
+                    .as_str()
+                    .expect("server x5u must carry a DER key"),
+            )
+            .unwrap();
+        assert_eq!(
+            der,
+            identity
+                .verifying_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_bytes()
+        );
+        assert!(token.claims().unwrap().values()["cpk"].is_object());
+        assert_eq!(
+            token.claims().unwrap().client_public_key().unwrap(),
+            *identity.verifying_key()
+        );
+        token.verify_es384(identity.verifying_key()).unwrap();
+    }
 
     #[test]
     fn the_identity_is_inserted_above_the_media_description() {
@@ -288,7 +336,7 @@ D9X8Fh+xaDyPt2Z7rVGnwVihOy/Uu1zzizzcYTJMluYn8XetihGgczU=
         m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
         a=sctp-port:5000\r\n";
 
-    const GOLDEN_IDENTITY_VALUE: &str = "eyJpZHAiOnsiZG9tYWluIjoiZXhhbXBsZS5jb20iLCJwcm90b2NvbCI6ImRlZmF1bHQifSwiYXNzZXJ0aW9uIjoie1widG9rZW5cIjpcImV5SmhiR2NpT2lKRlV6TTROQ0o5LmV5SmpjR3NpT25zaVkzSjJJam9pVUMwek9EUWlMQ0pyZEhraU9pSkZReUlzSW5naU9pSlJTM0UxYUROUlNIaG5UMEZsZUhwUE4wczFjbVZqYlVoQlJrVlNiMmRtZURkcGJuZG5WMVJMVGt0MGVXTjJNbVZ6VFZWd09HeHVhbTVtUm14UFZpMXFJaXdpZVNJNkluVnBaa0p4T1habkxYZGZWbDlDV1daelYyYzRhamRrYldVMk1WSndPRVpaYjFSemRqRk1kR000TkhNNE0wZEZlVlJLWW0xS1gwWXpjbGx2VW05SVRURWlmU3dpWlhod0lqb3hOekF3TURnMk5EQXdMQ0pwWVhRaU9qRTNNREF3TURBd01EQXNJbWx6Y3lJNkltVjRZVzF3YkdVdVkyOXRJbjAuMm1NMGVQUXNqT25RSWh0VGxyZEl0N3duTkNfZUFPbXNnWTVhd05NQlpfS2xuUkVYXy1CSGtoaDNtd0F3UnVRUHNaTXJTRjdES0JVSlRpdGN5THIyY2VhYXpHODBaTy15LTRSYW5IYVlWX2JhUlBJODM5VjhoLTNuVk5Razd1TUFcIixcImZpbmdlcnByaW50c1wiOlwiZXlKaGJHY2lPaUpGVXpNNE5DSjkuLi13YlVXVTh3a3lFMDVucG1LZHJfRUs3RmRlZHdfd2dpZ21CQlEzSkZCd0hKSVEwVVlHX1oyT1V0dzhRR2tRMnJYMkVnMUpRdjN5LVluSzlXMkcwT2dNVVl0NEJQXzhWcHVscTRPOW12dXdkUlVwSjZGNE0tcUtYalNpRVdBa0xjXCJ9In0=";
+    const GOLDEN_IDENTITY_VALUE: &str = "eyJpZHAiOnsiZG9tYWluIjoiZXhhbXBsZS5jb20iLCJwcm90b2NvbCI6ImRlZmF1bHQifSwiYXNzZXJ0aW9uIjoie1widG9rZW5cIjpcImV5SmhiR2NpT2lKRlV6TTROQ0lzSW5nMWRTSTZJazFJV1hkRlFWbElTMjlhU1hwcU1FTkJVVmxHU3pSRlJVRkRTVVJaWjBGRlVVdHhOV2d6VVVoNFowOUJaWGg2VHpkTE5YSmxZMjFJUVVaRlVtOW5abmczYVc1M1oxZFVTMDVMZEhsamRqSmxjMDFWY0Roc2JtcHVaa1pzVDFZcmFuVnBaa0p4T1habkszY3ZWaTlDV1daelYyYzRhamRrYldVMk1WSndPRVpaYjFSemRqRk1kR000TkhNNE0wZEZlVlJLWW0xS0wwWXpjbGx2VW05SVRURWlmUS5leUpqY0dzaU9uc2lZM0oySWpvaVVDMHpPRFFpTENKcmRIa2lPaUpGUXlJc0luZ2lPaUpSUzNFMWFETlJTSGhuVDBGbGVIcFBOMHMxY21WamJVaEJSa1ZTYjJkbWVEZHBibmRuVjFSTFRrdDBlV04yTW1WelRWVndPR3h1YW01bVJteFBWaTFxSWl3aWVTSTZJblZwWmtKeE9YWm5MWGRmVmw5Q1dXWnpWMmM0YWpka2JXVTJNVkp3T0VaWmIxUnpkakZNZEdNNE5ITTRNMGRGZVZSS1ltMUtYMFl6Y2xsdlVtOUlUVEVpZlN3aVpYaHdJam94TnpBd01EQXdNRFl3TENKcFlYUWlPakUzTURBd01EQXdNREFzSW1semN5STZJbVY0WVcxd2JHVXVZMjl0SW4wLkVPaEpsdkhPeU0xUHV1WDJqM3BXRUZhUXl2Y3Y5OUZCMTJrNjAyckRjRFkzYUJUWEQ0QlYwNFduLVU2aGJQYWFWVFBIRXdLQWQ4b0NUd082WlEzcTZ5RFpiUG1wQmxNWlBlcmloYWRhLWhNdndXRmFHUXYxY3ZDSW4zcUZ3bEdpXCIsXCJmaW5nZXJwcmludHNcIjpcImV5SmhiR2NpT2lKRlV6TTROQ0o5Li4td2JVV1U4d2t5RTA1bnBtS2RyX0VLN0ZkZWR3X3dnaWdtQkJRM0pGQndISklRMFVZR19aMk9VdHc4UUdrUTJyWDJFZzFKUXYzeS1Zbks5VzJHME9nTVVZdDRCUF84VnB1bHE0TzltdnV3ZFJVcEo2RjRNLXFLWGpTaUVXQWtMY1wifSJ9";
 
     fn fixture_now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW_SECONDS)

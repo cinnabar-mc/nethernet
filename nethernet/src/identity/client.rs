@@ -25,6 +25,7 @@ pub struct SelfSignedIdentity {
     signing: Arc<SigningKey>,
     token: String,
     claims: Claims,
+    domain: String,
 }
 
 impl fmt::Debug for SelfSignedIdentity {
@@ -76,7 +77,14 @@ impl SelfSignedIdentity {
             signing,
             token,
             claims: Claims::new(claims),
+            domain: DEFAULT_DOMAIN.to_owned(),
         })
+    }
+
+    /// Uses the authorization domain supplied by the caller's service discovery.
+    pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = domain.into();
+        self
     }
 
     /// Borrows the same key for an application login that must match the transport identity.
@@ -95,7 +103,7 @@ impl SdpIdentity for SelfSignedIdentity {
         let payload = fingerprint_payload(&fingerprints);
         let identity = Identity {
             idp: Idp {
-                domain: DEFAULT_DOMAIN.to_owned(),
+                domain: self.domain.clone(),
                 protocol: DEFAULT_IDP_PROTOCOL.to_owned(),
             },
             assertion: Assertion {
@@ -115,6 +123,22 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     const SDP: &str = "v=0\r\na=fingerprint:sha-256 AB:CD\r\nm=application 9\r\n";
+
+    #[test]
+    fn a_client_offer_uses_the_configured_authorization_domain() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let identity = SelfSignedIdentity::new(now, Duration::from_secs(60))
+            .unwrap()
+            .with_domain("authorization.example");
+        let parsed = Identity::from_sdp(&identity.augment(SDP, now).unwrap()).unwrap();
+        assert_eq!(parsed.idp.domain, "authorization.example");
+        let claims =
+            validate_sdp(&identity.augment(SDP, now).unwrap(), &TokenTrust::Any, now).unwrap();
+        assert_eq!(
+            claims.client_public_key().unwrap(),
+            *identity.signing_key().verifying_key()
+        );
+    }
 
     #[test]
     fn signed_out_offer_binds_a_der_token_key_to_the_signed_fingerprints() {

@@ -25,6 +25,7 @@ impl MessageSegment {
     }
 
     /// Fails below two bytes, so a segment with an empty body is invalid.
+    #[inline]
     pub fn decode(mut data: Bytes) -> Result<Self> {
         if data.len() < 2 {
             return Err(ProtocolError::MessageParse(format!(
@@ -72,7 +73,23 @@ impl Message {
     }
 
     /// Returns the message on its final segment; a framing rejection permanently seals reassembly.
+    #[inline]
     pub fn add_segment(&mut self, segment: MessageSegment) -> Result<Option<Bytes>> {
+        if !self.failed
+            && self.expected_segments == 0
+            && self.data.is_empty()
+            && segment.remaining_segments == 0
+        {
+            if segment.data.len() > self.maximum {
+                return self.reject(ProtocolError::MessageSizeExceeded(segment.data.len()));
+            }
+            return Ok(Some(segment.data));
+        }
+        self.add_fragment(segment)
+    }
+
+    /// Applies sequence and size checks when a message needs stateful reassembly.
+    fn add_fragment(&mut self, segment: MessageSegment) -> Result<Option<Bytes>> {
         if self.failed {
             return Err(ProtocolError::MessageParse("reassembly has failed".into()));
         }

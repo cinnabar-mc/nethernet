@@ -70,7 +70,7 @@ impl NetherServer {
                 "caller server requires explicit offer trust".into(),
             ));
         }
-        let establish = config.timeouts.start.checked_add(config.timeouts.channel);
+        let establish = signaling.establish_timeout(&config.timeouts);
         let now = crate::session::guard::transport_now();
         if config.max_sessions > Semaphore::MAX_PERMITS
             || establish

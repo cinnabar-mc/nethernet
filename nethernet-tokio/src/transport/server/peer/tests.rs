@@ -326,3 +326,59 @@ async fn peer_worker_retains_ready_prefix_and_close_during_answer_dispatch() {
     .await
     .expect("finite actual LAN answer-dispatch handoff fixture stalled");
 }
+
+/// The actual accepted transport can finish after the old establishment window has elapsed.
+#[tokio::test]
+async fn http_listener_waits_for_server_trust_before_ready() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let PendingPeer {
+            mut owner,
+            answered,
+            pending,
+            mut incoming,
+            mut rtc,
+            signals: _signals,
+            answer,
+            ..
+        } = pending_peer().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let mut handoff = Box::pin(owner.handoff(answered, pending));
+        assert!(
+            poll!(&mut handoff).is_pending(),
+            "HTTP transport expired during the server-trust decision"
+        );
+        tokio::time::resume();
+        rtc.apply_answer(answer);
+        while !rtc.both_ready() {
+            rtc.turn().await;
+        }
+        let _forwarding = handoff
+            .await
+            .expect("HTTP peer must establish within the one-minute budget");
+        let accepted = incoming.recv().await.unwrap();
+        let retired = accepted.close();
+        retired.session.closed().await;
+    })
+    .await
+    .expect("finite HTTP trust fixture stalled");
+}
+
+/// A held trust decision still reaches the original finite HTTP establishment cutoff.
+#[tokio::test]
+async fn http_listener_stops_waiting_at_the_original_trust_budget() {
+    let PendingPeer {
+        mut owner,
+        answered,
+        pending,
+        signals: _signals,
+        rtc: _rtc,
+        ..
+    } = pending_peer().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert!(matches!(
+        owner.handoff(answered, pending).await,
+        Err((_, NetherError::Timeout))
+    ));
+}

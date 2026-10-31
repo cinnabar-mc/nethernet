@@ -20,6 +20,9 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Instant, SystemTime};
 
+/// Default HTTP transport establishment budget, including a server-trust decision.
+pub const DEFAULT_ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 const FORWARDED_FOR: &str = "x-forwarded-for";
 
 const JOIN_PATH: &str = "/v1/join";

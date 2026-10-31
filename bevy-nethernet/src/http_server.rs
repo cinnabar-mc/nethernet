@@ -110,7 +110,7 @@ pub struct NetherHttpServer {
     infer_peer_candidates: bool,
     pending_limits: PendingLimits,
     max_incoming_message_bytes: usize,
-    timeouts: Timeouts,
+    establish_timeout: Duration,
     idle_timeout: Duration,
     tls: ServerTls,
     next_conn_id: u64,
@@ -145,7 +145,7 @@ impl NetherHttpServer {
             pending_limits: PendingLimits::default(),
             max_incoming_message_bytes:
                 nethernet::protocol::constants::DEFAULT_MAX_INCOMING_MESSAGE_BYTES,
-            timeouts: Timeouts::default(),
+            establish_timeout: nethernet::signaling::http::DEFAULT_ESTABLISH_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             tls: ServerTls::default(),
             next_conn_id: 0,
@@ -180,8 +180,9 @@ impl NetherHttpServer {
         self.tls = ServerTls::with_config(tls);
     }
 
+    /// Selects the combined transport readiness budget used by HTTP acceptance.
     pub fn set_timeouts(&mut self, timeouts: Timeouts) {
-        self.timeouts = timeouts;
+        self.establish_timeout = timeouts.establish();
     }
 
     pub fn set_pending_limits(&mut self, limits: PendingLimits) {
@@ -354,7 +355,7 @@ impl NetherHttpServer {
             self.connections.remove(&id);
             let _ = self.signaler.handle(HttpSignalerInput::Closed(id));
         }
-        let establish = self.timeouts.establish();
+        let establish = self.establish_timeout;
         self.sessions.retain(|id, entry| {
             let keep =
                 entry.ready.is_some() || now.saturating_duration_since(entry.created) < establish;
@@ -614,7 +615,7 @@ impl NetherHttpServer {
         let mut policy = OfferPolicy::new(IceMode::Full)
             .with_max_incoming_message_size(self.max_incoming_message_bytes)
             .with_inferred_peer_candidates(self.infer_peer_candidates);
-        policy = policy.with_establish_deadline(self.timeouts.establish());
+        policy = policy.with_establish_deadline(self.establish_timeout);
         if let Some(identity) = &self.identity {
             policy = policy.with_identity(identity);
         }
@@ -655,7 +656,7 @@ impl NetherHttpServer {
                         readiness,
                         created: now,
                         answer: Some(answer.data),
-                        answer_deadline: now + self.timeouts.establish(),
+                        answer_deadline: now + self.establish_timeout,
                         remote_addr: None,
                         rtt: None,
                         player: player.map(Arc::new).or(signaled_player),
@@ -708,5 +709,40 @@ impl NetherHttpServer {
         for id in failed {
             self.remove_session(&id);
         }
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    /// HTTP admission carries the same full minute into its pending-session deadline.
+    #[test]
+    fn http_pending_answer_retains_the_server_trust_budget() {
+        let now = Instant::now();
+        let mut server = NetherHttpServer::bind("127.0.0.1:0".parse().unwrap(), |config| {
+            config.token_trust = None
+        })
+        .unwrap();
+        server.set_identity(ServerIdentity::generate("self", SystemTime::now()).unwrap());
+        let address = "127.0.0.1:40200".parse().unwrap();
+        let (peer, description) = nethernet::session::Session::new(address, true, 1, now).unwrap();
+        server.handle_offer(
+            Offer {
+                connection_id: 7,
+                network_id: "fixture".into(),
+                sdp: description.encode_full(&[peer.local_candidate().clone()]),
+                client_address: Some(address),
+                host: None,
+                player: None,
+            },
+            now,
+        );
+        assert_eq!(server.sessions.len(), 1);
+        let pending = server.sessions.values().next().unwrap();
+        assert_eq!(
+            pending.answer_deadline.duration_since(now),
+            Duration::from_secs(60)
+        );
     }
 }

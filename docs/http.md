@@ -78,6 +78,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 The empty `IceConfig` uses host candidates. Full ICE describes how candidates
 are exchanged; it does not imply that a relay is configured.
 
+HTTP listeners allow one minute for transport readiness, including a server-trust
+decision. Tokio uses `HttpServerConfig::establish_timeout`; the Bevy HTTP
+listener accepts an explicit combined budget through `set_timeouts`. LAN and
+client transport defaults are unchanged.
+
 ## Choose identity and trust
 
 HTTP servers require `ConnectionConfig::identity` by default. For a server that

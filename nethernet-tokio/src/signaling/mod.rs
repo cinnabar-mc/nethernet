@@ -60,6 +60,17 @@ impl From<Arc<HttpSignalingServer>> for ServerSignaling {
 }
 
 impl ServerSignaling {
+    /// Selects the HTTP trust budget while preserving other backends' configured timeouts.
+    pub(crate) fn establish_timeout(
+        &self,
+        timeouts: &crate::transport::Timeouts,
+    ) -> Option<std::time::Duration> {
+        match self {
+            Self::Http(signaling) => Some(signaling.establish_timeout()),
+            Self::Caller(_) | Self::Lan(_) => timeouts.start.checked_add(timeouts.channel),
+        }
+    }
+
     pub async fn signal(&self, signal: Signal) -> Result<()> {
         match self {
             Self::Caller(s) => s.signal(signal).await,

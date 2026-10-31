@@ -43,6 +43,9 @@ pub struct HttpServerConfig {
 
     /// Time a connection may take to send its request headers.
     pub idle_timeout: Duration,
+
+    /// Time for transport readiness after an offer; includes the server-trust decision.
+    pub establish_timeout: Duration,
 }
 
 impl Default for HttpServerConfig {
@@ -52,6 +55,7 @@ impl Default for HttpServerConfig {
             signaler: HttpSignalerConfig::default(),
             tls: None,
             idle_timeout: Duration::from_secs(30),
+            establish_timeout: nethernet::signaling::http::DEFAULT_ESTABLISH_TIMEOUT,
         }
     }
 }
@@ -87,6 +91,7 @@ struct Response {
 /// Join requests surface as offer signals and are completed by answer or error signals.
 pub struct HttpSignalingServer {
     network_id: String,
+    establish_timeout: Duration,
     local_addr: SocketAddr,
     commands: mpsc::UnboundedSender<Command>,
     signal_tx: broadcast::Sender<Signal>,
@@ -120,12 +125,18 @@ impl HttpSignalingServer {
 
         Ok(Self {
             network_id: config.network_id,
+            establish_timeout: config.establish_timeout,
             local_addr,
             commands,
             signal_tx,
             cancel_token,
             task: Some(task),
         })
+    }
+
+    /// Retains the listener's original HTTP transport budget for each new offer.
+    pub(crate) fn establish_timeout(&self) -> Duration {
+        self.establish_timeout
     }
 
     pub fn local_addr(&self) -> SocketAddr {

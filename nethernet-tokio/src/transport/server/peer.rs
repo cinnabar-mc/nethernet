@@ -211,7 +211,10 @@ impl Peer {
         } else {
             IceMode::Trickle
         };
-        let establish = self.config.timeouts.establish();
+        let establish = self
+            .signaling
+            .establish_timeout(&self.config.timeouts)
+            .ok_or_else(timeout)?;
         let mut policy = OfferPolicy::new(ice_mode)
             .with_max_incoming_message_size(self.config.max_incoming_message_bytes)
             .with_anonymous_offers(self.config.allow_anonymous_offers)

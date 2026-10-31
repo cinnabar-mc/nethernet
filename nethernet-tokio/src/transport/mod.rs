@@ -65,7 +65,7 @@ pub struct ConnectionConfig {
     /// Defaults to the core's 66,846,465 bytes. Zero refuses nonempty bodies.
     pub max_incoming_message_bytes: usize,
 
-    /// Deadlines for the stages of negotiation.
+    /// Deadlines for negotiation; HTTP acceptance uses HttpServerConfig::establish_timeout.
     pub timeouts: Timeouts,
 
     /// Aborts client negotiation and unaccepted server sessions when cancelled.

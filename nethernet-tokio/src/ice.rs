@@ -127,8 +127,7 @@ async fn resolve(
         let addresses = match addresses(&parsed, local, valid_until, deadline).await {
             Ok(addresses) => addresses,
             Err(error)
-                if error == IceResolveError::AddressFamily
-                    || (mode == Mode::Full && error == IceResolveError::Dns) =>
+                if error == IceResolveError::AddressFamily || error == IceResolveError::Dns =>
             {
                 unavailable.get_or_insert(error);
                 continue;
@@ -373,6 +372,43 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
+
+    /// A stale DNS alternative cannot discard a numeric UDP target in either resolver.
+    #[tokio::test]
+    async fn dns_failure_preserves_usable_udp_targets() {
+        for reverse in [false, true] {
+            let mut urls = vec![
+                "stun:127.0.0.1:3478".into(),
+                "stun:does-not-exist.invalid:3478".into(),
+            ];
+            if reverse {
+                urls.reverse();
+            }
+            let server = IceServer {
+                urls,
+                ..Default::default()
+            };
+            let now = transport_now();
+            let expires = now + Duration::from_secs(30);
+            let deadline = now + Duration::from_secs(5);
+            let local = "127.0.0.1:0".parse().unwrap();
+            assert_eq!(
+                resolve_ice_servers(std::slice::from_ref(&server), local, expires, deadline)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                resolve_ice_targets(&[server], local, expires, deadline)
+                    .await
+                    .unwrap()
+                    .datagrams
+                    .len(),
+                1
+            );
+        }
+    }
 
     /// An unrelated numeric family cannot suppress the same service's usable alternative.
     #[tokio::test]

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
@@ -66,7 +66,7 @@ enum Command {
         request: Box<http::Request<String>>,
         reply: oneshot::Sender<Response>,
     },
-    Connected(u64, SocketAddr, oneshot::Sender<bool>),
+    Connected(u64, SocketAddr, CancellationToken, oneshot::Sender<bool>),
     Closed(u64),
     Answer {
         connection_id: u64,
@@ -86,6 +86,14 @@ enum Command {
 struct Response {
     response: http::Response<String>,
     keep_alive: bool,
+}
+
+/// Metadata belongs to the physical request connection until the join completes.
+struct OfferMetadata {
+    connection: u64,
+    address: Option<SocketAddr>,
+    player: Option<Arc<PlayerInfo>>,
+    host: Option<String>,
 }
 
 /// Join requests surface as offer signals and are completed by answer or error signals.
@@ -171,11 +179,13 @@ impl HttpSignalingServer {
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let next_connection = AtomicU64::new(1);
+            let mut serving = JoinSet::new();
             let acceptor = config.tls.clone().map(TlsAcceptor::from);
 
             loop {
                 let (stream, peer) = tokio::select! {
                     _ = cancel_token.cancelled() => break,
+                    _ = serving.join_next(), if !serving.is_empty() => continue,
                     accepted = listener.accept() => match accepted {
                         Ok(accepted) => accepted,
                         Err(e) => {
@@ -186,9 +196,15 @@ impl HttpSignalingServer {
                 };
 
                 let connection = next_connection.fetch_add(1, Ordering::Relaxed);
+                let connection_cancel = cancel_token.child_token();
                 let (admitted_tx, admitted_rx) = oneshot::channel();
                 if commands
-                    .send(Command::Connected(connection, peer, admitted_tx))
+                    .send(Command::Connected(
+                        connection,
+                        peer,
+                        connection_cancel.clone(),
+                        admitted_tx,
+                    ))
                     .is_err()
                 {
                     break;
@@ -201,9 +217,9 @@ impl HttpSignalingServer {
                 let commands = commands.clone();
                 let config = config.clone();
                 let acceptor = acceptor.clone();
-                let cancel_token = cancel_token.clone();
+                let cancel_token = connection_cancel;
 
-                tokio::spawn(async move {
+                serving.spawn(async move {
                     let served = tokio::select! {
                         _ = cancel_token.cancelled() => Ok(()),
                         served = serve(stream, connection, config, acceptor, commands.clone()) => served,
@@ -214,6 +230,8 @@ impl HttpSignalingServer {
                     let _ = commands.send(Command::Closed(connection));
                 });
             }
+            serving.abort_all();
+            while serving.join_next().await.is_some() {}
         })
     }
 
@@ -226,16 +244,17 @@ impl HttpSignalingServer {
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut waiting: HashMap<u64, oneshot::Sender<Response>> = HashMap::new();
-            let mut addresses: HashMap<u64, SocketAddr> = HashMap::new();
-            let mut players: HashMap<u64, Arc<PlayerInfo>> = HashMap::new();
-            let mut hosts: HashMap<u64, String> = HashMap::new();
+            let mut connections: HashMap<u64, CancellationToken> = HashMap::new();
+            let mut metadata: HashMap<u64, OfferMetadata> = HashMap::new();
+            let mut offer_connections: HashMap<u64, u64> = HashMap::new();
             let mut wake = Instant::now() + MAX_IDLE;
 
             loop {
+                let mut requested_connection = None;
                 tokio::select! {
                     _ = cancel_token.cancelled() => break,
                     command = commands.recv() => match command {
-                        Some(Command::Connected(connection, addr, admitted)) => {
+                        Some(Command::Connected(connection, addr, cancel, admitted)) => {
                             let _ = signaler.handle(HttpSignalerInput::Connected(
                                 connection,
                                 addr,
@@ -248,9 +267,11 @@ impl HttpSignalingServer {
                                     refused = true;
                                 }
                             }
+                            if !refused { connections.insert(connection, cancel); }
                             let _ = admitted.send(!refused);
                         }
                         Some(Command::Request { connection, request, reply }) => {
+                            requested_connection = Some(connection);
                             waiting.insert(connection, reply);
                             if let Err(e) = signaler.handle(HttpSignalerInput::Request {
                                 connection,
@@ -263,6 +284,8 @@ impl HttpSignalingServer {
                         }
                         Some(Command::Closed(connection)) => {
                             waiting.remove(&connection);
+                            connections.remove(&connection);
+                            if let Some(id) = offer_connections.remove(&connection) { metadata.remove(&id); }
                             let _ = signaler.handle(HttpSignalerInput::Closed(connection));
                         }
                         Some(Command::Answer { connection_id, sdp }) => {
@@ -271,9 +294,7 @@ impl HttpSignalingServer {
                             {
                                 tracing::debug!("Failed to deliver an answer: {}", e);
                             }
-                            addresses.remove(&connection_id);
-                            players.remove(&connection_id);
-                            hosts.remove(&connection_id);
+                            if let Some(offer) = metadata.remove(&connection_id) { offer_connections.remove(&offer.connection); }
                         }
                         Some(Command::Reject { connection_id, reason }) => {
                             if let Err(e) = signaler
@@ -281,9 +302,7 @@ impl HttpSignalingServer {
                             {
                                 tracing::debug!("Failed to reject a join: {}", e);
                             }
-                            addresses.remove(&connection_id);
-                            players.remove(&connection_id);
-                            hosts.remove(&connection_id);
+                            if let Some(offer) = metadata.remove(&connection_id) { offer_connections.remove(&offer.connection); }
                         }
                         Some(Command::SetServerData(data)) => {
                             let _ = signaler.handle(HttpSignalerInput::SetServerData(data));
@@ -292,13 +311,13 @@ impl HttpSignalingServer {
                             let _ = signaler.handle(HttpSignalerInput::SetTokenTrust(trust));
                         }
                         Some(Command::Address(connection_id, reply)) => {
-                            let _ = reply.send(addresses.get(&connection_id).copied());
+                            let _ = reply.send(metadata.get(&connection_id).and_then(|offer| offer.address));
                         }
                         Some(Command::Host(connection_id, reply)) => {
-                            let _ = reply.send(hosts.get(&connection_id).cloned());
+                            let _ = reply.send(metadata.get(&connection_id).and_then(|offer| offer.host.clone()));
                         }
                         Some(Command::Player(connection_id, reply)) => {
-                            let _ = reply.send(players.get(&connection_id).cloned());
+                            let _ = reply.send(metadata.get(&connection_id).and_then(|offer| offer.player.clone()));
                         }
                         None => break,
                     },
@@ -314,6 +333,9 @@ impl HttpSignalingServer {
                             response,
                             keep_alive,
                         } => {
+                            if let Some(id) = offer_connections.remove(&connection) {
+                                metadata.remove(&id);
+                            }
                             if let Some(reply) = waiting.remove(&connection) {
                                 let _ = reply.send(Response {
                                     response: *response,
@@ -323,18 +345,27 @@ impl HttpSignalingServer {
                         }
                         HttpSignalerOutput::Close(connection) => {
                             waiting.remove(&connection);
+                            if let Some(cancel) = connections.remove(&connection) {
+                                cancel.cancel();
+                            }
+                            if let Some(id) = offer_connections.remove(&connection) {
+                                metadata.remove(&id);
+                            }
                         }
                         HttpSignalerOutput::Offer(offer) => {
                             let offered = offer.signal();
-                            if let Some(address) = offer.client_address {
-                                addresses.insert(offer.connection_id, address);
-                            }
-                            if let Some(host) = offer.host {
-                                hosts.insert(offer.connection_id, host);
-                            }
-                            if let Some(player) = offer.player {
-                                players.insert(offer.connection_id, Arc::from(*player));
-                            }
+                            let connection = requested_connection
+                                .expect("an offer comes from the current request");
+                            offer_connections.insert(connection, offer.connection_id);
+                            metadata.insert(
+                                offer.connection_id,
+                                OfferMetadata {
+                                    connection,
+                                    address: offer.client_address,
+                                    host: offer.host,
+                                    player: offer.player.map(|player| Arc::from(*player)),
+                                },
+                            );
 
                             let _ = signal_tx.send(offered);
                         }
@@ -345,7 +376,8 @@ impl HttpSignalingServer {
                 }
             }
 
-            accept.abort();
+            cancel_token.cancel();
+            let _ = accept.await;
         })
     }
 }
@@ -441,9 +473,9 @@ async fn serve(
 ) -> Result<()> {
     match acceptor {
         Some(acceptor) => {
-            let stream = acceptor
-                .accept(stream)
+            let stream = tokio::time::timeout(config.idle_timeout, acceptor.accept(stream))
                 .await
+                .map_err(|_| NetherError::Timeout)?
                 .map_err(|e| NetherError::Other(format!("TLS handshake: {}", e)))?;
             serve_http(stream, connection, config, commands).await
         }
@@ -573,6 +605,80 @@ pub(crate) mod tests {
             .next()
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// Unanswered offers release their metadata on disconnect and on answer expiry.
+    #[tokio::test]
+    async fn abandoned_offers_release_metadata() {
+        use futures::StreamExt;
+        for disconnect in [false, true] {
+            let mut config = HttpServerConfig::default();
+            config.signaler.answer_timeout = Duration::from_millis(20);
+            let server = HttpSignalingServer::bind("127.0.0.1:0".parse().unwrap(), config)
+                .await
+                .unwrap();
+            let mut offers = server.signals();
+            let mut peer = TcpStream::connect(server.local_addr()).await.unwrap();
+            let offer = signed_offer();
+            peer.write_all(format!("POST /v1/join/1234 HTTP/1.1\r\nhost: metadata.example\r\ncontent-length: {}\r\n\r\n{offer}", offer.len()).as_bytes()).await.unwrap();
+            let signal = tokio::time::timeout(Duration::from_secs(2), offers.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let addr = Addr::new(signal.network_id, signal.connection_id);
+            assert!(server.remote_address(&addr).await.is_some());
+            assert_eq!(
+                server.host(&addr).await.as_deref(),
+                Some("metadata.example")
+            );
+            if disconnect {
+                drop(peer);
+            } else {
+                assert!(status_line(&mut peer).await.contains("504"));
+            }
+            let cleaned = tokio::time::timeout(Duration::from_secs(2), async {
+                while server.remote_address(&addr).await.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            server.shutdown().await;
+            assert!(cleaned.is_ok(), "abandoned offer retained metadata");
+        }
+    }
+
+    /// A stalled TLS peer must release its socket without global server shutdown.
+    #[tokio::test]
+    async fn stalled_tls_is_closed_at_the_header_budget() {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![issued.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        let server = HttpSignalingServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            HttpServerConfig {
+                tls: Some(Arc::new(tls)),
+                idle_timeout: Duration::from_millis(20),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut peer = TcpStream::connect(server.local_addr()).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut [0; 1])).await;
+        server.shutdown().await;
+        assert!(
+            matches!(result, Ok(Ok(0))),
+            "stalled TLS socket survived its budget: {result:?}"
+        );
     }
 
     #[tokio::test]

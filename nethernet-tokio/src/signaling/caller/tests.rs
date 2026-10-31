@@ -422,3 +422,35 @@ async fn caller_negotiation_timeout_does_not_automatically_offer_again() {
     );
     assert!(matches!(driver.recv().now_or_never(), Some(None)));
 }
+
+/// A prepared delivery belongs to the original subscription even when the next offer reuses its ID.
+#[tokio::test]
+async fn prepared_delivery_cannot_enter_a_replacement_with_the_same_connection_id() {
+    let (caller, mut driver) = bridge();
+    let incoming = caller.signals().unwrap();
+    {
+        let mut send = Box::pin(caller.signal(Signal::offer(9, "sdp".into(), PEER.into())));
+        assert!(poll!(send.as_mut()).is_pending());
+        driver
+            .recv()
+            .await
+            .unwrap()
+            .finish(Ok(SignalDelivery::PeerReceived));
+        send.await.unwrap();
+    }
+    let old = driver
+        .prepare_delivery(PEER, "CANDIDATEADD 9 retired")
+        .unwrap();
+    drop(incoming);
+    let mut replacement = caller.signals().unwrap();
+    let mut send = Box::pin(caller.signal(Signal::offer(9, "sdp".into(), PEER.into())));
+    assert!(poll!(send.as_mut()).is_pending());
+    driver
+        .recv()
+        .await
+        .unwrap()
+        .finish(Ok(SignalDelivery::PeerReceived));
+    send.await.unwrap();
+    assert_eq!(old.await, Err(CallerSignalingError::RouteMismatch));
+    assert!(replacement.next().now_or_never().is_none());
+}

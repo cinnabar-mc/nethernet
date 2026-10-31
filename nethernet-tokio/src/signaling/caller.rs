@@ -92,6 +92,7 @@ pub enum SignalDelivery {
 struct Inbox {
     receiver: Option<mpsc::Receiver<Signal>>,
     connection_id: Option<u64>,
+    epoch: Arc<()>,
 }
 
 /// Transport side of one caller-driven, per-peer bridge.
@@ -164,6 +165,7 @@ impl CallerSignaling {
         let inbox = Arc::new(Mutex::new(Inbox {
             receiver: Some(receiver),
             connection_id: None,
+            epoch: Arc::new(()),
         }));
         let closed = CancellationToken::new();
         Ok((
@@ -229,6 +231,7 @@ impl CallerSignaling {
             .take()
             .ok_or(CallerSignalingError::AlreadySubscribed)?;
         inbox.connection_id = None;
+        inbox.epoch = Arc::new(());
         let subscription = Subscription {
             receiver: Some(receiver),
             inbox: self.inbox.clone(),
@@ -419,10 +422,11 @@ impl CallerSignalingDriver {
         CallerSignalingError,
     > {
         let signal = self.decode(sender, wire)?;
-        check_subscription(
-            &self.inbox.lock().unwrap_or_else(|error| error.into_inner()),
-            &signal,
-        )?;
+        let epoch = {
+            let inbox = self.inbox.lock().unwrap_or_else(|error| error.into_inner());
+            check_subscription(&inbox, &signal)?;
+            inbox.epoch.clone()
+        };
         let incoming = self.incoming.clone();
         let inbox = self.inbox.clone();
         let closed = self.closed.clone();
@@ -437,6 +441,9 @@ impl CallerSignalingDriver {
                 return Err(CallerSignalingError::Closed);
             }
             check_subscription(&inbox, &signal)?;
+            if !Arc::ptr_eq(&inbox.epoch, &epoch) {
+                return Err(CallerSignalingError::RouteMismatch);
+            }
             if deadline.is_some_and(|deadline| tokio::time::Instant::now().into_std() >= deadline) {
                 return Err(CallerSignalingError::TimedOut);
             }

@@ -223,7 +223,14 @@ impl NetherClient {
                 NetherError::Protocol(nethernet::session::IceError::UnsupportedCarrier.into()),
             ));
         }
-        let deadline = tokio::time::Instant::now() + config.timeouts.negotiation;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(config.timeouts.negotiation)
+            .ok_or_else(|| {
+                (
+                    None,
+                    NetherError::InvalidState("negotiation timeout is too large".into()),
+                )
+            })?;
         let bind_addr = config
             .client_ice
             .as_ref()
@@ -603,6 +610,22 @@ impl AsyncWrite for NetherClient {
 mod tests {
     use super::*;
     use nethernet::identity::ServerIdentity;
+
+    /// Caller-controlled timeout overflow must remain a configuration error.
+    #[tokio::test]
+    async fn unrepresentable_negotiation_deadline_returns_an_error() {
+        let (caller, _driver) =
+            crate::CallerSignaling::new("local".into(), "peer".into(), Default::default()).unwrap();
+        let config = ConnectionConfig {
+            timeouts: crate::transport::Timeouts {
+                negotiation: std::time::Duration::MAX,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = NetherClient::connect_with(caller, "peer".into(), config).await;
+        assert!(matches!(result, Err(NetherError::InvalidState(_))));
+    }
 
     /// Configured preflight retains the original failure classification before an offer exists.
     #[tokio::test]

@@ -1080,3 +1080,35 @@ fn framing_rejection_retains_only_accepted_prefix_before_terminal() {
         ));
     }
 }
+
+/// Direct descriptions must have the same DTLS roles as their encoded counterparts.
+#[test]
+fn direct_descriptions_negotiate_complementary_roles_and_reach_ready() {
+    let now = Instant::now();
+    let (mut offerer, offer) = Session::new(addr(40100), true, 1, now).unwrap();
+    let (mut answerer, answer) = Session::new(addr(40101), false, 2, now).unwrap();
+    assert_ne!(
+        ResolvedRole::from_remote_announced(offer.dtls_role),
+        ResolvedRole::from_remote_announced(answer.dtls_role)
+    );
+    let offer_candidates = vec![offerer.local_candidate().clone()];
+    let answer_candidates = vec![answerer.local_candidate().clone()];
+    answerer
+        .handle(SessionInput::RemoteDescription(
+            offer,
+            offer_candidates,
+            now,
+        ))
+        .unwrap();
+    offerer
+        .handle(SessionInput::RemoteDescription(
+            answer,
+            answer_candidates,
+            now,
+        ))
+        .unwrap();
+    assert_eq!(
+        drive_until_ready(&mut offerer, &mut answerer, now),
+        (true, true)
+    );
+}

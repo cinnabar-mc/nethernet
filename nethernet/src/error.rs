@@ -56,6 +56,17 @@ pub enum SignalErrorCode {
     NoSignalingChannel = 24,
     NotLoggedIn = 25,
     SignalingFailedToSend = 26,
+    RelayServerConfigurationResultFailure = 27,
+    RelayServerConfigurationResultParsingErrorNoUrls = 28,
+    RelayServerConfigurationResultParsingErrorNoCreds = 29,
+    RelayServerConfigurationResultParsingErrorNoServers = 30,
+    RelayServerConfigurationResultParsingErrorNoExpiration = 31,
+    DataChannelClosed = 32,
+    InternalErrorJsonSerialization = 33,
+    InvalidArgument = 34,
+    GenericFailure = 35,
+    FailedToCreateIdentityAssertion = 36,
+    IdentityNotAllowed = 37,
 }
 
 impl From<u32> for SignalErrorCode {
@@ -88,6 +99,17 @@ impl From<u32> for SignalErrorCode {
             24 => SignalErrorCode::NoSignalingChannel,
             25 => SignalErrorCode::NotLoggedIn,
             26 => SignalErrorCode::SignalingFailedToSend,
+            27 => SignalErrorCode::RelayServerConfigurationResultFailure,
+            28 => SignalErrorCode::RelayServerConfigurationResultParsingErrorNoUrls,
+            29 => SignalErrorCode::RelayServerConfigurationResultParsingErrorNoCreds,
+            30 => SignalErrorCode::RelayServerConfigurationResultParsingErrorNoServers,
+            31 => SignalErrorCode::RelayServerConfigurationResultParsingErrorNoExpiration,
+            32 => SignalErrorCode::DataChannelClosed,
+            33 => SignalErrorCode::InternalErrorJsonSerialization,
+            34 => SignalErrorCode::InvalidArgument,
+            35 => SignalErrorCode::GenericFailure,
+            36 => SignalErrorCode::FailedToCreateIdentityAssertion,
+            37 => SignalErrorCode::IdentityNotAllowed,
             _ => SignalErrorCode::SignalingUnknownError,
         }
     }

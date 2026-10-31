@@ -76,7 +76,7 @@ pub fn encode(packet: &Packets, sender_id: u64) -> Result<Vec<u8>> {
     header.serialize(&mut payload)?;
     packet.serialize(&mut payload)?;
 
-    let data_len = payload.len() - 2;
+    let data_len = payload.len();
     if data_len > u16::MAX as usize {
         return Err(ProtocolError::MessageSizeExceeded(data_len));
     }
@@ -170,7 +170,7 @@ mod tests {
         };
         assert_eq!(actual_sender, sender);
         assert_eq!(matched.recipient_id, recipient);
-        assert_eq!(matched.data, data);
+        assert_eq!(matched.data, data.as_bytes());
 
         let mut payload = original[compute_checksum(&[]).len()..].to_vec();
         decrypt(&mut payload).unwrap();
@@ -195,6 +195,6 @@ mod tests {
         };
         assert_eq!(actual_sender, sender);
         assert_eq!(decoded.recipient_id, recipient);
-        assert_eq!(decoded.data, data);
+        assert_eq!(decoded.data, data.as_bytes());
     }
 }

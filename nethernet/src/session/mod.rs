@@ -231,7 +231,7 @@ impl Session<Connecting> {
             dtls_role: if is_controlling {
                 DtlsRole::Server
             } else {
-                DtlsRole::Auto
+                DtlsRole::Client
             },
             fingerprint,
             sctp_max_message_size: LOCAL_SCTP_MAX_MESSAGE_SIZE,

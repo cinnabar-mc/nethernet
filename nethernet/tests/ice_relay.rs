@@ -1060,3 +1060,83 @@ fn owned_turn_transactions_ignore_wrong_methods_and_reflected_requests() {
 
 #[path = "ice_relay/allocation_lifetime.rs"]
 mod allocation_lifetime;
+
+#[test]
+fn idle_relay_sends_emit_transport_output_without_a_timeout() {
+    for v6 in [false, true] {
+        for channel in [Channel::Reliable, Channel::Unreliable] {
+            let (mut endpoints, mut server, now) = pair(v6);
+            endpoints[0].drain(&mut server);
+            endpoints[0]
+                .session
+                .send(channel, b"immediate".as_slice().into(), now)
+                .unwrap();
+            assert!(
+                std::iter::from_fn(|| endpoints[0].session.poll()).any(|output| {
+                    let SessionOutput::Send(bytes, _) = output else {
+                        return false;
+                    };
+                    if rtc_turn::proto::chandata::ChannelData::is_channel_data(&bytes) {
+                        return true;
+                    }
+                    let mut message = rtc::stun::message::Message::new();
+                    message.unmarshal_binary(&bytes).is_ok()
+                        && message.typ.method == rtc::stun::message::METHOD_SEND
+                }),
+                "{channel:?} had no immediate relay data"
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_acceptance_retains_the_allocation_for_cleanup() {
+    use nethernet::connection::{Connection, IceMode};
+    use nethernet::protocol::Signal;
+    for invalid_signal in [true, false] {
+        let now = Instant::now();
+        let local = addr(false, 48200);
+        let mut server = TurnPeer::new(addr(false, 3478));
+        let (mut session, description) = Session::new_with_ice(
+            local,
+            false,
+            1,
+            config(server.addr, now, IcePolicy::RelayOnly),
+            now,
+        )
+        .unwrap();
+        drive_gatherer(&mut session, local, &mut server, now);
+        assert_eq!(server.allocation_count(), 1);
+        let (offer, candidates) = if invalid_signal {
+            (Signal::answer(42, "sdp".into(), "2".into()), Vec::new())
+        } else {
+            let candidate = nethernet::protocol::webrtc::candidate::parse_ice_candidate(
+                "candidate:invalid 1 udp 1 0.0.0.0 4000 typ host",
+            )
+            .unwrap();
+            (Signal::offer(42, "sdp".into(), "2".into()), vec![candidate])
+        };
+        let failure = match Connection::accept(
+            session,
+            description.clone(),
+            &offer,
+            description,
+            candidates,
+            IceMode::Full,
+            now,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid acceptance succeeded"),
+        };
+        let (session, _) = failure.into_parts();
+        let (mut retired, closed) = session.close(now);
+        closed.unwrap();
+        while let Some(output) = retired.poll() {
+            if let SessionOutput::Send(bytes, to) = output {
+                assert_eq!(to, server.addr);
+                server.receive(local, bytes);
+            }
+        }
+        assert_eq!(server.allocation_count(), 0);
+    }
+}

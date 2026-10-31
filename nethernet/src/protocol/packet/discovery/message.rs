@@ -8,19 +8,24 @@ use std::io::{Read, Write};
 #[derive(Debug, Clone, Default)]
 pub struct MessagePacket {
     pub recipient_id: u64,
-    pub data: String,
+    /// Opaque wire bytes; signaling interprets its text separately.
+    pub data: Vec<u8>,
 }
 
 impl MessagePacket {
-    pub fn new(recipient_id: u64, data: String) -> Self {
-        Self { recipient_id, data }
+    /// Retains the supplied payload bytes without imposing a text encoding.
+    pub fn new(recipient_id: u64, data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            recipient_id,
+            data: data.into(),
+        }
     }
 }
 
 impl NetherCodec for MessagePacket {
     fn serialize<W: Write>(&self, writer: &mut W) -> Result<()> {
         writer.write_u64::<LittleEndian>(self.recipient_id)?;
-        write_bytes_u32(writer, self.data.as_bytes())?;
+        write_bytes_u32(writer, &self.data)?;
         Ok(())
     }
 
@@ -34,9 +39,10 @@ impl NetherCodec for MessagePacket {
         if data_bytes.len() > MAX_BYTES {
             return Err(ProtocolError::MessageSizeExceeded(data_bytes.len()));
         }
-        let data = String::from_utf8(data_bytes)
-            .map_err(|e| ProtocolError::Other(format!("invalid UTF-8: {}", e)))?;
-        Ok(Self { recipient_id, data })
+        Ok(Self {
+            recipient_id,
+            data: data_bytes,
+        })
     }
 
     fn size_hint(&self) -> usize {

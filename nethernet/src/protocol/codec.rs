@@ -66,6 +66,9 @@ pub fn read_varuint32<R: Read>(reader: &mut R) -> Result<u32> {
     let mut value: u32 = 0;
     for shift in (0..35).step_by(7) {
         let byte = reader.read_u8()?;
+        if shift == 28 && byte & 0xf0 != 0 {
+            return Err(ProtocolError::Other("varuint32 exceeds 32 bits".into()));
+        }
         value |= u32::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);

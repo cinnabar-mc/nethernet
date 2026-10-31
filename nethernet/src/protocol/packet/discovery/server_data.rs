@@ -45,7 +45,7 @@ impl ServerDataVersion {
 pub struct ServerData {
     pub server_name: String,
     pub level_name: String,
-    pub game_type: u8,
+    pub game_type: i32,
     pub player_count: i32,
     pub max_player_count: i32,
     pub editor_world: bool,
@@ -54,7 +54,7 @@ pub struct ServerData {
     pub flag_b: bool,
     pub session_id: String,
     pub transport_layer: u8,
-    pub connection_type: u8,
+    pub connection_type: i32,
     pub protocol_version: u32,
     pub game_version: String,
 }
@@ -85,7 +85,7 @@ impl ServerData {
             level: String,
             players: i32,
             max_players: i32,
-            game_type: u8,
+            game_type: i32,
         }
 
         let status: Status = serde_json::from_str(json)
@@ -150,13 +150,13 @@ impl NetherCodec for ServerData {
         write_bytes_varuint(writer, self.level_name.as_bytes())?;
         write_varint32(writer, self.player_count)?;
         write_varint32(writer, self.max_player_count)?;
-        write_varint32(writer, i32::from(self.game_type))?;
+        write_varint32(writer, self.game_type)?;
         writer.write_u8(if self.editor_world { 1 } else { 0 })?;
         writer.write_u8(if self.hardcore { 1 } else { 0 })?;
         writer.write_u8(if self.flag_a { 1 } else { 0 })?;
         writer.write_u8(if self.flag_b { 1 } else { 0 })?;
         write_bytes_varuint(writer, self.session_id.as_bytes())?;
-        write_varint32(writer, i32::from(self.connection_type))?;
+        write_varint32(writer, self.connection_type)?;
 
         Ok(())
     }
@@ -215,9 +215,6 @@ impl NetherCodec for ServerData {
                 (player_count, max_player_count, game_type)
             }
         };
-        let game_type = u8::try_from(game_type).map_err(|_| {
-            ProtocolError::Other(format!("game type {} does not fit into u8", game_type))
-        })?;
 
         let editor_world = reader.read_u8()? != 0;
         let hardcore = reader.read_u8()? != 0;
@@ -249,13 +246,12 @@ impl NetherCodec for ServerData {
                 i32::from(reader.read_u8()? >> 1),
             ),
         };
-        let to_u8 = |value: i32, what: &str| {
-            u8::try_from(value).map_err(|_| {
-                ProtocolError::Other(format!("{} {} does not fit into u8", what, value))
-            })
-        };
-        let transport_layer = to_u8(transport_layer, "transport layer")?;
-        let connection_type = to_u8(connection_type, "connection type")?;
+        let transport_layer = u8::try_from(transport_layer).map_err(|_| {
+            ProtocolError::Other(format!(
+                "transport layer {} does not fit into u8",
+                transport_layer
+            ))
+        })?;
 
         Ok(Self {
             server_name,

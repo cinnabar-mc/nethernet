@@ -20,16 +20,8 @@ use std::time::Instant;
 /// Known differences from go-nethernet. Each check asserts its entry still reproduces,
 /// so fixing one fails here until the entry is removed.
 const EXPECTED_DIVERGENCES: &[&str] = &[
-    // Rust's LAN length prefix excludes the prefix; Go's includes it (go-nethernet 1c5981b).
-    "lan-length-prefix",
     // Better than Go: ServerData versions 4 to 6 decode; Go reads only version 7.
     "server-data-legacy-versions",
-    // Stricter than Go: LAN message data must be valid UTF-8; Go keeps any bytes.
-    "lan-message-utf8",
-    // Stricter than Go: game type and connection type must fit a u8.
-    "server-data-u8-fields",
-    // Error codes 27 to 37 read as SignalingUnknownError (go-nethernet 20af621, f0d2dac).
-    "error-codes-27-to-37",
 ];
 
 fn check(id: &str, diverges: bool) {
@@ -77,7 +69,7 @@ fn rust_decoded(wire: &[u8]) -> Result<Decoded, String> {
             packet: "message",
             sender,
             recipient: p.recipient_id,
-            data: p.data.into_bytes(),
+            data: p.data,
         },
     })
 }
@@ -220,7 +212,7 @@ fn message_data_that_is_not_utf8() {
     }));
     let go_result = go_decoded(&mut go, &wire);
     assert_eq!(go_result.as_ref().map(|d| d.data.as_slice()), Ok(&data[..]));
-    check("lan-message-utf8", rust_decoded(&wire).is_err());
+    assert_eq!(rust_decoded(&wire), go_result);
 }
 
 fn to_go(d: &ServerData) -> Value {
@@ -327,7 +319,8 @@ fn server_data_fields_wider_than_a_byte() {
         .get("error")
         .is_none();
     assert!(go_reads);
-    check("server-data-u8-fields", ServerData::decode(&wire).is_err());
+    let decoded = ServerData::decode(&wire).unwrap();
+    assert_eq!(to_go(&decoded), fields);
 }
 
 #[test]
@@ -412,14 +405,13 @@ fn error_codes_match_go() {
     let max = go.call(json!({"op": "error_codes"}))["max"]
         .as_u64()
         .unwrap() as u32;
-    let lost: Vec<u32> = (0..=max)
-        .filter(|&code| u32::from(SignalErrorCode::from(code)) != code)
-        .collect();
-    assert!(
-        lost.iter().all(|&code| code >= 27),
-        "codes below 27 changed: {lost:?}"
-    );
-    check("error-codes-27-to-37", !lost.is_empty());
+    for code in 0..=max {
+        assert_eq!(
+            u32::from(SignalErrorCode::from(code)),
+            code,
+            "error code {code}"
+        );
+    }
 }
 
 fn attribute<'a>(sdp: &'a str, key: &str) -> Option<&'a str> {
@@ -543,4 +535,28 @@ fn non_trickle_sdp_layout_matches_go() {
 
 fn sdp_has_candidate(sdp: &str) -> bool {
     sdp.contains("a=candidate:")
+}
+
+#[test]
+fn unused_outer_length_hints_do_not_change_packet_decoding() {
+    let Some(mut go) = oracle() else { return };
+    let mut plain = payload(0, 3, &[]);
+    for length in [0, 1, 18, 20, u16::MAX] {
+        plain[..2].copy_from_slice(&length.to_le_bytes());
+        let wire = go.seal(&plain);
+        let expected = Decoded {
+            packet: "request",
+            sender: 3,
+            recipient: 0,
+            data: Vec::new(),
+        };
+        assert_eq!(
+            rust_decoded(&wire),
+            Ok(Decoded {
+                data: Vec::new(),
+                ..expected
+            })
+        );
+        assert_eq!(go_decoded(&mut go, &wire), Ok(expected));
+    }
 }

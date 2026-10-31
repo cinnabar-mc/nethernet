@@ -146,22 +146,19 @@ impl LanSignaler {
             return Ok(());
         }
 
-        self.addresses.insert(
-            sender,
-            AddressEntry {
-                addr,
-                last_seen: now,
-            },
-        );
-
         match packet {
-            Packets::Request(_) => self.answer_request(addr)?,
+            Packets::Request(_) => {
+                self.remember_address(sender, addr, now);
+                self.answer_request(addr)?;
+            }
             Packets::Response(response) => {
                 let full = self.discovered.len() >= self.config.max_discovered;
                 if full && !self.discovered.contains_key(&sender) {
                     return Ok(());
                 }
-                if let Ok(data) = ServerData::decode(&response.application_data) {
+                if let Ok(data) = ServerData::decode(&response.application_data)
+                    && self.remember_address(sender, addr, now)
+                {
                     self.discovered.insert(sender, data.clone());
                     self.output
                         .push_back(LanSignalerOutput::ServerDiscovered(sender, Box::new(data)));
@@ -169,26 +166,55 @@ impl LanSignaler {
             }
             Packets::Message(message) => {
                 if message.data.is_empty()
-                    || message.data == PING
+                    || message.data == PING.as_bytes()
                     || message.recipient_id != self.network_id
                 {
                     return Ok(());
                 }
-
-                let Ok(signal) = Signal::from_string(&message.data, sender.to_string()) else {
+                let Ok(text) = std::str::from_utf8(&message.data) else {
+                    return Ok(());
+                };
+                let Ok(signal) = Signal::from_string(text, sender.to_string()) else {
                     tracing::debug!("ignoring malformed signal from {}", sender);
                     return Ok(());
                 };
-
+                if !self.remember_address(sender, addr, now) {
+                    return Ok(());
+                }
                 self.pending.retain(|pending| {
-                    pending.target != sender || pending.signal.connection_id != signal.connection_id
+                    pending.target != sender
+                        || pending.signal.connection_id != signal.connection_id
+                        || match signal.signal_type {
+                            SignalType::Error => false,
+                            SignalType::Answer => pending.signal.signal_type != SignalType::Offer,
+                            _ => true,
+                        }
                 });
-
                 self.output.push_back(LanSignalerOutput::Signal(signal));
             }
         }
 
         Ok(())
+    }
+
+    /// Bounds unauthenticated address state while allowing existing peers to refresh.
+    fn remember_address(&mut self, sender: u64, addr: SocketAddr, now: Instant) -> bool {
+        if !self.addresses.contains_key(&sender)
+            && self.addresses.len() >= self.config.max_addresses
+        {
+            self.expire(now);
+            if self.addresses.len() >= self.config.max_addresses {
+                return false;
+            }
+        }
+        self.addresses.insert(
+            sender,
+            AddressEntry {
+                addr,
+                last_seen: now,
+            },
+        );
+        true
     }
 
     fn answer_request(&mut self, addr: SocketAddr) -> Result<(), LanSignalerError> {
@@ -222,6 +248,8 @@ impl LanSignaler {
                 attempts: 1,
                 next_send,
             });
+            self.output
+                .push_back(LanSignalerOutput::Wait(self.next_timer(now)));
         }
 
         Ok(())

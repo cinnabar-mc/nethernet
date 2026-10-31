@@ -26,7 +26,7 @@ impl NetherMotd {
     }
 
     pub fn game_type(mut self, game_type: u8) -> Self {
-        self.server_data.game_type = game_type;
+        self.server_data.game_type = i32::from(game_type);
         self
     }
 
@@ -56,7 +56,7 @@ impl NetherMotd {
     }
 
     pub fn connection_type(mut self, connection_type: u8) -> Self {
-        self.server_data.connection_type = connection_type;
+        self.server_data.connection_type = i32::from(connection_type);
         self
     }
 

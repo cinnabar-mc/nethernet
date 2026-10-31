@@ -28,6 +28,9 @@ pub struct LanSignalerConfig {
     /// Retransmissions after the first send; zero disables them.
     pub signal_retries: u32,
 
+    /// Most unauthenticated peer addresses retained at once. Existing entries can still refresh.
+    pub max_addresses: usize,
+
     /// Most servers kept in the discovered map; responses from new servers beyond it are ignored.
     pub max_discovered: usize,
 }
@@ -43,6 +46,7 @@ impl Default for LanSignalerConfig {
             offer_retry_interval: Duration::from_secs(2),
             signal_retries: 3,
             max_discovered: 256,
+            max_addresses: 256,
         }
     }
 }

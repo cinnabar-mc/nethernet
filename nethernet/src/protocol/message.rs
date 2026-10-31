@@ -156,8 +156,11 @@ impl Message {
         }))
     }
 
-    /// Refuses a body beyond the caller's single-segment payload limit, excluding its header.
+    /// Refuses empty bodies and bodies beyond the single-segment payload limit, excluding its header.
     pub fn encode_unreliable(data: Bytes, maximum_payload: usize) -> Result<Bytes> {
+        if data.is_empty() {
+            return Err(ProtocolError::MessageParse("message body is empty".into()));
+        }
         if data.len() > maximum_payload {
             return Err(ProtocolError::MessageSizeExceeded(data.len()));
         }
@@ -167,6 +170,9 @@ impl Message {
 
 /// Checks the shared fragment-count policy before creating descriptors or copying wire bytes.
 fn segment_count(length: usize, maximum_payload: usize) -> Result<usize> {
+    if length == 0 {
+        return Err(ProtocolError::MessageParse("message body is empty".into()));
+    }
     let count = if length <= maximum_payload {
         1
     } else if maximum_payload == 0 {
@@ -239,10 +245,7 @@ mod tests {
     fn encoded_segments_preserve_boundaries_and_validate_before_encoding() {
         let wire: Vec<_> = Message::encode_segments(b"abcde", 2).unwrap().collect();
         assert_eq!(wire, [b"\x02ab".as_slice(), b"\x01cd", b"\x00e"]);
-        assert_eq!(
-            Message::encode_segments(b"", 0).unwrap().next().unwrap(),
-            b"\x00".as_slice()
-        );
+        assert!(Message::encode_segments(b"", 0).is_err());
         assert!(Message::encode_segments(b"x", 0).is_err());
         assert!(Message::encode_segments(&[0; 256], 1).is_err());
     }

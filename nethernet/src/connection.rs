@@ -45,6 +45,32 @@ pub struct Connection<S: Phase = Connecting> {
     next_candidate_index: usize,
 }
 
+/// A rejected acceptance retains the session so its caller can close and drain TURN cleanup.
+#[derive(thiserror::Error)]
+#[error("{error}")]
+pub struct AcceptError {
+    #[source]
+    error: ProtocolError,
+    session: Box<Session>,
+}
+
+impl std::fmt::Debug for AcceptError {
+    /// Reports the failure without inspecting the retained transport state.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcceptError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcceptError {
+    /// Returns the original session and failure; close the session and drain its output before dropping it.
+    pub fn into_parts(self) -> (Session, ProtocolError) {
+        (*self.session, self.error)
+    }
+}
+
 impl Connection<Connecting> {
     pub fn connect(
         mut session: Session,
@@ -85,7 +111,8 @@ impl Connection<Connecting> {
         Description::parse(&offer.data)
     }
 
-    /// Applies a parsed offer and builds the answer signals, adopting the offer's connection and network ids.
+    /// Applies a parsed offer and builds answer signals, adopting its connection and network ids.
+    /// On error, recover the session with `AcceptError::into_parts`, close it and drain its output.
     pub fn accept(
         mut session: Session,
         description: Description,
@@ -94,17 +121,25 @@ impl Connection<Connecting> {
         remote_candidates: Vec<Candidate>,
         ice_mode: IceMode,
         now: Instant,
-    ) -> Result<(Connection, Vec<Signal>), ProtocolError> {
+    ) -> Result<(Connection, Vec<Signal>), AcceptError> {
         if offer.signal_type != SignalType::Offer {
-            return Err(ProtocolError::Other("expected an offer signal".to_string()));
+            return Err(AcceptError {
+                error: ProtocolError::Other("expected an offer signal".to_string()),
+                session: Box::new(session),
+            });
         }
 
         let remote_identity = remote_description.identity.clone();
-        session.handle(SessionInput::RemoteDescription(
+        if let Err(error) = session.handle(SessionInput::RemoteDescription(
             remote_description,
             remote_candidates,
             now,
-        ))?;
+        )) {
+            return Err(AcceptError {
+                error,
+                session: Box::new(session),
+            });
+        }
 
         let signals = Self::answer_signals(&session, &description, offer, ice_mode);
         let candidates = Self::take_described_candidates(&mut session);

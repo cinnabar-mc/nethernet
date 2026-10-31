@@ -41,6 +41,8 @@ pub(super) enum ServerEvent {
 }
 
 struct Permission {
+    // The relay API registers one socket tuple; TURN permission itself covers the IP.
+    peer: SocketAddr,
     pending: Option<TransactionId>,
     valid_until: Option<Instant>,
     attempts: u8,
@@ -85,7 +87,8 @@ pub(super) struct Server {
     integrity_key: Option<Vec<u8>>,
     manual_refresh_pending: bool,
     refresh_nonce_retries: u8,
-    permissions: HashMap<SocketAddr, Permission>,
+    permissions: HashMap<IpAddr, Permission>,
+    transmits: VecDeque<TaggedBytesMut>,
     requests: HashMap<TransactionId, TrackedRequest>,
     pending: VecDeque<TaggedBytesMut>,
     pending_bytes: usize,
@@ -140,6 +143,7 @@ impl Server {
             manual_refresh_pending: false,
             refresh_nonce_retries: 0,
             permissions: HashMap::new(),
+            transmits: VecDeque::new(),
             requests: HashMap::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
@@ -449,7 +453,7 @@ impl Server {
                     self.allocating = false;
                 }
                 Event::CreatePermissionResponse(id, peer) => {
-                    if let Some(permission) = self.permissions.get_mut(&peer)
+                    if let Some(permission) = self.permissions.get_mut(&peer.ip())
                         && permission.pending == Some(id)
                     {
                         permission.pending = None;
@@ -458,7 +462,7 @@ impl Server {
                             now.checked_add(PERMISSION_LIFETIME)
                                 .ok_or(IceError::Server)?,
                         );
-                        self.flush_peer(peer, now)?;
+                        self.flush_peer(peer.ip(), now)?;
                     }
                 }
                 Event::CreatePermissionError(id, error) => {
@@ -473,7 +477,7 @@ impl Server {
                                 .get_mut(&peer)
                                 .ok_or(IceError::Server)?
                                 .pending = None;
-                            self.request_permission(peer, now)?;
+                            self.request_permission(self.permissions[&peer].peer, now)?;
                         } else {
                             self.discard_peer(peer);
                         }
@@ -500,9 +504,8 @@ impl Server {
                 }
                 Event::DataIndicationOrChannelData(_, peer, data) => {
                     if let Some(relay) = self.relay
-                        && self.permissions.iter().any(|(allowed, permission)| {
-                            allowed.ip() == peer.ip()
-                                && permission.valid_until.is_some_and(|expiry| now < expiry)
+                        && self.permissions.get(&peer.ip()).is_some_and(|permission| {
+                            permission.valid_until.is_some_and(|expiry| now < expiry)
                         })
                     {
                         self.events.push_back(ServerEvent::Data(TaggedBytesMut {
@@ -527,25 +530,28 @@ impl Server {
             return Err(IceError::Configuration);
         }
         // A refused candidate cannot terminate checks for other peers or retain queued data.
-        if self.permissions.get(&peer).is_some_and(|permission| {
+        if self.permissions.get(&peer.ip()).is_some_and(|permission| {
             permission.attempts >= MAX_PERMISSION_ATTEMPTS
                 && permission.pending.is_none()
                 && permission.valid_until.is_none()
         }) {
             return Ok(());
         }
-        if self.permissions.get(&peer).is_some_and(|permission| {
+        if self.permissions.get(&peer.ip()).is_some_and(|permission| {
             permission
                 .valid_until
                 .is_some_and(|expiry| msg.now < expiry)
         }) {
-            return self
-                .client
-                .as_mut()
-                .ok_or(IceError::Closed)?
-                .relay(relay)
-                .and_then(|mut relay| relay.send_to(msg.now, &msg.message, peer))
-                .map_err(|_| IceError::Server);
+            if self.permissions[&peer.ip()].peer == peer {
+                return self
+                    .client
+                    .as_mut()
+                    .ok_or(IceError::Closed)?
+                    .relay(relay)
+                    .and_then(|mut relay| relay.send_to(msg.now, &msg.message, peer))
+                    .map_err(|_| IceError::Server);
+            }
+            return self.send_indication(msg);
         }
         if self.pending.len() >= MAX_PENDING_PACKETS
             || msg.message.len() > MAX_PENDING_BYTES.saturating_sub(self.pending_bytes)
@@ -558,20 +564,60 @@ impl Server {
         Ok(())
     }
 
+    /// Uses the existing IP permission when the relay API has only registered another port.
+    fn send_indication(&mut self, msg: TaggedBytesMut) -> Result<(), IceError> {
+        let peer = msg.transport.peer_addr;
+        let mut indication = Message::new();
+        indication
+            .build(&[
+                Box::new(TransactionId::new()),
+                Box::new(rtc::stun::message::MessageType::new(
+                    rtc::stun::message::METHOD_SEND,
+                    CLASS_INDICATION,
+                )),
+                Box::new(rtc_turn::proto::data::Data(msg.message.to_vec())),
+                Box::new(PeerAddress {
+                    ip: peer.ip(),
+                    port: peer.port(),
+                }),
+                Box::new(rtc::stun::fingerprint::FINGERPRINT),
+            ])
+            .map_err(|_| IceError::Server)?;
+        while let Some(packet) = self.client.as_mut().and_then(|client| client.poll_write()) {
+            self.transmits.push_back(packet);
+        }
+        let (local, transport_protocol) = match self.carrier {
+            Carrier::Udp { local } => (local, TransportProtocol::UDP),
+            Carrier::ActiveStream { route, .. } => (route.local(), TransportProtocol::TCP),
+            Carrier::PendingStream { .. } => return Err(IceError::Closed),
+        };
+        self.transmits.push_back(TaggedBytesMut {
+            now: msg.now,
+            transport: TransportContext {
+                transport_protocol,
+                ..context(local, self.addr)
+            },
+            message: BytesMut::from(indication.raw.as_slice()),
+        });
+        Ok(())
+    }
+
     /// Deduplicates in-flight permissions; RTC owns the actual request and retransmissions.
     fn request_permission(&mut self, peer: SocketAddr, now: Instant) -> Result<(), IceError> {
         if self
             .permissions
-            .get(&peer)
+            .get(&peer.ip())
             .is_some_and(|permission| permission.pending.is_some())
         {
             return Ok(());
         }
-        if !self.permissions.contains_key(&peer) && self.permissions.len() >= MAX_REMOTE_CANDIDATES
+        if !self.permissions.contains_key(&peer.ip())
+            && self.permissions.len() >= MAX_REMOTE_CANDIDATES
         {
             return Err(IceError::CandidateLimit);
         }
-        let permission = self.permissions.entry(peer).or_insert(Permission {
+        let permission = self.permissions.entry(peer.ip()).or_insert(Permission {
+            peer,
             pending: None,
             valid_until: None,
             attempts: 0,
@@ -591,13 +637,13 @@ impl Server {
     }
 
     /// Flushes only the peer whose permission completed, retaining queue order for every other peer.
-    fn flush_peer(&mut self, peer: SocketAddr, now: Instant) -> Result<(), IceError> {
+    fn flush_peer(&mut self, peer: IpAddr, now: Instant) -> Result<(), IceError> {
         let count = self.pending.len();
         for _ in 0..count {
             let Some(mut packet) = self.pending.pop_front() else {
                 break;
             };
-            if packet.transport.peer_addr == peer {
+            if packet.transport.peer_addr.ip() == peer {
                 self.pending_bytes -= packet.message.len();
                 packet.now = now;
                 self.send(packet)?;
@@ -609,20 +655,24 @@ impl Server {
     }
 
     /// Drops data for a failed peer and keeps its finite attempt counter.
-    fn discard_peer(&mut self, peer: SocketAddr) {
+    fn discard_peer(&mut self, peer: IpAddr) {
         if let Some(permission) = self.permissions.get_mut(&peer) {
             permission.pending = None;
             permission.valid_until = None;
             permission.attempts = MAX_PERMISSION_ATTEMPTS;
         }
         self.pending
-            .retain(|packet| packet.transport.peer_addr != peer);
+            .retain(|packet| packet.transport.peer_addr.ip() != peer);
         self.pending_bytes = self.pending.iter().map(|packet| packet.message.len()).sum();
     }
 
     /// Retains the method, original integrity key and permission scope of every RTC request.
     pub fn poll_write(&mut self) -> Result<Option<TaggedBytesMut>, IceError> {
-        let Some(msg) = self.client.as_mut().and_then(|client| client.poll_write()) else {
+        let Some(msg) = self
+            .transmits
+            .pop_front()
+            .or_else(|| self.client.as_mut().and_then(|client| client.poll_write()))
+        else {
             return Ok(None);
         };
         if let Some(request) = decode_stun(&msg.message)
@@ -728,7 +778,7 @@ impl Server {
             .checked_add(PERMISSION_LIFETIME)
             .ok_or(IceError::Server)?;
         for (peer, permission) in &mut self.permissions {
-            if peers.contains(&peer.ip()) && permission.valid_until.is_some() {
+            if peers.contains(peer) && permission.valid_until.is_some() {
                 permission.valid_until = Some(expiry);
             }
         }
@@ -813,6 +863,7 @@ impl Server {
         self.manual_refresh_pending = false;
         self.refresh_nonce_retries = 0;
         self.permissions.clear();
+        self.transmits.clear();
         self.requests.clear();
         self.pending.clear();
         self.pending_bytes = 0;
@@ -913,3 +964,7 @@ fn redacted_error(response: &Message) -> Result<BytesMut, IceError> {
     message.build(&setters).map_err(|_| IceError::Server)?;
     Ok(BytesMut::from(message.raw.as_slice()))
 }
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;

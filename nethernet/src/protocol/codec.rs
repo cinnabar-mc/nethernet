@@ -12,15 +12,13 @@ pub trait NetherCodec: Sized {
     fn size_hint(&self) -> usize;
 }
 
+/// Allocates once for the bounded field length and rejects truncated input.
 fn read_len_bytes<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u8>> {
     if len > MAX_BYTES {
         return Err(ProtocolError::MessageSizeExceeded(len));
     }
-    let mut buf = Vec::new();
-    reader.take(len as u64).read_to_end(&mut buf)?;
-    if buf.len() < len {
-        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
-    }
+    let mut buf = vec![0; len];
+    reader.read_exact(&mut buf)?;
     Ok(buf)
 }
 

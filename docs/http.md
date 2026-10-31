@@ -86,6 +86,12 @@ keeps its identity between restarts, use
 the returned signer in `Arc`. The example generates an in-memory signer for one
 run. `allow_unsigned_answers` explicitly allows a server without a signer.
 
+Saved keys are created under an adjacent exclusive lock and published from a
+complete, synced temporary file. An empty file is recovered; nonempty invalid
+keys are reported without replacing them. New directories use mode 0700 and
+new keys and lock files use mode 0600 on Unix. Interrupted creators' temporary
+files are cleaned up under the same lock on the next creation attempt.
+
 HTTP offer verification belongs to `HttpServerConfig::signaler.token_trust`,
 whose default is `Some(TokenTrust::Any)`. The example client's self-signed identity
 satisfies that local demonstration policy. `Any` does not authenticate an issuer.

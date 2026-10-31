@@ -1,164 +1,124 @@
 use super::*;
 use std::{
-    future::{Future, poll_fn},
-    path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
-    task::{Context, Poll, Wake, Waker},
+    io::{BufRead, Read},
+    process::{Command, Stdio},
 };
-use tokio::{runtime::Handle, task::JoinHandle};
 
-/// Releases its one owned blocking task even when fixture setup unwinds.
-struct BlockedWrite {
-    release: Option<mpsc::Sender<()>>,
-    task: Option<JoinHandle<()>>,
-    file_created: bool,
-}
-
-impl BlockedWrite {
-    /// Queues before the identity future's next filesystem operation on its sole blocking worker.
-    fn new(runtime: &Handle, file_created: bool) -> Self {
-        let (release, wait) = mpsc::channel();
-        let task = runtime.spawn_blocking(move || {
-            let _ = wait.recv();
-        });
-        Self {
-            release: Some(release),
-            task: Some(task),
-            file_created,
-        }
-    }
-
-    /// Releases and joins this exact task before any persistence assertion.
-    async fn finish(mut self) {
-        let _ = self.release.take().unwrap().send(());
-        self.task.take().unwrap().await.unwrap();
-    }
-}
-
-impl Drop for BlockedWrite {
-    fn drop(&mut self) {
-        if let Some(release) = self.release.take() {
-            let _ = release.send(());
-        }
-    }
-}
-
-struct CreationWake {
-    path: PathBuf,
-    runtime: Handle,
-    state: Mutex<CreationState>,
-}
-
-struct CreationState {
-    outer: Waker,
-    blocked: Option<BlockedWrite>,
-    created: bool,
-}
-
-impl Wake for CreationWake {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    /// Holds each real filesystem completion until the next original operation registers its wait.
-    fn wake_by_ref(self: &Arc<Self>) {
-        let outer = {
-            let mut state = self.state.lock().unwrap();
-            if !state.created && state.blocked.is_none() {
-                state.created = self.path.is_file();
-                state.blocked = Some(BlockedWrite::new(&self.runtime, state.created));
-            }
-            state.outer.clone()
-        };
-        outer.wake();
-    }
-}
-
-/// The actual identity writer must finish its queued file write before publishing the saved identity.
-#[test]
-fn a_created_identity_waits_for_its_original_file_write_before_returning() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .max_blocking_threads(1)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let directory = std::env::temp_dir().join(format!(
-            "nethernet-persist-{}-{}",
+struct Directory(PathBuf);
+impl Directory {
+    /// Reserves an isolated directory for the owned writer processes.
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "nethernet-publish-{}-{}",
             std::process::id(),
             rand::random::<u64>()
         ));
-        std::fs::create_dir(&directory).unwrap();
-        let pem = directory.join("identity.pem");
-        let gate = Arc::new(CreationWake {
-            path: pem.clone(),
-            runtime: Handle::current(),
-            state: Mutex::new(CreationState {
-                outer: Waker::noop().clone(),
-                blocked: Some(BlockedWrite::new(&Handle::current(), false)),
-                created: false,
-            }),
-        });
-        let waker = Waker::from(Arc::clone(&gate));
-        let mut saving = Box::pin(from_pem_or_create(&pem, "example.com"));
-        let (waited_for_write, completed) = loop {
-            let (result, blocked) = poll_fn(|cx| {
-                let outer = cx.waker().clone();
-                let (previous, blocker_installed) = {
-                    let mut state = gate.state.lock().unwrap();
-                    (
-                        std::mem::replace(&mut state.outer, outer),
-                        state.blocked.is_some(),
-                    )
-                };
-                drop(previous);
-                // The blocker task's join can wake us before the filesystem callback.
-                // Only that callback's installed successor permits advancing the writer.
-                if !blocker_installed {
-                    return Poll::Pending;
-                }
-                let result = saving.as_mut().poll(&mut Context::from_waker(&waker));
-                let blocked = gate.state.lock().unwrap().blocked.take();
-                if blocked.is_some() || result.is_ready() {
-                    Poll::Ready((result, blocked))
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
-            let file_created = blocked.as_ref().is_some_and(|blocked| blocked.file_created);
-            if let Some(blocked) = blocked {
-                blocked.finish().await;
-            }
-            if file_created || result.is_ready() {
-                break (file_created && result.is_pending(), result);
-            }
-        };
-        let created = match completed {
-            Poll::Ready(result) => result.unwrap(),
-            Poll::Pending => saving.await.unwrap(),
-        };
-        let loaded = from_pem(&pem, "example.com").await.unwrap();
-        let same_key = created.verifying_key() == loaded.verifying_key();
-        #[cfg(unix)]
-        let mode = {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::metadata(&pem)
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777
-        };
-        tokio::fs::remove_dir_all(&directory).await.unwrap();
-        drop(gate);
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+impl Drop for Directory {
+    /// Removes only this fixture's directory after its writers have joined.
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
 
-        assert!(same_key, "original persisted identity did not reload");
-        #[cfg(unix)]
-        assert_eq!(mode, 0o600);
-        assert!(
-            waited_for_write,
-            "identity creation returned while its original file write was still queued"
-        );
+/// The final path remains absent until its complete synced temporary key is ready to publish.
+#[test]
+fn an_interrupted_publish_leaves_no_partial_destination() {
+    let directory = Directory::new();
+    let path = directory.0.join("identity.pem");
+    let result = load_or_create(&path, "self".into(), |temporary| {
+        assert!(!path.exists());
+        assert!(read(temporary, "self").unwrap().is_some());
+        Err(io::Error::other("fixture interrupts publication"))
     });
+    assert!(result.is_err());
+    assert!(!path.exists());
+    assert_eq!(
+        fs::read_dir(&directory.0).unwrap().count(),
+        1,
+        "only the stable lock remains"
+    );
+}
+
+/// Stale cleanup covers both save formats without deleting unrelated files or directories.
+#[test]
+fn a_creator_cleans_only_stale_key_temporaries() {
+    let directory = Directory::new();
+    let path = directory.0.join("identity.pem");
+    for name in [
+        "identity.pem.tmp123",
+        ".nethernet-key-456",
+        "identity.pem.tmp",
+        "identity.pem.tmpABC",
+        "other.tmp123",
+    ] {
+        fs::write(directory.0.join(name), b"fixture temporary").unwrap();
+    }
+    fs::create_dir(directory.0.join("identity.pem.tmp789")).unwrap();
+    load_or_create(&path, "self".into(), |_| Ok(())).unwrap();
+    for name in ["identity.pem.tmp123", ".nethernet-key-456"] {
+        assert!(!directory.0.join(name).exists());
+    }
+    for name in [
+        "identity.pem.tmp",
+        "identity.pem.tmpABC",
+        "other.tmp123",
+        "identity.pem.tmp789",
+    ] {
+        assert!(directory.0.join(name).exists());
+    }
+}
+
+/// Child-only entry point holds the actual publisher after syncing, before its rename.
+#[test]
+#[ignore = "subprocess fixture"]
+fn interrupted_publisher_process() {
+    let path = PathBuf::from(std::env::var_os("NETHERNET_KEY_TEST_PATH").unwrap());
+    load_or_create(&path, "self".into(), |_| {
+        println!("TEMP_READY");
+        io::stdout().flush()?;
+        io::stdin().read_exact(&mut [0])?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// A creator killed while holding its lock leaves only an unpublished temp, recovered on restart.
+#[test]
+fn a_killed_creator_releases_its_lock_and_its_temporary_is_recovered() {
+    let directory = Directory::new();
+    let path = directory.0.join("identity.pem");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "util::identity::persistence_tests::interrupted_publisher_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("NETHERNET_KEY_TEST_PATH", &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = child.stdout.take().unwrap();
+    let mut lines = io::BufReader::new(output).lines();
+    let ready = lines.any(|line| line.is_ok_and(|line| line == "TEMP_READY"));
+    // Child::kill addresses only the exact child PID returned by this fixture's spawn.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(ready);
+    assert!(!path.exists());
+    let identity = load_or_create(&path, "self".into(), |_| Ok(())).unwrap();
+    assert_eq!(
+        identity.verifying_key(),
+        read(&path, "self").unwrap().unwrap().verifying_key()
+    );
+    assert_eq!(
+        fs::read_dir(&directory.0).unwrap().count(),
+        2,
+        "only key and lock remain"
+    );
 }

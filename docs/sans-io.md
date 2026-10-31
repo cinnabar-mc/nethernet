@@ -4,7 +4,7 @@ Choose `nethernet` when your application owns sockets, scheduling, and time.
 The core accepts typed input and returns work for your loop. It does not open
 sockets, resolve names, execute HTTP, or read a clock.
 
-For a socket-owning adapter, use [Tokio](tokio.md) or [Bevy](bevy.md).
+For a socket-owning adapter, use [Tokio](tokio.md).
 
 ## Create a session and exchange SDP
 

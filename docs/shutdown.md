@@ -50,15 +50,3 @@ on their original sockets, with any existing partial-write offset.
 The retired owner accepts no new input, credentials, or application sends.
 Dropping a core cannot perform socket I/O: the application must send the output.
 See the [event-loop guide](sans-io.md) for output and timer handling.
-
-## Bevy
-
-`client.disconnect()` releases the current outbound connection and discards its
-receive owner. Read any retained messages you need first. Starting another
-connection also discards the old receive owner. After transport failure, `recv`
-and `recv_unreliable` can still return messages accepted before failure.
-
-A server disconnects one peer with `server.disconnect(established_id)`. Keep the
-`EstablishedSessionId` from its connected event or `sessions()`, rather than
-trying to reconstruct it from peer IDs. Its clones observe closure; they cannot
-be used to control a later connection that happens to reuse the same IDs.

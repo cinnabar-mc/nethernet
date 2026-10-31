@@ -23,6 +23,7 @@ rtc.workspace = true
 rtc-turn.workspace = true
 byteorder.workspace = true
 ipnet.workspace = true
+form_urlencoded.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

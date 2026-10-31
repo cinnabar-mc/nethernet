@@ -13,6 +13,7 @@ use nethernet::prelude::ServerData;
 use nethernet::prelude::ServerIdentity;
 use nethernet::protocol::Signal;
 use nethernet::session::{Channel, TurnCredentials, TurnStreamRoute};
+pub use nethernet::signaling::http::join::ClientInfo;
 use nethernet::signaling::http::join::{self, StatusResponseError};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -225,6 +226,7 @@ pub struct NetherHttpClient {
     attempts: u32,
     attempts_left: u32,
     local_network_id: String,
+    client_info: ClientInfo,
     server_url: String,
     join_target: Option<(JoinTarget, SocketAddr)>,
     established: Option<EstablishedClient>,
@@ -253,7 +255,8 @@ impl Default for NetherHttpClient {
             timeouts: Timeouts::default(),
             attempts: DEFAULT_ATTEMPTS,
             attempts_left: 0,
-            local_network_id: String::new(),
+            local_network_id: rand::random::<u64>().to_string(),
+            client_info: ClientInfo::default(),
             server_url: String::new(),
             join_target: None,
             established: None,
@@ -271,6 +274,11 @@ impl Default for NetherHttpClient {
 impl NetherHttpClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Selects optional game metadata for subsequent status queries.
+    pub fn set_client_info(&mut self, info: ClientInfo) {
+        self.client_info = info;
     }
 
     /// Selects the complete incoming body limit for future attempts, leaving active ones unchanged.
@@ -338,10 +346,14 @@ impl NetherHttpClient {
 
     /// Sends GET /v1/join; the result arrives as ServerData or QueryFailed.
     pub fn query_server_data(&mut self, url: &str) -> std::io::Result<()> {
+        let path = self
+            .client_info
+            .status_path(&self.local_network_id)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
         let (target, addr) = Self::resolve(url)?;
         self.tls.prepare(target.secure)?;
         let stream = self.open_stream(&target, addr)?;
-        let request = http_wire::RequestWriter::get(&target.authority, join::STATUS_PATH)
+        let request = http_wire::RequestWriter::get(&target.authority, &path)
             .map_err(std::io::Error::other)?;
         self.query = Some(Query {
             state: JoinState::sending(stream, &request),
@@ -690,3 +702,7 @@ impl NetherHttpClient {
 #[cfg(test)]
 #[path = "http_client/retirement_tests.rs"]
 mod retirement_tests;
+
+#[cfg(test)]
+#[path = "http_client/query_tests.rs"]
+mod query_tests;

@@ -12,6 +12,38 @@ pub const MAX_ANSWER_SIZE: usize = 1 << 20;
 
 pub const STATUS_PATH: &str = JOIN_PATH;
 
+/// Optional game version, protocol and platform sent when querying an HTTP endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientInfo {
+    pub version: String,
+    pub protocol: i64,
+    pub platform: i64,
+}
+
+/// Client information must be entirely absent or have all three fields populated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("incomplete HTTP client information")]
+pub struct InvalidClientInfo;
+
+impl ClientInfo {
+    /// Builds the status path, including the local ID only when all metadata is present.
+    pub fn status_path(&self, network_id: &str) -> Result<String, InvalidClientInfo> {
+        if self.version.is_empty() && self.protocol == 0 && self.platform == 0 {
+            return Ok(STATUS_PATH.to_owned());
+        }
+        if self.version.is_empty() || self.protocol == 0 || self.platform == 0 {
+            return Err(InvalidClientInfo);
+        }
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", network_id)
+            .append_pair("platform", &self.platform.to_string())
+            .append_pair("protocol", &self.protocol.to_string())
+            .append_pair("version", &self.version)
+            .finish();
+        Ok(format!("{STATUS_PATH}?{query}"))
+    }
+}
+
 pub fn join_path(network_id: &str) -> String {
     format!("{JOIN_PATH}/{network_id}")
 }
@@ -73,6 +105,29 @@ mod tests {
     use super::*;
 
     const VANILLA_STATUS: &str = "{\"name\":\"Server\",\"protocol\":0,\"version\":\"\",\"level\":\"World\",\"players\":1,\"maxPlayers\":8,\"gameType\":0}";
+
+    #[test]
+    fn metadata_is_absent_or_complete_and_form_encoded() {
+        for present in 0..8 {
+            let info = ClientInfo {
+                version: if present & 1 != 0 {
+                    "1.26 +&?".into()
+                } else {
+                    String::new()
+                },
+                protocol: if present & 2 != 0 { -2 } else { 0 },
+                platform: if present & 4 != 0 { -1 } else { 0 },
+            };
+            match present {
+                0 => assert_eq!(info.status_path("id/+"), Ok(STATUS_PATH.into())),
+                7 => assert_eq!(
+                    info.status_path("id/+").unwrap(),
+                    "/v1/join?id=id%2F%2B&platform=-1&protocol=-2&version=1.26+%2B%26%3F"
+                ),
+                _ => assert_eq!(info.status_path("id/+"), Err(InvalidClientInfo)),
+            }
+        }
+    }
 
     #[test]
     fn the_status_path_is_the_join_path() {

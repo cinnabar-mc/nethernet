@@ -5,6 +5,7 @@ use crate::protocol::{Signal, SignalType};
 use crate::util::tls::ensure_crypto_provider;
 use futures::Stream;
 use nethernet::signaling::http::join;
+pub use nethernet::signaling::http::join::ClientInfo;
 use reqwest::Client;
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use std::pin::Pin;
@@ -17,6 +18,7 @@ pub struct HttpSignaling {
     network_id: String,
     client: Client,
     signal_tx: broadcast::Sender<Signal>,
+    client_info: ClientInfo,
 }
 
 impl HttpSignaling {
@@ -39,7 +41,14 @@ impl HttpSignaling {
             network_id,
             client,
             signal_tx,
+            client_info: ClientInfo::default(),
         }
+    }
+
+    /// Selects optional game metadata for subsequent status queries.
+    pub fn with_client_info(mut self, info: ClientInfo) -> Self {
+        self.client_info = info;
+        self
     }
 
     fn join_url(&self, network_id: &str) -> Result<Url> {
@@ -57,9 +66,13 @@ impl HttpSignaling {
     }
 
     fn status_url(&self, network_id: &str) -> Result<Url> {
-        let mut url = self.join_url(network_id)?;
-        url.set_path(join::STATUS_PATH);
-        Ok(url)
+        let url = self.join_url(network_id)?;
+        let path = self
+            .client_info
+            .status_path(&self.network_id)
+            .map_err(|error| NetherError::Other(error.to_string()))?;
+        url.join(&path)
+            .map_err(|error| NetherError::Other(format!("build status URL: {error}")))
     }
 
     /// Reads GET /v1/join; the network id here is an HTTP/HTTPS target URL.
@@ -73,6 +86,11 @@ impl HttpSignaling {
             .map_err(|e| NetherError::Other(format!("request server data: {}", e)))?;
 
         let status = response.status();
+        if !status.is_success() {
+            return Err(NetherError::Other(
+                join::StatusResponseError::Status(status.as_u16()).to_string(),
+            ));
+        }
         let body = read_capped(response, "server data").await?;
         Ok(join::validate_status_response(status.as_u16(), &body)?)
     }
@@ -89,6 +107,11 @@ impl HttpSignaling {
             .map_err(|e| NetherError::Other(format!("signal offer: {}", e)))?;
 
         let status = response.status();
+        if !status.is_success() {
+            return Err(NetherError::Other(
+                join::JoinResponseError::Status(status.as_u16()).to_string(),
+            ));
+        }
         let body = read_capped(response, "answer").await?;
         let body = String::from_utf8_lossy(&body).into_owned();
 
@@ -197,6 +220,33 @@ mod tests {
             signaling.status_url("http://example.com:19132").unwrap(),
             Url::parse("http://example.com:19132/v1/join").unwrap()
         );
+    }
+
+    #[test]
+    fn status_metadata_is_encoded_and_incomplete_information_is_rejected() {
+        let signaling = HttpSignaling::new("1234".into())
+            .unwrap()
+            .with_client_info(ClientInfo {
+                version: "1.26 +&?".into(),
+                protocol: -2,
+                platform: -1,
+            });
+        assert_eq!(
+            signaling.status_url("http://example.com").unwrap().as_str(),
+            "http://example.com/v1/join?id=1234&platform=-1&protocol=-2&version=1.26+%2B%26%3F"
+        );
+        assert!(
+            signaling
+                .join_url("http://example.com")
+                .unwrap()
+                .query()
+                .is_none()
+        );
+        let incomplete = signaling.with_client_info(ClientInfo {
+            version: "1.26".into(),
+            ..Default::default()
+        });
+        assert!(incomplete.status_url("http://example.com").is_err());
     }
 
     #[test]

@@ -1860,6 +1860,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "criterion",
+ "form_urlencoded",
  "hex",
  "hmac 0.13.0",
  "http",

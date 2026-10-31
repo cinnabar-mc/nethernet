@@ -200,8 +200,11 @@ impl HttpSignaler {
             return self.respond(connection, StatusCode::METHOD_NOT_ALLOWED, keep_alive);
         }
 
-        let Some(data) = self.server_data.as_ref().filter(|_| self.config.serve_motd) else {
+        if !self.config.serve_motd {
             return self.respond(connection, StatusCode::NOT_FOUND, keep_alive);
+        }
+        let Some(data) = self.server_data.as_ref() else {
+            return self.respond(connection, StatusCode::OK, keep_alive);
         };
 
         let body = data.to_json();
@@ -504,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_with_nothing_to_advertise_is_not_found() {
+    fn a_host_with_nothing_to_advertise_still_answers_the_probe() {
         let mut signaler = HttpSignaler::new(HttpSignalerConfig::default());
         connect(&mut signaler, 1, "127.0.0.1:1000");
         send(&mut signaler, 1, request(Method::GET, "/v1/join", ""));
@@ -512,7 +515,8 @@ mod tests {
         let HttpSignalerOutput::Response { response, .. } = next(&mut signaler) else {
             panic!("expected a response");
         };
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.body().is_empty());
     }
 
     #[test]

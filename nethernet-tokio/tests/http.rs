@@ -1,9 +1,132 @@
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use nethernet_tokio::signaling::http::HttpSignaling;
 use nethernet_tokio::{NetherError, Signal, SignalType};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+/// Captures a complete request header and returns a finite, caller-selected HTTP response.
+async fn response_server(
+    status: u16,
+    body: &'static str,
+    declared_length: usize,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut chunk = [0; 4096];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(n, 0, "request ended before its headers");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let response = format!(
+            "HTTP/1.1 {status} Response\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n{body}"
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    (addr, server)
+}
+
+#[tokio::test]
+async fn status_query_sends_configured_client_information() {
+    let body = "{\"name\":\"Server\",\"protocol\":0,\"version\":\"\",\"level\":\"World\",\"players\":1,\"maxPlayers\":8,\"gameType\":0}";
+    let (addr, server) = response_server(200, body, body.len()).await;
+    let signaling = HttpSignaling::new("1234".into()).unwrap().with_client_info(
+        nethernet::signaling::http::join::ClientInfo {
+            version: "1.26 +&?".into(),
+            protocol: 975,
+            platform: 7,
+        },
+    );
+    signaling
+        .server_data(&format!("http://{addr}"))
+        .await
+        .unwrap();
+    let request = server.await.unwrap();
+    assert!(
+        request.starts_with(
+            "GET /v1/join?id=1234&platform=7&protocol=975&version=1.26+%2B%26%3F HTTP/1.1\r\n"
+        ),
+        "{request}"
+    );
+}
+
+#[tokio::test]
+async fn join_status_boundaries_deliver_only_successful_answers() {
+    for status in [200, 201, 299, 300, 401, 403, 404, 503] {
+        let body = "v=0\r\ns=-\r\n";
+        let (addr, server) = response_server(status, body, body.len()).await;
+        let signaling = HttpSignaling::new("1234".into()).unwrap();
+        let mut signals = signaling.signals();
+        let result = signaling
+            .signal(Signal::offer(42, "offer".into(), format!("http://{addr}")))
+            .await;
+        if (200..300).contains(&status) {
+            result.unwrap();
+            assert_eq!(signals.next().await.unwrap().data, body);
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&status.to_string())
+            );
+            assert!(signals.next().now_or_never().is_none());
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_join_reports_the_status_before_reading_the_body() {
+    for declared_length in [1, (1 << 20) + 1] {
+        let (addr, server) = response_server(403, "", declared_length).await;
+        let signaling = HttpSignaling::new("1234".into()).unwrap();
+        let mut signals = signaling.signals();
+        let error = signaling
+            .signal(Signal::offer(42, "offer".into(), format!("http://{addr}")))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("403"), "{error}");
+        assert!(signals.next().now_or_never().is_none());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_status_query_reports_the_status_before_reading_the_body() {
+    for declared_length in [1, (1 << 20) + 1] {
+        let (addr, server) = response_server(503, "", declared_length).await;
+        let signaling = HttpSignaling::new("1234".into()).unwrap();
+        let error = signaling
+            .server_data(&format!("http://{addr}"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("503"), "{error}");
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn empty_and_numeric_success_bodies_never_deliver_answers() {
+    for (status, body) in [(204, ""), (200, ""), (201, "15"), (299, "15")] {
+        let (addr, server) = response_server(status, body, body.len()).await;
+        let signaling = HttpSignaling::new("1234".into()).unwrap();
+        let mut signals = signaling.signals();
+        assert!(
+            signaling
+                .signal(Signal::offer(42, "offer".into(), format!("http://{addr}")))
+                .await
+                .is_err()
+        );
+        assert!(signals.next().now_or_never().is_none());
+        server.await.unwrap();
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn offer_is_answered_by_the_endpoint() {

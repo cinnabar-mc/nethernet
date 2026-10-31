@@ -471,7 +471,7 @@ impl IceLayer {
                                 base_config,
                                 rel_addr: self.local_addr.ip().to_string(),
                                 rel_port: self.local_addr.port(),
-                                url: None,
+                                ..Default::default()
                             }
                             .new_candidate_server_reflexive(),
                             CandidateType::Relay => {
@@ -481,7 +481,7 @@ impl IceLayer {
                                     base_config,
                                     rel_addr: related.ip().to_string(),
                                     rel_port: related.port(),
-                                    url: None,
+                                    ..Default::default()
                                 }
                                 .new_candidate_relay()
                             }

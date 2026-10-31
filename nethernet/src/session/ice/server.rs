@@ -8,14 +8,14 @@ use rtc::ice::candidate::CandidateType;
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::stun::attributes::{
-    ATTR_ERROR_CODE, ATTR_MESSAGE_INTEGRITY, ATTR_NONCE, ATTR_REALM, ATTR_XOR_PEER_ADDRESS,
+    ATTR_MESSAGE_INTEGRITY, ATTR_NONCE, ATTR_REALM, ATTR_XOR_PEER_ADDRESS,
 };
 use rtc::stun::error_code::{CODE_STALE_NONCE, CODE_UNAUTHORIZED, ErrorCodeAttribute};
 use rtc::stun::integrity::MessageIntegrity;
 use rtc::stun::message::{
     CLASS_ERROR_RESPONSE, CLASS_INDICATION, CLASS_REQUEST, CLASS_SUCCESS_RESPONSE, Getter,
     METHOD_ALLOCATE, METHOD_BINDING, METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION, METHOD_DATA,
-    METHOD_REFRESH, Message, Method, Setter, TransactionId, is_stun_message,
+    METHOD_REFRESH, Message, Method, TransactionId, is_stun_message,
 };
 use rtc::stun::textattrs::Realm;
 use rtc::stun::xoraddr::XorMappedAddress;
@@ -271,7 +271,7 @@ impl Server {
     }
 
     /// Demultiplexes only source-bound server traffic. Unknown transactions never affect lifetime.
-    pub fn handle_read(&mut self, mut msg: TaggedBytesMut) -> Result<(), IceError> {
+    pub fn handle_read(&mut self, msg: TaggedBytesMut) -> Result<(), IceError> {
         self.expire(msg.now);
         let Some(client) = &self.client else {
             return Ok(());
@@ -386,13 +386,7 @@ impl Server {
             && response.as_ref().is_some_and(|response| {
                 response.typ.method == METHOD_REFRESH && stale_nonce(response)
             });
-        if owned
-            && let Some(response) = &response
-            && response.typ.class == CLASS_ERROR_RESPONSE
-        {
-            // RTC logs ChannelBind errors including the untrusted reason. Only its numeric code is needed.
-            msg.message = redacted_error(response)?;
-        }
+        // RTC verifies the original response bytes before consuming the transaction.
         self.client
             .as_mut()
             .ok_or(IceError::Closed)?
@@ -948,21 +942,6 @@ fn unauthorized(message: &Message) -> bool {
     message.typ.class == CLASS_ERROR_RESPONSE
         && code.get_from(message).is_ok()
         && code.code == CODE_UNAUTHORIZED
-}
-
-/// Makes an internal decoded copy after integrity validation; never emits altered server bytes on the network.
-fn redacted_error(response: &Message) -> Result<BytesMut, IceError> {
-    let mut setters: Vec<Box<dyn Setter>> =
-        vec![Box::new(response.transaction_id), Box::new(response.typ)];
-    for mut attribute in response.attributes.0.iter().cloned() {
-        if attribute.typ == ATTR_ERROR_CODE {
-            attribute.value.truncate(4);
-        }
-        setters.push(Box::new(attribute));
-    }
-    let mut message = Message::new();
-    message.build(&setters).map_err(|_| IceError::Server)?;
-    Ok(BytesMut::from(message.raw.as_slice()))
 }
 
 #[cfg(test)]

@@ -362,15 +362,19 @@ impl Session<Connecting> {
             let mut candidates_enabled = signaling
                 .as_ref()
                 .is_none_or(|signaling| signaling.enabled.is_none());
+            // Keep wait registrations across packets, including cancellation during UDP writes.
+            let closed = close_token.cancelled();
+            let timer = tokio::time::sleep_until(wake.into());
+            tokio::pin!(closed, timer);
             let terminal = 'drive: loop {
                 let admit_commands = !io.blocked(connection.selected_turn_stream());
                 tokio::select! {
                     biased;
 
-                    _ = close_token.cancelled() => break Terminal::Eof,
+                    _ = &mut closed => break Terminal::Eof,
                     _ = async { match signaling.as_ref().and_then(|signaling| signaling.service_closed.as_ref()) { Some(closed) => closed.cancelled().await, None => pending().await } } => break Terminal::Transport,
                     _ = async { match signaling.as_ref().and_then(|signaling| signaling.enabled.as_ref()) { Some(enabled) => enabled.cancelled().await, None => pending().await } }, if !candidates_enabled => { candidates_enabled = true; },
-                    _ = tokio::time::sleep_until(wake.into()) => {
+                    _ = &mut timer => {
                         let now = transport_now();
                         if connection.handle(ConnectionInput::Timeout(now)).is_err() { break Terminal::Transport; }
                         wake = now + MAX_IDLE;
@@ -491,7 +495,7 @@ impl Session<Connecting> {
                         SessionOutput::Send(data, to) => {
                             tokio::select! {
                                 biased;
-                                _ = close_token.cancelled() => break 'drive Terminal::Eof,
+                                _ = &mut closed => break 'drive Terminal::Eof,
                                 result = io.send_datagram(&data, to) => {
                                     if let Err(e) = result {
                                         if crate::transport::egress::is_denied(&e) {
@@ -575,6 +579,9 @@ impl Session<Connecting> {
                 rtt_observation
                     .0
                     .publish(rtt.filter(|sample| !sample.is_zero()));
+                if timer.deadline() != tokio::time::Instant::from_std(wake) {
+                    timer.as_mut().reset(wake.into());
+                }
             };
             rtt_observation.0.retire();
             let terminal = drain_retired_prefix(

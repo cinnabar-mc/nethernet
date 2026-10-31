@@ -105,6 +105,24 @@ certificate does not choose your SDP peer trust policy.
 GET `/v1/join`. Joins use POST `/v1/join/{local_network_id}`. The remote argument
 to `NetherClient::connect_with` is the base HTTP/HTTPS URL.
 
+## Join by host and port
+
+Use `signaling::http::HttpProbe::new(reqwest::Client::builder())` for an address
+whose HTTP endpoint is not known. Supply your TLS and egress policy on that
+builder. `probe(host, port, deadline).await` returns the first completed 2xx base
+URL; port zero means an omitted port. Discovery has a six-second overall limit
+and disables redirects. It tries HTTPS together, gives it up to a one-second
+head start, then also tries HTTP. A failed secure game port releases its plain
+HTTP alternative immediately. No answer returns an error.
+
+`select(host, port, cache, deadline)` also accepts an optional caller-owned
+`ProbeCache`. Answers live for ten minutes and their URL is rechecked before
+each join. Use the returned `ProbeSelection::connect` with `probe.signaling(id)`
+and your existing `ConnectionConfig`; a failed or cancelled dial forgets its
+selection. If a later game Login fails, call `selection.forget()` as well. An
+older receipt cannot forget a newer answer. `selection.login_address()` gives
+the selected URL with one explicit port for Login metadata.
+
 ## Add STUN or TURN
 
 Your application obtains ICE service records and their expiry. Resolve them

@@ -292,8 +292,12 @@ impl IceIo {
             && self.pending_udp.len() + 1 < UDP_MAX_PENDING_PACKETS
             && bytes <= UDP_MAX_PENDING_BYTES - MAX_DATAGRAM_SIZE
         {
+            let Poll::Ready(budget) = tokio::task::coop::poll_proceed(cx) else {
+                break;
+            };
             match self.receive_udp_now() {
                 Ok((data, from)) => {
+                    budget.made_progress();
                     batch_packets += 1;
                     batch_bytes += data.len();
                     bytes += data.len();

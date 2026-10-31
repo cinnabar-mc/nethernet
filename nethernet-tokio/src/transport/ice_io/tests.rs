@@ -591,7 +591,9 @@ async fn udp_prefetch_stops_at_its_packet_and_byte_budgets() {
                 packet[..4].copy_from_slice(&value.to_le_bytes());
                 sender.send_to(&packet, address).await.unwrap();
             }
-            let IceEvent::Datagram(first, _) = io.next().await.unwrap() else {
+            // Isolate the transport limits from the scheduler's separate work budget.
+            let IceEvent::Datagram(first, _) = tokio::task::unconstrained(io.next()).await.unwrap()
+            else {
                 panic!("expected a UDP datagram");
             };
             assert_eq!(&first[..4], &round.to_le_bytes());
@@ -600,4 +602,48 @@ async fn udp_prefetch_stops_at_its_packet_and_byte_budgets() {
         assert_eq!(length, packet.len());
         assert_eq!(&packet[..4], &staged.to_le_bytes());
     }
+}
+
+/// Counts and consumes the current task's remaining cooperative work credits.
+#[cfg(target_os = "linux")]
+async fn consume_remaining_cooperative_budget() -> usize {
+    futures::future::poll_fn(|cx| {
+        let mut consumed = 0;
+        while let std::task::Poll::Ready(budget) = tokio::task::coop::poll_proceed(cx) {
+            budget.made_progress();
+            consumed += 1;
+        }
+        std::task::Poll::Ready(consumed)
+    })
+    .await
+}
+
+/// Native read-ahead spends the same runtime credits as other successful socket reads.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn native_udp_reads_spend_cooperative_budget() {
+    tokio::spawn(async {
+        let receiver = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = receiver.local_addr().unwrap();
+        let mut io = IceIo::from(Arc::clone(&receiver));
+        for _ in 0..UDP_READ_BATCH_PACKETS {
+            sender.send_to(&[0; 32], address).unwrap();
+        }
+        receiver.readable().await.unwrap();
+        tokio::task::yield_now().await;
+        let available = consume_remaining_cooperative_budget().await;
+        tokio::task::yield_now().await;
+        io.next().await.unwrap();
+        let received = io.pending_udp.len() + 1;
+        let remaining = consume_remaining_cooperative_budget().await;
+        assert!(received > 1, "the fixture must exercise native read-ahead");
+        assert!(
+            available >= received + remaining,
+            "received {received} packets but spent only {} of {available} credits",
+            available - remaining,
+        );
+    })
+    .await
+    .unwrap();
 }

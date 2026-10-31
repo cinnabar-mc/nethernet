@@ -114,7 +114,7 @@ async fn configured_client_gathers_while_offering_and_releases_turn_on_cancellat
             candidate.finish(Ok(SignalDelivery::ServiceAccepted));
         }
         cancel.cancel();
-        assert!(matches!(connect.await, Err(NetherError::ConnectionClosed)));
+        assert!(matches!(connect.await, Err(NetherError::Cancelled)));
         if let Some(offer) = offer {
             assert!(offer.is_cancelled());
         }

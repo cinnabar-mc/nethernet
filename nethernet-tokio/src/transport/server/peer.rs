@@ -136,6 +136,10 @@ impl Peer {
             deadline,
             retirement,
         } = answered;
+        // Reject an elapsed budget before polling peer closure or readiness.
+        if transport_now() >= deadline {
+            return Err(timeout());
+        }
         let close = accepted.session.close_token();
         let commands = accepted.session.signal_sender();
         // Reserve capacity alongside Ready rather than hiding it behind a blocked send.

@@ -121,6 +121,9 @@ impl ProbeSelection {
             selection: self,
             succeeded: false,
         };
+        if config.cancel_token.is_cancelled() {
+            return Err(NetherError::Cancelled);
+        }
         if Instant::now() >= deadline {
             return Err(NetherError::Timeout);
         }

@@ -382,3 +382,24 @@ async fn http_listener_stops_waiting_at_the_original_trust_budget() {
         Err((_, NetherError::Timeout))
     ));
 }
+
+/// A sub-millisecond cutoff takes precedence even before Tokio's rounded timer fires.
+#[tokio::test]
+async fn original_nanosecond_cutoff_wins_over_a_closed_peer() {
+    let PendingPeer {
+        mut owner,
+        mut answered,
+        pending,
+        signals: _signals,
+        rtc: _rtc,
+        ..
+    } = pending_peer().await;
+    answered.accepted.session.close_token().cancel();
+    tokio::time::pause();
+    answered.deadline = transport_now() + Duration::from_nanos(1);
+    tokio::time::advance(Duration::from_nanos(1)).await;
+    assert!(matches!(
+        owner.handoff(answered, pending).await,
+        Err((_, NetherError::Timeout))
+    ));
+}

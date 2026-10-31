@@ -108,3 +108,12 @@ continue independently.
 for later offers. Existing peers keep the configuration used for their attempt.
 These setters do not acquire credentials. For TURN refresh and candidate
 configuration, see [HTTP and ICE](http.md#add-stun-or-turn).
+
+## Inspect setup failures
+
+Connection setup returns `NetherError::Cancelled` when the caller cancels its
+setup token. A remote closure remains `ConnectionClosed`. `is_cancelled()` and
+`is_timeout()` classify structured causes, including HTTP request and nested
+socket deadlines. HTTP signaling failures retain their original `reqwest::Error`
+through `std::error::Error::source`. Applications own retry budgets and failure
+presentation for ICE, credentials, signaling, and other returned setup failures.

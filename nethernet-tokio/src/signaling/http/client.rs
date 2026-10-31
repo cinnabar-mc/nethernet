@@ -29,7 +29,7 @@ impl HttpSignaling {
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
-            .map_err(|e| NetherError::Other(format!("create HTTP client: {}", e)))?;
+            .map_err(NetherError::Http)?;
 
         Ok(Self::with_client(network_id, client))
     }
@@ -83,7 +83,7 @@ impl HttpSignaling {
             .header(USER_AGENT, join::CLIENT_USER_AGENT)
             .send()
             .await
-            .map_err(|e| NetherError::Other(format!("request server data: {}", e)))?;
+            .map_err(NetherError::Http)?;
 
         let status = response.status();
         if !status.is_success() {
@@ -104,7 +104,7 @@ impl HttpSignaling {
             .body(signal.data.clone())
             .send()
             .await
-            .map_err(|e| NetherError::Other(format!("signal offer: {}", e)))?;
+            .map_err(NetherError::Http)?;
 
         let status = response.status();
         if !status.is_success() {
@@ -139,11 +139,7 @@ async fn read_capped(mut response: reqwest::Response, what: &str) -> Result<Vec<
     }
 
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| NetherError::Other(format!("read {what}: {e}")))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(NetherError::Http)? {
         if body.len() + chunk.len() > join::MAX_ANSWER_SIZE {
             return Err(exceeded());
         }

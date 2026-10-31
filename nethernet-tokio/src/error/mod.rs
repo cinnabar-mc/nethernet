@@ -14,6 +14,14 @@ pub enum NetherError {
     #[error("caller signaling error: {0}")]
     CallerSignaling(#[from] crate::signaling::caller::CallerSignalingError),
 
+    /// The caller explicitly cancelled connection setup.
+    #[error("connection setup cancelled")]
+    Cancelled,
+
+    /// The original HTTP request failure, retained for timeout and source inspection.
+    #[error("HTTP signaling request failed")]
+    Http(#[from] reqwest::Error),
+
     #[error("ICE error: {0}")]
     Ice(String),
 
@@ -103,3 +111,34 @@ pub enum SignalingError {
 }
 
 pub type Result<T> = std::result::Result<T, NetherError>;
+
+impl NetherError {
+    /// Identifies explicit setup cancellation without inspecting diagnostic text.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    /// Preserves deadline classification through HTTP and socket failure sources.
+    pub fn is_timeout(&self) -> bool {
+        if matches!(
+            self,
+            Self::Timeout | Self::CallerSignaling(crate::CallerSignalingError::TimedOut)
+        ) {
+            return true;
+        }
+        let mut cause = std::error::Error::source(self);
+        while let Some(error) = cause {
+            if error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+                || error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+            {
+                return true;
+            }
+            cause = error.source();
+        }
+        false
+    }
+}

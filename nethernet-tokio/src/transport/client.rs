@@ -157,7 +157,8 @@ impl NetherClient {
 
             let cancel_token = config.cancel_token.clone();
             let result = tokio::select! {
-                _ = cancel_token.cancelled() => Err((None, NetherError::ConnectionClosed)),
+                biased;
+                _ = cancel_token.cancelled() => Err((None, NetherError::Cancelled)),
                 result = Self::negotiate(
                     &signaling,
                     &remote_network_id,
@@ -166,6 +167,9 @@ impl NetherClient {
                 ) => result,
             };
 
+            if cancel_token.is_cancelled() {
+                return Err(NetherError::Cancelled);
+            }
             let (code, error) = match result {
                 Ok(stream) => return Ok(stream),
                 Err(failure) => failure,
@@ -184,7 +188,10 @@ impl NetherClient {
                 }
             }
 
-            if !matches!(error, NetherError::Timeout) || attempt == attempts {
+            if cancel_token.is_cancelled() {
+                return Err(NetherError::Cancelled);
+            }
+            if !error.is_timeout() || attempt == attempts {
                 return Err(error);
             }
 

@@ -263,3 +263,23 @@ async fn failed_dial_forgets_the_selected_cache_entry() {
     ));
     assert!(cache.lookup("h", 19132).is_none());
 }
+
+/// A caller abort takes precedence over a simultaneous cutoff and forgets its selected answer.
+#[tokio::test]
+async fn cancelled_cached_attempt_preserves_the_abort_category() {
+    let cache = ProbeCache::default();
+    let selection = ProbeCache::store(Some(&cache), "h", 19132, "http://h:19132".into());
+    let config = crate::ConnectionConfig::default();
+    config.cancel_token.cancel();
+    let signaling = HttpProbe::new(Client::builder())
+        .unwrap()
+        .signaling("local".into());
+    let error = selection
+        .connect(signaling, config, Instant::now())
+        .await
+        .err()
+        .unwrap();
+    assert!(error.is_cancelled());
+    assert!(!error.is_timeout());
+    assert!(cache.lookup("h", 19132).is_none());
+}

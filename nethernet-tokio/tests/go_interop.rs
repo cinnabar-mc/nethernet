@@ -8,25 +8,9 @@ use nethernet_tokio::{NetherError, ServerData};
 use serde_json::json;
 use std::time::Duration;
 
-/// Known differences from go-nethernet. Each check asserts its entry still reproduces,
-/// so fixing one fails here until the entry is removed.
-const EXPECTED_DIVERGENCES: &[&str] = &[
-    // A "Spectator" pong game mode becomes 6; Go reads it as survival.
-    "pong-spectator-game-type",
-    // Better than Go: pong protocol and version are kept; Go leaves them empty.
-    "pong-protocol-version",
-];
-
+/// Requires matching behavior between the two peers for a named probe.
 fn check(id: &str, diverges: bool) {
-    let expected = EXPECTED_DIVERGENCES.contains(&id);
-    if expected {
-        assert!(
-            diverges,
-            "{id} no longer reproduces; remove it from EXPECTED_DIVERGENCES"
-        );
-    } else {
-        assert!(!diverges, "new divergence from go-nethernet: {id}");
-    }
+    assert!(!diverges, "new divergence from go-nethernet: {id}");
 }
 
 /// Reliable body used by the matched send-admission and receive-capacity probes.
@@ -167,7 +151,7 @@ fn rust_server_data() -> ServerData {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rust_dials_go_reliable() {
-    let Some((peer, link, _)) = rust_dials_go(&[]).await else {
+    let Some((peer, link, _)) = rust_dials_go().await else {
         return;
     };
     reliable_echo_and_rust_close(peer, link).await;
@@ -183,7 +167,7 @@ async fn go_dials_rust_reliable() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rust_dials_go_large_inbound() {
-    let Some((peer, link, _)) = rust_dials_go(&[]).await else {
+    let Some((peer, link, _)) = rust_dials_go().await else {
         return;
     };
     large_inbound_and_go_close(peer, link).await;
@@ -199,7 +183,7 @@ async fn go_dials_rust_large_inbound() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rust_dials_go_unreliable() {
-    let Some((peer, link, _)) = rust_dials_go(&[]).await else {
+    let Some((peer, link, _)) = rust_dials_go().await else {
         return;
     };
     unreliable_under_loss(peer, link).await;
@@ -215,7 +199,7 @@ async fn go_dials_rust_unreliable() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rust_dials_go_ice_blackhole() {
-    let Some((peer, link, _)) = rust_dials_go(&[]).await else {
+    let Some((peer, link, _)) = rust_dials_go().await else {
         return;
     };
     ice_blackhole(peer, link).await;
@@ -246,34 +230,4 @@ async fn go_discovers_rust_server_data() {
         "connection_type": data.connection_type,
     });
     assert_eq!(discovered["server_data"], expected);
-}
-
-/// Rust reads Go's advertisement built from a pong, and compares its own pong parser.
-#[tokio::test(flavor = "multi_thread")]
-async fn rust_discovers_go_pong_data() {
-    let pong = "MCPE;Go Host;975;1.26.50;2;10;1234;Go World;Spectator;1;19132;19133;";
-    let Some((_peer, _link, discovered)) = rust_dials_go(&["--pong", pong]).await else {
-        return;
-    };
-    let parsed = ServerData::from_pong_data(pong.as_bytes()).unwrap();
-    assert_eq!(
-        (
-            &discovered.server_name,
-            &discovered.level_name,
-            discovered.player_count,
-            discovered.max_player_count,
-        ),
-        (&parsed.server_name, &parsed.level_name, 2, 10)
-    );
-    check(
-        "pong-spectator-game-type",
-        discovered.game_type != parsed.game_type,
-    );
-    check(
-        "pong-protocol-version",
-        (
-            discovered.protocol_version,
-            discovered.game_version.as_str(),
-        ) != (parsed.protocol_version, parsed.game_version.as_str()),
-    );
 }

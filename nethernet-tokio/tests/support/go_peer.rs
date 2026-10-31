@@ -173,23 +173,16 @@ fn client_config(maximum: usize) -> ConnectionConfig {
 }
 
 /// Rust dials a listening Go peer; returns the peer, the link and what discovery reported.
-pub async fn rust_dials_go(extra: &[&str]) -> Option<(GoPeer, Link, ServerData)> {
-    rust_dials_go_with_incoming_limit(
-        extra,
-        ConnectionConfig::default().max_incoming_message_bytes,
-    )
-    .await
+pub async fn rust_dials_go() -> Option<(GoPeer, Link, ServerData)> {
+    rust_dials_go_with_incoming_limit(ConnectionConfig::default().max_incoming_message_bytes).await
 }
 
 /// Uses the original LAN client with only its complete incoming-body policy selected by the caller.
 pub async fn rust_dials_go_with_incoming_limit(
-    extra: &[&str],
     maximum: usize,
 ) -> Option<(GoPeer, Link, ServerData)> {
     const GO_ID: u64 = 7001;
-    let mut args = vec!["--role", "listen", "--network-id", "7001"];
-    args.extend_from_slice(extra);
-    let mut peer = GoPeer::spawn(&args)?;
+    let mut peer = GoPeer::spawn(&["--role", "listen", "--network-id", "7001"])?;
     let ready = peer.event("ready").await;
     let go_addr: SocketAddr = ready["addr"].as_str().unwrap().parse().unwrap();
     let signaling = LanSignaling::with_config(

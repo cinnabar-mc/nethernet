@@ -45,7 +45,6 @@ func runPeer(args []string) error {
 	remoteID := fs.Uint64("remote-id", 0, "network ID to dial")
 	lanAddr := fs.String("lan-addr", "127.0.0.1:0", "LAN discovery bind address")
 	broadcast := fs.String("broadcast", "", "where discovery requests go when dialing")
-	pong := fs.String("pong", "", "RakNet pong string advertised when listening")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -61,14 +60,10 @@ func runPeer(args []string) error {
 		return err
 	}
 	defer lan.Close()
-	if *pong != "" {
-		lan.PongData([]byte(*pong))
-	} else {
-		lan.ServerData(&discovery.ServerData{
-			ServerName: "go-peer", LevelName: "go-peer", MaxPlayerCount: 8,
-			AcceptsOnlineAuth: true, AcceptsSelfSignedAuth: true, ConnectionType: 4,
-		})
-	}
+	lan.ServerData(&discovery.ServerData{
+		ServerName: "go-peer", LevelName: "go-peer", MaxPlayerCount: 8,
+		AcceptsOnlineAuth: true, AcceptsSelfSignedAuth: true, ConnectionType: 4,
+	})
 	api, lossy, err := loopbackAPI()
 	if err != nil {
 		return err

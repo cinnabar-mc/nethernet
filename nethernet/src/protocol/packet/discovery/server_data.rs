@@ -118,36 +118,6 @@ impl ServerData {
         }
     }
 
-    /// Parses a semicolon-separated pong string of at least nine fields; unparsable numbers become 0.
-    pub fn from_pong_data(data: &[u8]) -> Result<Self> {
-        let pong = std::str::from_utf8(data)
-            .map_err(|e| ProtocolError::Other(format!("invalid pong data UTF-8: {}", e)))?;
-        let parts: Vec<&str> = pong.split(';').collect();
-        if parts.len() < 9 {
-            return Err(ProtocolError::Other(format!(
-                "unexpected pong data format: {} fields, expected at least 9",
-                parts.len()
-            )));
-        }
-
-        Ok(Self {
-            server_name: parts[1].to_string(),
-            protocol_version: parts[2].parse().unwrap_or(0),
-            game_version: parts[3].to_string(),
-            level_name: parts[7].to_string(),
-            game_type: game_type(parts[8]),
-            player_count: parts[4].parse().unwrap_or(0),
-            max_player_count: parts[5].parse().unwrap_or(0),
-            editor_world: false,
-            hardcore: false,
-            flag_a: true,
-            flag_b: true,
-            session_id: String::new(),
-            transport_layer: 2,
-            connection_type: 4,
-        })
-    }
-
     /// Encodes a version 7 record into one preallocated buffer.
     #[inline]
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -339,15 +309,6 @@ fn escape(value: &str) -> String {
     }
     out.push('"');
     out
-}
-
-fn game_type(mode: &str) -> u8 {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "creative" => 1,
-        "adventure" => 2,
-        "spectator" => 6,
-        _ => 0,
-    }
 }
 
 #[cfg(test)]
@@ -604,27 +565,6 @@ mod tests {
         let decoded = ServerData::decode(&encoded).unwrap();
         assert_eq!(decoded.server_name, server_name);
         assert_eq!(decoded.level_name, level_name);
-    }
-
-    #[test]
-    fn test_from_pong_data() {
-        let pong = b"MCPE;Dedicated Server;800;1.21.0;3;10;13253860892328930865;Bedrock level;Creative;1;19132;19133;";
-        let data = ServerData::from_pong_data(pong).unwrap();
-
-        assert_eq!(data.server_name, "Dedicated Server");
-        assert_eq!(data.protocol_version, 800);
-        assert_eq!(data.game_version, "1.21.0");
-        assert_eq!(data.level_name, "Bedrock level");
-        assert_eq!(data.game_type, 1);
-        assert_eq!(data.player_count, 3);
-        assert_eq!(data.max_player_count, 10);
-        assert_eq!(data.transport_layer, 2);
-        assert_eq!(data.connection_type, 4);
-    }
-
-    #[test]
-    fn test_from_pong_data_rejects_short_input() {
-        assert!(ServerData::from_pong_data(b"MCPE;Server").is_err());
     }
 
     #[test]

@@ -133,14 +133,6 @@ impl ServerSignaling {
         }
     }
 
-    /// Replaces the advertised server data from a pong string; an unparsable string is logged and ignored.
-    pub fn set_pong_data(&self, data: &[u8]) {
-        match self {
-            Self::Caller(_) => {}
-            Self::Lan(s) => s.set_pong_data(data),
-            Self::Http(s) => s.set_pong_data(data),
-        }
-    }
     /// Claims a caller route before asynchronous admission or a bounded refusal starts.
     pub(crate) fn claim_route(
         &self,

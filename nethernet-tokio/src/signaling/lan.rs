@@ -151,13 +151,6 @@ impl LanSignaling {
         self.get_address(network_id).await
     }
 
-    pub fn set_pong_data(&self, data: &[u8]) {
-        match ServerData::from_pong_data(data) {
-            Ok(server_data) => self.set_server_data(server_data),
-            Err(e) => tracing::error!("Failed to parse pong data: {}", e),
-        }
-    }
-
     fn drive(
         mut signaler: LanSignaler,
         socket: Arc<UdpSocket>,

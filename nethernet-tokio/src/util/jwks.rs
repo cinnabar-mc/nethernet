@@ -28,6 +28,7 @@ struct Inner {
     client: Client,
     keys: MinecraftKeys,
     fetched_at: Mutex<Option<Instant>>,
+    missed: Mutex<bool>,
 }
 
 impl Jwks {
@@ -43,6 +44,7 @@ impl Jwks {
                 client,
                 keys: MinecraftKeys::default(),
                 fetched_at: Mutex::new(None),
+                missed: Mutex::new(false),
             }),
         };
 
@@ -66,15 +68,20 @@ impl Jwks {
 
     /// Refetches the keys unless they were fetched less than 60 seconds ago.
     pub async fn refresh(&self) -> Result<()> {
-        self.inner.refresh(MIN_INTERVAL).await
+        let mut missed = self.inner.missed.lock().await;
+        if self.inner.refresh(MIN_INTERVAL).await? {
+            *missed = false;
+        }
+        Ok(())
     }
 }
 
 impl Inner {
-    async fn refresh(&self, min_interval: Duration) -> Result<()> {
+    /// Reports whether an HTTP refresh actually completed, rather than being throttled.
+    async fn refresh(&self, min_interval: Duration) -> Result<bool> {
         let mut fetched_at = self.fetched_at.lock().await;
         if fetched_at.is_some_and(|at| at.elapsed() < min_interval) {
-            return Ok(());
+            return Ok(false);
         }
 
         let keys: JwkSet = self
@@ -91,7 +98,7 @@ impl Inner {
 
         self.keys.replace(keys);
         *fetched_at = Some(Instant::now());
-        Ok(())
+        Ok(true)
     }
 
     async fn is_due(&self, max_age: Duration) -> bool {
@@ -103,18 +110,15 @@ impl Inner {
 
     /// Refetches if a token named an unpublished key or the keys are older than `max_age`.
     async fn refresh_if_needed(&self, min_interval: Duration, max_age: Duration) -> Result<()> {
-        let missed = self.keys.take_missed();
-        if !missed && !self.is_due(max_age).await {
+        let mut missed = self.missed.lock().await;
+        *missed |= self.keys.take_missed();
+        if !*missed && !self.is_due(max_age).await {
             return Ok(());
         }
-        let result = self.refresh(min_interval).await;
-        if missed && (result.is_err() || !self.is_due(min_interval).await) {
-            tracing::debug!(
-                "a token named an unpublished key; refreshed: {}",
-                result.is_ok()
-            );
+        if self.refresh(min_interval).await? {
+            *missed = false;
         }
-        result
+        Ok(())
     }
 }
 
@@ -214,6 +218,71 @@ mod tests {
             panic!("Minecraft trust expected");
         };
         assert!(keys.snapshot().contains("key-2"));
+    }
+
+    /// One missed key remains pending across a throttled pass and a failed HTTP request.
+    #[tokio::test]
+    async fn missed_key_survives_throttling_and_fetch_failure() {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let url = key_server(fetches.clone()).await;
+        let jwks = Jwks::fetch(url, client(FETCH_TIMEOUT).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            jwks.trust()
+                .await
+                .claims(&unknown_kid(), SystemTime::now())
+                .is_err()
+        );
+        jwks.inner
+            .refresh_if_needed(MIN_INTERVAL, MAX_AGE)
+            .await
+            .unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        *jwks.inner.fetched_at.lock().await = Some(Instant::now() - MIN_INTERVAL);
+        jwks.inner
+            .refresh_if_needed(MIN_INTERVAL, MAX_AGE)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            2,
+            "throttling consumed the only miss"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/keys", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for status in [503, 200] {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let _ = peer.read(&mut [0; 2048]).await.unwrap();
+                let body = r#"{"keys":[]}"#;
+                peer.write_all(format!("HTTP/1.1 {status} Response\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let inner = Inner {
+            url,
+            client: client(FETCH_TIMEOUT).unwrap(),
+            keys: MinecraftKeys::default(),
+            fetched_at: Mutex::new(Some(Instant::now())),
+            missed: Mutex::new(false),
+        };
+        let trust = TokenTrust::Minecraft(inner.keys.clone());
+        assert!(trust.claims(&unknown_kid(), SystemTime::now()).is_err());
+        assert!(
+            inner
+                .refresh_if_needed(Duration::ZERO, MAX_AGE)
+                .await
+                .is_err()
+        );
+        inner
+            .refresh_if_needed(Duration::ZERO, MAX_AGE)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("miss was lost after HTTP failure")
+            .unwrap();
     }
 
     fn unknown_kid() -> Identity {

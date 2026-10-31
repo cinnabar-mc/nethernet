@@ -165,6 +165,8 @@ impl LanSignaling {
             let dual_stack = socket.local_addr().is_ok_and(|addr| addr.is_ipv6());
 
             loop {
+                let mut completion = None;
+                let mut written = Ok(());
                 tokio::select! {
                     _ = cancel_token.cancelled() => break,
                     received = socket.recv_from(&mut buf) => match received {
@@ -186,7 +188,7 @@ impl LanSignaling {
                             let result = signaler
                                 .handle(LanSignalerInput::Signal(*signal, Instant::now()))
                                 .map_err(|e| NetherError::Other(e.to_string()));
-                            let _ = reply.send(result);
+                            completion = Some((reply, result));
                         }
                         Some(Command::SetServerData(data)) => {
                             let _ = signaler.handle(LanSignalerInput::SetServerData(data));
@@ -211,6 +213,9 @@ impl LanSignaling {
                                 socket.send_to(&buf, socket_family(addr, dual_stack)).await
                             {
                                 tracing::debug!("Failed to send to {}: {}", addr, e);
+                                if written.is_ok() {
+                                    written = Err(NetherError::from(e));
+                                }
                             }
                         }
                         LanSignalerOutput::Signal(signal) => {
@@ -223,6 +228,9 @@ impl LanSignaling {
                     }
                 }
 
+                if let Some((reply, result)) = completion {
+                    let _ = reply.send(result.and(written));
+                }
                 addresses = signaler.addresses().collect();
             }
         })
@@ -301,4 +309,47 @@ pub async fn scan(
     }
 
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An IPv4 socket cannot send a learned IPv6 route, and that OS error must reach signal().
+    #[tokio::test]
+    async fn signal_returns_the_immediate_datagram_write_error() {
+        let mut signaler = LanSignaler::new(1, LanConfig::default());
+        let packet = encode(&Packets::Request(RequestPacket), 2).unwrap();
+        signaler
+            .handle(LanSignalerInput::Datagram(
+                packet.into(),
+                "[::1]:3478".parse().unwrap(),
+                Instant::now(),
+            ))
+            .unwrap();
+        while signaler.poll().is_some() {}
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let (signal_tx, _) = broadcast::channel(1);
+        let cancel = CancellationToken::new();
+        let task = LanSignaling::drive(signaler, socket, receiver, signal_tx, cancel.clone());
+        let (reply, result) = oneshot::channel();
+        commands
+            .send(Command::Signal(
+                Box::new(Signal::offer(9, "offer".into(), "2".into())),
+                reply,
+            ))
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), result)
+            .await
+            .unwrap()
+            .unwrap();
+        cancel.cancel();
+        task.await.unwrap();
+        assert!(
+            matches!(result, Err(NetherError::Io(_))),
+            "write error was hidden: {result:?}"
+        );
+    }
+
 }

@@ -74,7 +74,16 @@ fn scope_v4(address: Ipv4Addr) -> Scope {
 }
 
 fn scope_v6(address: Ipv6Addr) -> Scope {
-    let [a, b, ..] = address.segments();
+    let [a, b, c, d, e, f, g, h] = address.segments();
+
+    if a == 0x2001
+        && (b == 3
+            || (b == 4 && c == 0x112)
+            || (b == 1 && c == 0 && d == 0 && e == 0 && f == 0 && g == 0 && (1..=3).contains(&h))
+            || (0x20..=0x3f).contains(&b))
+    {
+        return Scope::Public;
+    }
 
     if a & 0xfe00 == 0xfc00 {
         return Scope::Private;

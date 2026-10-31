@@ -15,6 +15,9 @@ pub fn local_ufrag(datagram: &[u8]) -> Option<String> {
 
     let mut message = Message::new();
     message.unmarshal_binary(datagram).ok()?;
+    if message.typ != rtc::stun::message::BINDING_REQUEST {
+        return None;
+    }
     let username = Username::get_from_as(&message, ATTR_USERNAME).ok()?;
     let (local, _remote) = username.text.split_once(':')?;
     Some(local.to_string())

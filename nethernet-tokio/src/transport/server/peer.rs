@@ -240,7 +240,7 @@ impl Peer {
                 self.config
                     .server_ice
                     .as_ref()
-                    .map_or_else(local_bind_addr, |ice| ice.bind_addr),
+                    .map_or_else(|| local_bind_addr(remote_address), |ice| ice.bind_addr),
             )
             .await
             .map_err(socket_error)?,

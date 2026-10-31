@@ -231,11 +231,18 @@ impl NetherClient {
                     NetherError::InvalidState("negotiation timeout is too large".into()),
                 )
             })?;
+        let peer_address = match signaling {
+            ClientSignaling::Lan(lan) => match remote_network_id.parse() {
+                Ok(network) => lan.get_address(network).await,
+                Err(_) => None,
+            },
+            _ => None,
+        };
         let bind_addr = config
             .client_ice
             .as_ref()
             .and_then(|ice| ice.bind_addr)
-            .unwrap_or_else(local_bind_addr);
+            .unwrap_or_else(|| local_bind_addr(peer_address));
         let socket = Arc::new(
             UdpSocket::bind(bind_addr)
                 .await
@@ -610,6 +617,50 @@ impl AsyncWrite for NetherClient {
 mod tests {
     use super::*;
     use nethernet::identity::ServerIdentity;
+
+    /// Default LAN negotiation follows the route to its discovered peer without a public gateway.
+    #[tokio::test]
+    async fn default_lan_binding_follows_the_discovered_peer_route() {
+        use crate::signaling::lan::{LanConfig, LanSignaling};
+        use std::time::Duration;
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let config = LanConfig {
+            discovery_port: address.port(),
+            broadcast_address: Some(address),
+            broadcast_interval: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let server = LanSignaling::with_config(1, address, config.clone())
+            .await
+            .unwrap();
+        server.set_server_data(crate::ServerData::new("test".into(), "world".into()));
+        let client = Arc::new(
+            LanSignaling::with_config(2, "127.0.0.1:0".parse().unwrap(), config)
+                .await
+                .unwrap(),
+        );
+        let mut offers = server.signals();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !client.discover().await.contains_key(&1) { tokio::task::yield_now().await; }
+            let mut connecting = Box::pin(NetherClient::connect(client, "1".into()));
+            loop {
+                tokio::select! {
+                    signal = offers.next() => {
+                        let signal = signal.unwrap();
+                        if signal.signal_type == SignalType::Candidate {
+                            let candidate = nethernet::protocol::webrtc::candidate::parse_ice_candidate(&signal.data).unwrap();
+                            assert!(candidate.addr().ip().is_loopback(), "default LAN socket ignored the discovered peer route");
+                            break;
+                        }
+                    }
+                    result = &mut connecting => panic!("client ended before candidate: {:?}", result.err()),
+                }
+            }
+        }).await.expect("LAN route selection stalled");
+        server.shutdown().await;
+    }
 
     /// Caller-controlled timeout overflow must remain a configuration error.
     #[tokio::test]

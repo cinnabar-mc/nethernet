@@ -14,18 +14,30 @@ pub use server::NetherServer;
 use nethernet::identity::{SdpIdentity, TokenTrust};
 use nethernet::protocol::constants::{DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_NETWORK_ID};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
-pub(crate) fn local_bind_addr() -> SocketAddr {
+/// Selects the peer's connected route when known, without requiring an unrelated default gateway.
+pub(crate) fn local_bind_addr(peer: Option<SocketAddr>) -> SocketAddr {
+    let remote = peer.unwrap_or_else(|| SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 80));
+    let wildcard = if remote.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    };
     let probe = || -> std::io::Result<IpAddr> {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-        socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80))?;
+        let socket = std::net::UdpSocket::bind((wildcard, 0))?;
+        socket.connect(remote)?;
         socket.local_addr().map(|addr| addr.ip())
     };
-
-    SocketAddr::new(probe().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)), 0)
+    let fallback = if remote.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        IpAddr::V6(Ipv6Addr::LOCALHOST)
+    };
+    SocketAddr::new(probe().unwrap_or(fallback), 0)
 }
+
 use tokio_util::sync::CancellationToken;
 
 /// Outbound ICE configuration. DNS and service credential acquisition happen before dialing.

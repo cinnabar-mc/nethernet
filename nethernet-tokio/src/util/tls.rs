@@ -42,6 +42,7 @@ pub fn from_pem_bytes(certificate_chain: &[u8], private_key: &[u8]) -> Result<Ar
             .map_err(|e| NetherError::Other(format!("read private key: {}", e)))?
             .ok_or_else(|| NetherError::Other("the PEM holds no private key".to_string()))?;
 
+    ensure_crypto_provider();
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(chain, key)
@@ -53,6 +54,27 @@ pub fn from_pem_bytes(certificate_chain: &[u8], private_key: &[u8]) -> Result<Ar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run alone in a child so unrelated HTTP tests cannot install the process-wide provider first.
+    #[test]
+    fn valid_pem_initializes_the_crypto_provider_in_a_fresh_process() {
+        const CHILD: &str = "NETHERNET_TLS_PROVIDER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "util::tls::tests::valid_pem_initializes_the_crypto_provider_in_a_fresh_process", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        from_pem_bytes(
+            issued.cert.pem().as_bytes(),
+            issued.signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 
     #[test]
     fn a_pem_without_a_certificate_is_refused() {

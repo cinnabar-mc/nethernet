@@ -16,7 +16,7 @@ type Actor = (
 struct Gates {
     watched: oneshot::Receiver<SocketAddr>,
     hold: oneshot::Receiver<oneshot::Sender<bool>>,
-    replay: oneshot::Receiver<(usize, oneshot::Sender<usize>)>,
+    replay: oneshot::Receiver<(CancellationToken, oneshot::Sender<usize>)>,
     release: oneshot::Receiver<()>,
     prefix_forwarded: oneshot::Sender<()>,
 }
@@ -89,13 +89,20 @@ async fn service(listener: TcpListener, gates: Gates, done: CancellationToken) {
             }
             requested = async { replay.as_mut().unwrap().await }, if replay.is_some() => {
                 replay = None;
-                let (count, observed) = requested.unwrap();
+                let (complete, observed) = requested.unwrap();
                 let bytes = original_binding.as_ref().expect("original authenticated binding was observed");
                 let peer = peers.iter_mut().find(|peer| Some(peer.remote) == watched_addr).unwrap();
                 let mut written = 0;
-                for _ in 0..count {
-                    if peer.write(bytes).await.is_err() { break; }
-                    written += 1;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = done.cancelled() => break,
+                        _ = complete.cancelled() => break,
+                        result = peer.write(bytes) => {
+                            if result.is_err() { break; }
+                            written += 1;
+                        }
+                    }
                 }
                 let _ = observed.send(written);
                 continue;
@@ -394,19 +401,15 @@ async fn selected_write_pressure_bounds_original_actor_output_and_retains_live_p
             .unwrap();
             stage = "live prefix forwarding barrier";
             prefix_rx.await.unwrap();
-            stage = "original request replay";
             let (replayed, count) = oneshot::channel();
-            replay_tx
-                .send((
-                    nethernet::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY + 2,
-                    replayed,
-                ))
-                .unwrap();
-            replayed_frames = count.await.unwrap();
+            let replay_complete = CancellationToken::new();
+            replay_tx.send((replay_complete.clone(), replayed)).unwrap();
             stage = "original core output threshold";
             observation
                 .over_entries(nethernet::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY)
                 .await;
+            replay_complete.cancel();
+            replayed_frames = count.await.unwrap();
             let _ = release_tx.send(());
             stage = "live prefix receive";
             received_prefix = Some(a_rx.recv().await);

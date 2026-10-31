@@ -172,16 +172,9 @@ impl HttpSignaling {
     pub fn signals(&self) -> Pin<Box<dyn Stream<Item = Signal> + Send>> {
         let rx = self.signal_tx.subscribe();
         Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(signal) => return Some((signal, rx)),
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Signal receiver lagged, missed {} signals", n);
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                }
-            }
+            // Losing negotiation signals terminates the subscription and fails its owner.
+            let signal = rx.recv().await.ok()?;
+            Some((signal, rx))
         }))
     }
 
@@ -197,6 +190,21 @@ impl HttpSignaling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Overflow must be visible to negotiations through stream termination.
+    #[tokio::test]
+    async fn overflow_ends_the_http_client_subscription() {
+        use futures::StreamExt;
+        let client = HttpSignaling::new("local".into()).unwrap();
+        let mut signals = client.signals();
+        for id in 0..17 {
+            client
+                .signal_tx
+                .send(Signal::answer(id, "answer".into(), "peer".into()))
+                .unwrap();
+        }
+        assert!(signals.next().await.is_none());
+    }
 
     #[test]
     fn join_url_is_built_from_the_network_id() {

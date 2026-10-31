@@ -77,7 +77,7 @@ fn spawn_late_signal_forwarder<St>(
                 _ = command_tx.closed() => break,
                 signal = signals.next() => match signal {
                     Some(signal) => signal,
-                    None => break,
+                    None => { closed.cancel(); break; },
                 },
             };
             if signal.connection_id != connection_id || signal.network_id != remote_network_id {

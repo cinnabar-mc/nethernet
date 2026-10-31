@@ -125,16 +125,9 @@ impl LanSignaling {
     pub fn signals(&self) -> Pin<Box<dyn Stream<Item = Signal> + Send>> {
         let rx = self.signal_tx.subscribe();
         Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(signal) => return Some((signal, rx)),
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Signal receiver lagged, missed {} signals", n);
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                }
-            }
+            // Losing negotiation signals terminates the subscription and fails its owner.
+            let signal = rx.recv().await.ok()?;
+            Some((signal, rx))
         }))
     }
 
@@ -314,6 +307,7 @@ pub async fn scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
 
     /// An IPv4 socket cannot send a learned IPv6 route, and that OS error must reach signal().
     #[tokio::test]
@@ -352,4 +346,19 @@ mod tests {
         );
     }
 
+    /// Overflow cannot leave a healthy-looking negotiation stream after dropping candidates.
+    #[tokio::test]
+    async fn overflow_ends_the_lan_subscription() {
+        let lan = LanSignaling::new(1, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut signals = lan.signals();
+        for id in 0..129 {
+            lan.signal_tx
+                .send(Signal::candidate(id, "candidate".into(), "peer".into()))
+                .unwrap();
+        }
+        assert!(signals.next().await.is_none());
+        lan.shutdown().await;
+    }
 }

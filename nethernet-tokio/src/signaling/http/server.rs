@@ -418,16 +418,9 @@ impl HttpSignalingServer {
     pub fn signals(&self) -> Pin<Box<dyn Stream<Item = Signal> + Send>> {
         let rx = self.signal_tx.subscribe();
         Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(signal) => return Some((signal, rx)),
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Signal receiver lagged, missed {} signals", n);
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                }
-            }
+            // Losing negotiation signals terminates the subscription and fails its owner.
+            let signal = rx.recv().await.ok()?;
+            Some((signal, rx))
         }))
     }
 
@@ -679,6 +672,24 @@ pub(crate) mod tests {
             matches!(result, Ok(Ok(0))),
             "stalled TLS socket survived its budget: {result:?}"
         );
+    }
+
+    /// A subscriber cannot silently continue after losing offers.
+    #[tokio::test]
+    async fn overflow_ends_the_http_server_subscription() {
+        use futures::StreamExt;
+        let server = HttpSignalingServer::bind("127.0.0.1:0".parse().unwrap(), Default::default())
+            .await
+            .unwrap();
+        let mut signals = server.signals();
+        for id in 0..65 {
+            server
+                .signal_tx
+                .send(Signal::offer(id, "offer".into(), "peer".into()))
+                .unwrap();
+        }
+        assert!(signals.next().await.is_none());
+        server.shutdown().await;
     }
 
     #[tokio::test]

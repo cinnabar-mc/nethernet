@@ -570,24 +570,32 @@ async fn udp_bursts_survive_a_paused_consumer_with_a_small_kernel_queue() {
     .expect("a burst overflowed the kernel queue while its consumer was paused");
 }
 
-/// Entry and byte budgets leave excess datagrams in the kernel instead of growing wire staging.
+/// Per-turn and total staging budgets leave excess datagrams in the kernel.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn udp_prefetch_stops_at_its_packet_and_byte_budgets() {
-    for (count, length, staged) in [(129u32, 32, 128u32), (5, 65507, 4)] {
+    for (count, length, rounds, staged) in [
+        (129u32, 32, 1, 128u32),
+        (5, 65507, 1, 4),
+        (128, 32, 17, 2064),
+        (3, 65507, 17, 48),
+    ] {
         let receiver = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = receiver.local_addr().unwrap();
         let mut io = IceIo::from(Arc::clone(&receiver));
         let mut packet = vec![0; length];
-        for value in 0..count {
-            packet[..4].copy_from_slice(&value.to_le_bytes());
-            sender.send_to(&packet, address).await.unwrap();
+        for round in 0..rounds {
+            for index in 0..count {
+                let value = round * count + index;
+                packet[..4].copy_from_slice(&value.to_le_bytes());
+                sender.send_to(&packet, address).await.unwrap();
+            }
+            let IceEvent::Datagram(first, _) = io.next().await.unwrap() else {
+                panic!("expected a UDP datagram");
+            };
+            assert_eq!(&first[..4], &round.to_le_bytes());
         }
-        let IceEvent::Datagram(first, _) = io.next().await.unwrap() else {
-            panic!("expected a UDP datagram");
-        };
-        assert_eq!(&first[..4], &0u32.to_le_bytes());
         let (length, _) = receiver.try_recv_from(&mut packet).unwrap();
         assert_eq!(length, packet.len());
         assert_eq!(&packet[..4], &staged.to_le_bytes());

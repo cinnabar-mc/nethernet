@@ -24,6 +24,8 @@ use tokio_rustls::TlsConnector;
 const UDP_RECEIVE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const UDP_READ_BATCH_PACKETS: usize = 128;
 const UDP_READ_BATCH_BYTES: usize = 256 * 1024;
+const UDP_MAX_PENDING_PACKETS: usize = 2048;
+const UDP_MAX_PENDING_BYTES: usize = UDP_RECEIVE_BUFFER_BYTES;
 
 #[cfg(test)]
 type HeldDatagram = (
@@ -283,11 +285,17 @@ impl IceIo {
             }
         };
         let mut bytes = self.pending_udp_bytes + data.len();
-        while self.pending_udp.len() + 1 < UDP_READ_BATCH_PACKETS
-            && bytes <= UDP_READ_BATCH_BYTES - MAX_DATAGRAM_SIZE
+        let mut batch_bytes = data.len();
+        let mut batch_packets = 1;
+        while batch_packets < UDP_READ_BATCH_PACKETS
+            && batch_bytes <= UDP_READ_BATCH_BYTES - MAX_DATAGRAM_SIZE
+            && self.pending_udp.len() + 1 < UDP_MAX_PENDING_PACKETS
+            && bytes <= UDP_MAX_PENDING_BYTES - MAX_DATAGRAM_SIZE
         {
             match self.receive_udp_now() {
                 Ok((data, from)) => {
+                    batch_packets += 1;
+                    batch_bytes += data.len();
                     bytes += data.len();
                     self.pending_udp_bytes += data.len();
                     self.pending_udp.push_back(Ok((data, from)));

@@ -37,19 +37,19 @@ ipnet = "2"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [patch.crates-io]
-rtc = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-crypto = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-datachannel = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-dtls = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-ice = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-interceptor = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-media = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-mdns = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-rtcp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-rtp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-sctp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-sdp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-shared = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-srtp = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-stun = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
-rtc-turn = { git = "https://github.com/cinnabar-mc/rtc", rev = "e00c5015543287daaab65834dad70bd57467628e" }
+rtc = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-crypto = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-datachannel = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-dtls = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-ice = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-interceptor = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-media = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-mdns = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-rtcp = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-rtp = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-sctp = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-sdp = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-shared = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-srtp = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-stun = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }
+rtc-turn = { git = "https://github.com/cinnabar-mc/rtc", rev = "96e92b5ffddd5d0492fd1948ce9a61657f2786df" }

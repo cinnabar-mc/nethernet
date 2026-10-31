@@ -14,6 +14,8 @@ pub(crate) const COMMAND_CAPACITY: usize =
 
 pub(crate) enum Command {
     #[cfg(test)]
+    InputBurstRemaining(oneshot::Sender<usize>),
+    #[cfg(test)]
     QueuedCommands(oneshot::Sender<usize>),
     #[cfg(test)]
     SelectedTurnStream(oneshot::Sender<Option<nethernet::session::TurnStreamRoute>>),

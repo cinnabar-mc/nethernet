@@ -865,3 +865,32 @@ async fn async_write_waits_for_admission_without_duplicating_the_buffer() {
     .await
     .expect("stream admission stalled");
 }
+
+/// Ready transport input cannot drain an entire burst before an already queued control command.
+#[tokio::test]
+async fn commands_progress_during_continuously_ready_transport_input() {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let (core, description) =
+        SansSession::new(socket.local_addr().unwrap(), true, 1, transport_now()).unwrap();
+    let (core, _) = SansConnection::connect(core, description, 1, "peer".into(), IceMode::Full);
+    let mut io = IceIo::from(socket);
+    io.ready_input_burst(512);
+    let (session, reliable, unreliable, ready) =
+        Session::<Connecting>::spawn(io, core, Addr::default(), Addr::default());
+    let (tx, rx) = oneshot::channel();
+    session
+        .handle()
+        .command_tx
+        .try_send(Command::InputBurstRemaining(tx))
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let left = observed;
+    drop((session.close(), reliable, unreliable, ready));
+    assert!(
+        left > 0,
+        "transport input starved the queued command for the entire burst"
+    );
+}

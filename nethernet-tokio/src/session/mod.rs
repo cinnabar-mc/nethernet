@@ -41,6 +41,33 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+enum DriverInput {
+    Transport(Result<crate::transport::ice_io::IceEvent>),
+    Command(Option<Command>),
+}
+
+/// Alternates priority between ready inputs while the outer select keeps cancellation first.
+async fn next_input(
+    io: &mut IceIo,
+    commands: &mut mpsc::Receiver<Command>,
+    admit_commands: bool,
+    prefer_commands: bool,
+) -> DriverInput {
+    if prefer_commands {
+        tokio::select! {
+            biased;
+            command = commands.recv(), if admit_commands => DriverInput::Command(command),
+            received = io.next() => DriverInput::Transport(received),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            received = io.next() => DriverInput::Transport(received),
+            command = commands.recv(), if admit_commands => DriverInput::Command(command),
+        }
+    }
+}
+
 const MAX_IDLE: Duration = Duration::from_secs(1);
 
 const PACKET_CHANNEL_CAPACITY: usize =
@@ -330,6 +357,7 @@ impl Session<Connecting> {
             let mut player: Option<Arc<PlayerInfo>> = None;
             let mut host: Option<String> = None;
             let mut reliable_open = true;
+            let mut prefer_commands = false;
 
             let mut candidates_enabled = signaling
                 .as_ref()
@@ -353,82 +381,94 @@ impl Session<Connecting> {
                         outgoing = None;
                         if result.is_err() { break Terminal::Transport; }
                     },
-                    received = io.next() => match received {
-                        Ok(event) => {
-                            if let Some(input) = event.connection(transport_now())
-                                && let Err(error) = connection.handle(input) {
-                                tracing::debug!(%error, "transport input rejected");
+                    input = next_input(io, &mut commands, admit_commands, prefer_commands) => match input {
+                        DriverInput::Transport(received) => {
+                            prefer_commands = true;
+                            match received {
+                                Ok(event) => {
+                                    if let Some(input) = event.connection(transport_now())
+                                        && let Err(error) = connection.handle(input) {
+                                        tracing::debug!(%error, "transport input rejected");
+                                    }
+                                }
+                                Err(error) => {
+                                    if crate::transport::egress::is_denied(&error) { break Terminal::Egress; }
+                                    tracing::debug!(%error, "transport receive error");
+                                },
                             }
-                        }
-                        Err(error) => {
-                            if crate::transport::egress::is_denied(&error) { break Terminal::Egress; }
-                            tracing::debug!(%error, "transport receive error");
                         },
-                    },
-                    command = commands.recv(), if admit_commands => match command {
-                        #[cfg(test)]
-                        Some(Command::QueuedCommands(reply)) => {
-                            let _ = reply.send(commands.len());
-                        }
-                        #[cfg(test)]
-                        Some(Command::SelectedTurnStream(reply)) => {
-                            let _ = reply.send(connection.selected_turn_stream());
-                        }
-                        Some(Command::Send(channel, data, deadline, reply)) => {
-                            let now = transport_now();
-                            let result = if deadline.is_some_and(|deadline| now >= deadline) {
-                                Err(NetherError::Timeout)
-                            } else if deadline.is_some() && reply.is_closed() {
-                                // An abandoned wait may retract only a command not yet admitted.
-                                Err(NetherError::ConnectionClosed)
-                            } else {
-                                connection.send(channel, data, now)
-                                    .map_err(NetherError::from)
-                            };
-                            let _ = reply.send(result);
-                        }
-                        Some(Command::Signal(signal)) => {
-                            if let Err(e) = connection.handle(ConnectionInput::Signal(signal, transport_now())) {
-                                tracing::debug!("signal handling error: {e}");
+                        DriverInput::Command(command) => {
+                            prefer_commands = false;
+                            match command {
+                                #[cfg(test)]
+                                Some(Command::InputBurstRemaining(reply)) => {
+                                    let _ = reply.send(io.input_burst_remaining());
+                                }
+                                #[cfg(test)]
+                                Some(Command::QueuedCommands(reply)) => {
+                                    let _ = reply.send(commands.len());
+                                }
+                                #[cfg(test)]
+                                Some(Command::SelectedTurnStream(reply)) => {
+                                    let _ = reply.send(connection.selected_turn_stream());
+                                }
+                                Some(Command::Send(channel, data, deadline, reply)) => {
+                                    let now = transport_now();
+                                    let result = if deadline.is_some_and(|deadline| now >= deadline) {
+                                        Err(NetherError::Timeout)
+                                    } else if deadline.is_some() && reply.is_closed() {
+                                        // An abandoned wait may retract only a command not yet admitted.
+                                        Err(NetherError::ConnectionClosed)
+                                    } else {
+                                        connection.send(channel, data, now)
+                                            .map_err(NetherError::from)
+                                    };
+                                    let _ = reply.send(result);
+                                }
+                                Some(Command::Signal(signal)) => {
+                                    if let Err(e) = connection.handle(ConnectionInput::Signal(signal, transport_now())) {
+                                        tracing::debug!("signal handling error: {e}");
+                                    }
+                                }
+                                Some(Command::RemoteAddr(reply)) => {
+                                    let _ = reply.send(remote_addr);
+                                }
+                                Some(Command::Rtt(reply)) => {
+                                    let _ = reply.send(rtt);
+                                }
+                                Some(Command::SetPlayer(new_player)) => {
+                                    player = Some(new_player);
+                                }
+                                Some(Command::Player(reply)) => {
+                                    let _ = reply.send(player.clone());
+                                }
+                                Some(Command::SetHost(new_host)) => {
+                                    host = Some(new_host);
+                                }
+                                Some(Command::Host(reply)) => {
+                                    let _ = reply.send(host.clone());
+                                }
+                                Some(Command::TurnCredentials(server, credentials, reply)) => {
+                                    let result = connection.update_turn_credentials(server, credentials, transport_now()).map_err(NetherError::from);
+                                    let _ = reply.send(result);
+                                }
+                                Some(Command::TurnStreamCredentials(targets, deadline, reply)) => {
+                                    let now = transport_now();
+                                    let result = if now >= deadline {
+                                        Err(NetherError::Timeout)
+                                    } else if reply.is_closed() {
+                                        Err(NetherError::ConnectionClosed)
+                                    } else if targets.len() > nethernet::session::MAX_ICE_SERVERS {
+                                        Err(NetherError::Ice("TURN replacement target limit exceeded".into()))
+                                    } else if let Some(route) = connection.selected_turn_stream() {
+                                        io.selected_credentials(targets, route, now).and_then(|credentials|
+                                            connection.update_turn_stream_credentials(route, credentials, now).map_err(NetherError::from))
+                                    } else { Ok(()) };
+                                    let _ = reply.send(result);
+                                }
+                                None => break Terminal::Eof,
                             }
                         }
-                        Some(Command::RemoteAddr(reply)) => {
-                            let _ = reply.send(remote_addr);
-                        }
-                        Some(Command::Rtt(reply)) => {
-                            let _ = reply.send(rtt);
-                        }
-                        Some(Command::SetPlayer(new_player)) => {
-                            player = Some(new_player);
-                        }
-                        Some(Command::Player(reply)) => {
-                            let _ = reply.send(player.clone());
-                        }
-                        Some(Command::SetHost(new_host)) => {
-                            host = Some(new_host);
-                        }
-                        Some(Command::Host(reply)) => {
-                            let _ = reply.send(host.clone());
-                        }
-                        Some(Command::TurnCredentials(server, credentials, reply)) => {
-                            let result = connection.update_turn_credentials(server, credentials, transport_now()).map_err(NetherError::from);
-                            let _ = reply.send(result);
-                        }
-                        Some(Command::TurnStreamCredentials(targets, deadline, reply)) => {
-                            let now = transport_now();
-                            let result = if now >= deadline {
-                                Err(NetherError::Timeout)
-                            } else if reply.is_closed() {
-                                Err(NetherError::ConnectionClosed)
-                            } else if targets.len() > nethernet::session::MAX_ICE_SERVERS {
-                                Err(NetherError::Ice("TURN replacement target limit exceeded".into()))
-                            } else if let Some(route) = connection.selected_turn_stream() {
-                                io.selected_credentials(targets, route, now).and_then(|credentials|
-                                    connection.update_turn_stream_credentials(route, credentials, now).map_err(NetherError::from))
-                            } else { Ok(()) };
-                            let _ = reply.send(result);
-                        }
-                        None => break Terminal::Eof,
                     },
                 }
 

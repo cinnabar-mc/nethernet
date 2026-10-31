@@ -57,6 +57,8 @@ impl IceEvent {
 }
 
 pub(crate) struct IceIo {
+    #[cfg(test)]
+    ready_inputs: usize,
     udp: Arc<UdpSocket>,
     egress: Option<EgressPolicy>,
     streams: Vec<(TurnStreamId, Carrier)>,
@@ -71,6 +73,8 @@ impl From<Arc<UdpSocket>> for IceIo {
     fn from(udp: Arc<UdpSocket>) -> Self {
         configure_receive_buffer(udp.as_ref());
         Self {
+            #[cfg(test)]
+            ready_inputs: 0,
             udp,
             egress: None,
             streams: Vec::new(),
@@ -95,6 +99,18 @@ fn configure_receive_buffer(udp: &UdpSocket) {
 }
 
 impl IceIo {
+    /// Observes the remaining ready burst at the exact actor command turn.
+    #[cfg(test)]
+    pub(crate) fn input_burst_remaining(&self) -> usize {
+        self.ready_inputs
+    }
+
+    /// Supplies a finite run of immediately ready transport turns for scheduler tests.
+    #[cfg(test)]
+    pub(crate) fn ready_input_burst(&mut self, count: usize) {
+        self.ready_inputs = count;
+    }
+
     /// Installs one immutable admission owner before gathering or carrier construction.
     pub(crate) fn with_egress_policy(mut self, policy: Option<EgressPolicy>) -> Self {
         self.egress = policy;
@@ -223,6 +239,11 @@ impl IceIo {
         }
     }
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<IceEvent>> {
+        #[cfg(test)]
+        if self.ready_inputs > 0 {
+            self.ready_inputs -= 1;
+            return Poll::Ready(Ok(IceEvent::Written));
+        }
         // Rotate bounded stream precedence so a busy stream cannot starve another stream or UDP.
         let slots = self.streams.len() + 1;
         for offset in 0..slots {

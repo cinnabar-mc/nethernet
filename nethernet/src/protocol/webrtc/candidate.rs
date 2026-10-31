@@ -22,6 +22,25 @@ pub fn parse_ice_candidate(data: &str) -> Result<Candidate, ProtocolError> {
     unmarshal_candidate(raw).map_err(|e| ProtocolError::Other(format!("decode candidate: {e}")))
 }
 
+/// Ignores unsupported candidate types while rejecting malformed embedded candidates.
+pub(crate) fn parse_sdp_candidate(value: &str) -> Result<Option<Candidate>, ProtocolError> {
+    if value.split_whitespace().nth(6) != Some("typ") {
+        return Err(ProtocolError::Other("invalid candidate type field".into()));
+    }
+    match unmarshal_candidate(value) {
+        Ok(candidate) => Ok(Some(candidate)),
+        Err(rtc::shared::error::Error::Other(message))
+            if message.starts_with(&format!(
+                "{:?} (",
+                rtc::shared::error::Error::ErrUnknownCandidateType
+            )) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(ProtocolError::Other(format!("decode candidate: {error}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,11 +21,12 @@ pub enum ResolvedRole {
 }
 
 impl ResolvedRole {
+    /// Complements the wire role; Auto is announced as active, just like Client.
     pub fn from_remote_announced(remote: crate::protocol::webrtc::DtlsRole) -> Self {
         use crate::protocol::webrtc::DtlsRole;
         match remote {
-            DtlsRole::Client => Self::Server,
-            DtlsRole::Server | DtlsRole::Auto => Self::Client,
+            DtlsRole::Client | DtlsRole::Auto => Self::Server,
+            DtlsRole::Server => Self::Client,
         }
     }
 }

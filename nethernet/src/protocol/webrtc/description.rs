@@ -82,22 +82,15 @@ impl Description {
         }
         let media = &session.media_descriptions[0];
 
-        let ufrag = attribute(media, "ice-ufrag")?.to_string();
-        let pwd = attribute(media, "ice-pwd")?.to_string();
+        let ufrag = attribute(media, &session, "ice-ufrag")?.to_string();
+        let pwd = attribute(media, &session, "ice-pwd")?.to_string();
 
-        let fingerprint_attr = if media.attribute("fingerprint").is_some() {
-            attribute(media, "fingerprint")?
-        } else {
-            session
-                .attribute("fingerprint")
-                .map(String::as_str)
-                .ok_or_else(|| ProtocolError::Other("missing fingerprint attribute".into()))?
-        };
+        let fingerprint_attr = attribute(media, &session, "fingerprint")?;
         let (algorithm, value) = fingerprint_attr.split_once(' ').ok_or_else(|| {
             ProtocolError::Other(format!("invalid fingerprint: {fingerprint_attr}"))
         })?;
 
-        let setup = attribute(media, ATTR_KEY_CONNECTION_SETUP)?;
+        let setup = attribute(media, &session, ATTR_KEY_CONNECTION_SETUP)?;
         let dtls_role = match setup {
             "active" => DtlsRole::Client,
             "actpass" | "passive" => DtlsRole::Server,
@@ -108,20 +101,24 @@ impl Description {
             }
         };
 
-        let sctp_max_message_size = match attribute(media, ATTR_KEY_MAX_MESSAGE_SIZE) {
-            Ok(value) => value.parse::<u32>().map_err(|e| {
-                ProtocolError::Other(format!("parse max-message-size attribute: {e}"))
-            })?,
-            Err(_) => SCTP_MAX_MESSAGE_SIZE,
-        };
+        let sctp_max_message_size =
+            match optional_attribute(media, &session, ATTR_KEY_MAX_MESSAGE_SIZE)? {
+                Some(value) => value.parse::<u32>().map_err(|e| {
+                    ProtocolError::Other(format!("parse max-message-size attribute: {e}"))
+                })?,
+                None => SCTP_MAX_MESSAGE_SIZE,
+            };
 
         let mut candidates = Vec::new();
         for attr in session.attributes.iter().chain(&media.attributes) {
-            if attr.key == "candidate"
-                && let Some(value) = &attr.value
-                && let Ok(parsed) = candidate::parse_ice_candidate(value)
-            {
-                candidates.push(parsed);
+            if attr.key == "candidate" {
+                let value = attr
+                    .value
+                    .as_deref()
+                    .ok_or_else(|| ProtocolError::Other("empty candidate attribute".into()))?;
+                if let Some(parsed) = candidate::parse_sdp_candidate(value)? {
+                    candidates.push(parsed);
+                }
             }
         }
 
@@ -254,12 +251,34 @@ fn default_candidate(candidates: &[Candidate]) -> Option<&Candidate> {
     selected
 }
 
-fn attribute<'a>(media: &'a MediaDescription, key: &str) -> Result<&'a str, ProtocolError> {
-    match media.attribute(key) {
-        Some(Some(value)) => Ok(value),
-        Some(None) => Err(ProtocolError::Other(format!("empty {key} attribute"))),
-        None => Err(ProtocolError::Other(format!("missing {key} attribute"))),
-    }
+/// Resolves a required media attribute using the session value only when it is absent.
+fn attribute<'a>(
+    media: &'a MediaDescription,
+    session: &'a SessionDescription,
+    key: &str,
+) -> Result<&'a str, ProtocolError> {
+    optional_attribute(media, session, key)?
+        .ok_or_else(|| ProtocolError::Other(format!("missing {key} attribute")))
+}
+
+/// Distinguishes an omitted attribute from a present valueless attribute.
+fn optional_attribute<'a>(
+    media: &'a MediaDescription,
+    session: &'a SessionDescription,
+    key: &str,
+) -> Result<Option<&'a str>, ProtocolError> {
+    media
+        .attributes
+        .iter()
+        .chain(&session.attributes)
+        .find(|attr| attr.key == key)
+        .map(|attr| {
+            attr.value
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ProtocolError::Other(format!("empty {key} attribute")))
+        })
+        .transpose()
 }
 
 fn connection_role(role: DtlsRole) -> ConnectionRole {

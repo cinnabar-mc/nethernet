@@ -400,16 +400,20 @@ fn status(reason: RejectReason) -> StatusCode {
 }
 
 fn keep_alive(request: &Request<String>) -> bool {
-    let connection = request
-        .headers()
-        .get(CONNECTION)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-
-    match request.version() {
-        Version::HTTP_10 => connection.eq_ignore_ascii_case("keep-alive"),
-        _ => !connection.eq_ignore_ascii_case("close"),
+    let mut persistent = request.version() != Version::HTTP_10;
+    for value in request.headers().get_all(CONNECTION) {
+        if let Ok(value) = value.to_str() {
+            for token in value.split(',').map(str::trim) {
+                if token.eq_ignore_ascii_case("close") {
+                    return false;
+                }
+                if token.eq_ignore_ascii_case("keep-alive") {
+                    persistent = true;
+                }
+            }
+        }
     }
+    persistent
 }
 
 #[cfg(test)]
@@ -918,5 +922,32 @@ mod tests {
         };
         assert_eq!(connection, 1);
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn close_wins_in_token_lists_and_repeated_connection_headers() {
+        for version in [Version::HTTP_10, Version::HTTP_11] {
+            for headers in [
+                vec!["KeEp-AlIvE, ClOsE"],
+                vec!["keep-alive", "upgrade, close"],
+            ] {
+                let mut request = Request::builder().version(version);
+                for value in headers {
+                    request = request.header(CONNECTION, value);
+                }
+                assert!(!keep_alive(&request.body(String::new()).unwrap()));
+            }
+        }
+        let request = Request::builder()
+            .version(Version::HTTP_10)
+            .header(CONNECTION, "upgrade, KeEp-AlIvE")
+            .body(String::new())
+            .unwrap();
+        assert!(keep_alive(&request));
     }
 }
